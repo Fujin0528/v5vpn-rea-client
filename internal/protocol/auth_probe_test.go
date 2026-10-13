@@ -7,7 +7,7 @@ import "testing"
 // placeholders; the production environment's real password is required to
 // actually observe a "口令过期" error. Skip by default, opt in with:
 //
-//   go test ./internal/protocol -run TestGateway1PasswordExpiredDetection -count=1
+//	go test ./internal/protocol -run TestGateway1PasswordExpiredDetection -count=1
 //
 // Set GATEWAY_IP / GATEWAY_PORT / GATEWAY_USER / GATEWAY_PASSWORD to point
 // at a controlled test gateway.

@@ -29,7 +29,7 @@ func TestDecryptSettingPassword(t *testing.T) {
 		{"S3cret!pass-001"},
 		{"another-Test-PwD#1"},
 		{"\u4e2d\u6587\u6d4b\u8bd5\u5bc6\u7801"}, // UTF-8 sanity case
-		{strings.Repeat("a", 24)},                 // multi-block padding case
+		{strings.Repeat("a", 24)},                // multi-block padding case
 	}
 
 	for _, tt := range tests {
