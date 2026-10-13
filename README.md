@@ -93,6 +93,29 @@ http://127.0.0.1:45678
 .\v5vpn-rea.exe -cli -connect "<gateway-name>" -user "<username>" -pwd "<password>"
 ```
 
+### 4.4 界面截图对比（新旧版本）
+
+新旧客户端界面并排对比，**表格可左右滑动**查看全部截图，点击图片看大图：
+
+<table>
+  <tr>
+    <td valign="middle"><b>新版本</b><br>(本项目 v0.1.0)</td>
+    <td align="center"><a href="docs/references/v5vpn-rea/login.png"><img src="docs/references/v5vpn-rea/login.png" height="280" alt="新版本登录界面"></a></td>
+    <td align="center"><a href="docs/references/v5vpn-rea/main.png"><img src="docs/references/v5vpn-rea/main.png" height="280" alt="新版本主界面"></a></td>
+  </tr>
+  <tr>
+    <td valign="middle"><b>旧版本</b><br>(原厂客户端 5.3.3.x)</td>
+    <td align="center"><a href="docs/references/启明星辰-天清汉马VPN/1.png"><img src="docs/references/启明星辰-天清汉马VPN/1.png" height="280" alt="原厂界面 1"></a></td>
+    <td align="center"><a href="docs/references/启明星辰-天清汉马VPN/2.png"><img src="docs/references/启明星辰-天清汉马VPN/2.png" height="280" alt="原厂界面 2"></a></td>
+    <td align="center"><a href="docs/references/启明星辰-天清汉马VPN/3.png"><img src="docs/references/启明星辰-天清汉马VPN/3.png" height="280" alt="原厂界面 3"></a></td>
+    <td align="center"><a href="docs/references/启明星辰-天清汉马VPN/4.png"><img src="docs/references/启明星辰-天清汉马VPN/4.png" height="280" alt="原厂界面 4"></a></td>
+    <td align="center"><a href="docs/references/启明星辰-天清汉马VPN/5.png"><img src="docs/references/启明星辰-天清汉马VPN/5.png" height="280" alt="原厂界面 5"></a></td>
+  </tr>
+</table>
+
+> 统一按 `height=280` 缩放：整张表只有两行，不会把 README 撑得很长；
+> 旧版本一行（5 张，约 1800px 宽）超出内容区宽度时表格自动出现横向滚动条。
+
 ---
 
 ## 5. 项目目录结构
