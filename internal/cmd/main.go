@@ -95,6 +95,16 @@ func main() {
 			log.Printf("OnBeforeQuit logout error (ignored): %v", err)
 		}
 	})
+	// Tell the config package where the production build stores its
+	// saved credentials. mygo.App.Path(PathUserData) returns a per-user
+	// directory such as %APPDATA%\Roaming5vpn-rea on Windows or
+	// ~/.local/share/v5vpn-rea on Linux. An updater-driven replacement
+	// of the application directory no longer erases the operator's
+	// saved credentials when the file lives here instead of next to
+	// the executable.
+	if dataDir, err := mygo.App.Path(mygo.PathUserData); err == nil && dataDir != "" {
+		config.SetUserDataDir(dataDir)
+	}
 	mygo.BindAs("VPNService", vpnService)
 	mygo.SetFrontend(uiFS)
 

@@ -92,20 +92,57 @@ type AppConfig struct {
 	Gateways       []GatewayProfile `json:"gateways"`
 }
 
+// userDataDir is the per-user application data directory where the
+// production build (mygo.App.Path(PathUserData)) writes and reads
+// setting.xml. It defaults to "" which means "no candidate" so the
+// callers fall back to the working directory / exe directory /
+// configs/ candidates. main.go sets this once on startup via
+// SetUserDataDir.
+var userDataDir string
+
+// SetUserDataDir tells the config package which directory to prefer when
+// loading setting.xml. The directory is created if it does not already
+// exist. Pass an empty string to fall back to the legacy candidates.
+func SetUserDataDir(dir string) {
+	userDataDir = dir
+}
+
 // configCandidates returns the paths searched, in order, for a config file.
-// The working directory and the exe directory keep compatibility with
-// deployments that ship setting.xml next to the binary; configs/ is the
-// source-tree layout.
+// Production installs prefer the per-user data directory (mygo
+// PathUserData) so an auto-update does not stomp the saved credentials
+// when the application directory is replaced. The working directory,
+// the executable directory, and configs/ remain as fallbacks so the
+// developer workflow and tests still work out of the box.
 func configCandidates() []string {
-	candidates := []string{SettingXMLFilename}
+	candidates := []string{}
+	if userDataDir != "" {
+		candidates = append(candidates, filepath.Join(userDataDir, SettingXMLFilename))
+	}
+	candidates = append(candidates, SettingXMLFilename)
 	if exePath, err := os.Executable(); err == nil {
 		candidates = append(candidates, filepath.Join(filepath.Dir(exePath), SettingXMLFilename))
 	}
 	return append(candidates, filepath.Join("configs", SettingXMLFilename))
 }
 
-// LoadSettingXML reads and decrypts setting.xml from the current directory,
-// the executable directory, or configs/.
+// UserDataDir returns the configured per-user data directory, or the
+// empty string if none has been set.
+func UserDataDir() string { return userDataDir }
+
+// SaveSettingXML writes the config back to its source file. If a per-user
+// data directory has been configured, the file is created there
+// (preserving the location LoadSettingXML picked up on startup) so an
+// updater-driven application-directory replacement does not erase the
+// operator's saved credentials.
+func (cfg *AppConfig) saveToConfiguredPath(targetPath string) error {
+	if userDataDir != "" && targetPath == "" {
+		if err := os.MkdirAll(userDataDir, 0o700); err != nil {
+			return fmt.Errorf("cannot create user data dir %s: %w", userDataDir, err)
+		}
+		targetPath = filepath.Join(userDataDir, SettingXMLFilename)
+	}
+	return cfg.saveToPath(targetPath)
+}
 func LoadSettingXML(path string) (*AppConfig, error) {
 	if path == "" {
 		for _, candidate := range configCandidates() {
@@ -181,8 +218,19 @@ func LoadSettingXML(path string) (*AppConfig, error) {
 	return cfg, nil
 }
 
-// SaveSettingXML serializes AppConfig back to setting.xml
+// SaveSettingXML serializes AppConfig back to setting.xml. If the
+// caller has configured a per-user data directory via SetUserDataDir,
+// the file is created there so an updater-driven replacement of the
+// application directory does not erase the operator's saved credentials.
 func (cfg *AppConfig) SaveSettingXML(targetPath string) error {
+	if targetPath == "" {
+		return cfg.saveToConfiguredPath("")
+	}
+	return cfg.saveToPath(targetPath)
+}
+
+// saveToPath serializes AppConfig back to setting.xml at the given path.
+func (cfg *AppConfig) saveToPath(targetPath string) error {
 	if targetPath == "" {
 		targetPath = cfg.SourcePath
 	}

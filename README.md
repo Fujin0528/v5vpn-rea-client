@@ -114,3 +114,80 @@ v5vpn-rea/
 ├── go.mod
 └── README.md
 ```
+
+## 6. 平台支持矩阵
+
+| 平台 | WebView 后端 | 运行时依赖 | 实测状态 |
+|:---|:---|:---|:---|
+| Windows x64 / arm64 | WebView2 | WebView2 Runtime（Win11 自带；Win10 需安装） | 已实测（开发环境） |
+| Linux amd64 / arm64 | WebKitGTK | `libwebkit2gtk-4.1-0`（Debian/Ubuntu） | 仅编译通过，未实测 |
+| macOS amd64 / arm64 | WKWebView | 系统自带；分发需签名 + 公证 | 仅编译通过，未实测 |
+
+mygo 在 Linux 各桌面环境下系统托盘 (`mygo.NewTray`) 的可用性差异较大，
+如果托盘失败主功能仍可工作，直接用浏览器访问 `http://127.0.0.1:45678`
+进入控制台即可。
+
+## 7. 构建与发布
+
+`build.bat` 走 `go build`，产出的 `v5vpn-rea.exe` 是「开发者构建」：
+
+- 没有版本号、图标以外的资源节；
+- `mygo.App.Version()` 返回空串，`updater.Enabled()` 始终为假，因此
+  **该二进制永远无法自更新**；
+- 适用于本地调试、CI 跑测试，但不适合直接分发给最终用户。
+
+发布产物必须由 `go tool mygo build` 产出：
+
+```bash
+go tool mygo keygen                                    # 一次性生成 mygo-update.key / .pub
+gh secret set MYGO_UPDATER_PRIVATE_KEY < mygo-update.key   # 把私钥存进 CI secrets
+go tool mygo build -platform windows/amd64,linux/amd64,darwin/arm64 -upload
+```
+
+产物命名由 `mygo.json` 的 `name` 决定（当前是 `v5vpn-rea`），会得到
+`v5vpn-rea.exe` / `v5vpn-rea Setup <version> amd64.exe` / `v5vpn-rea.app`
+/ `.deb` 等。`.gitignore` 已把 `mygo-update.key`、`mygo-update.pub` 与
+`/build/` 排除，私钥不会入库。
+
+## 8. 自更新与签名
+
+mygo 内建了 ed25519 签名的自更新机制。`mygo.json` 的 `updates.publicKey`
+必须在第一次 `go tool mygo keygen` 之后替换为 `mygo-update.pub` 的内容；
+私钥 `mygo-update.key` 仅存放在 GitHub Secrets（变量名
+`MYGO_UPDATER_PRIVATE_KEY`），任何泄露都意味着任意代码可推送给用户。
+
+应用启动后约 10 秒进行首检（后台线程），托盘菜单新增「检查更新...」
+由 `updater.MenuItem()` 提供。`OnBeforeQuit` 钩子保证任何 quit 路径
+（包括 updater 触发的 relaunch）都会先调用 `vpnService.Logout()`，
+避免网关侧留下孤儿 `VSG_SESSIONID`。
+
+## 9. 用户数据位置
+
+| 平台 | setting.xml 实际存储位置 |
+|:---|:---|
+| Windows | `%APPDATA%5vpn-rea\setting.xml` |
+| Linux | `~/.local/share/v5vpn-rea/setting.xml` |
+| macOS | `~/Library/Application Support/v5vpn-rea/setting.xml` |
+
+这些目录由 `mygo.App.Path(PathUserData)` 解析。**自更新不会擦掉用户配置**，
+因为 mygo build 把应用目录整体替换，而 setting.xml 不再放在那里。
+
+如果想使用旧版「exe 同目录」的布局（例如便携式部署），把 `setting.xml`
+放在可执行文件旁边即可——`config.LoadSettingXML` 会按以下顺序回退：
+
+1. 用户数据目录（生产构建默认）
+2. 当前工作目录
+3. 可执行文件目录
+4. `configs/`（源码树布局）
+
+## 10. 贡献
+
+- 在 issue、PR、commit message 中**不要**粘贴真实网关地址、账号或密码
+  （DES 密文同样不应粘贴，凭证扫描器会批量尝试）；
+- 修改协议相关代码前先在私有分支跑通两套测试：单元测试 + `go test
+  -short` 跳过的集成测试需要自行提供 `GATEWAY_IP / GATEWAY_PORT /
+  GATEWAY_USER / GATEWAY_PASSWORD` 环境变量；
+- UI 改动请附前后对比截图，CSS 改动请确认在 1280x800 与 1920x1080
+  两个分辨率下都不破布局。
+
+详见 `DISCLAIMER.md` 与 `NOTICE`。

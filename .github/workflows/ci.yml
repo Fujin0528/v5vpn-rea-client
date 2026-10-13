@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Lint & test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: gofmt
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then
+            echo "gofmt found unformatted files:"
+            echo "$out"
+            exit 1
+          fi
+      - name: go vet
+        run: go vet ./...
+      - name: go test (short)
+        run: go test -short -race -coverprofile=coverage.out ./...
+      - name: upload coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.out
+
+  cross-build:
+    name: Cross-compile (${{ matrix.target.goos }}/${{ matrix.target.goarch }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - { goos: windows, goarch: amd64, ext: ".exe" }
+          - { goos: windows, goarch: arm64, ext: ".exe" }
+          - { goos: linux,   goarch: amd64, ext: "" }
+          - { goos: linux,   goarch: arm64, ext: "" }
+          - { goos: darwin,  goarch: arm64, ext: "" }
+          - { goos: darwin,  goarch: amd64, ext: "" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Build
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.target.goos }}
+          GOARCH: ${{ matrix.target.goarch }}
+        run: |
+          go build -trimpath -ldflags="-s -w" \
+            -o dist/v5vpn-rea-${{ matrix.target.goos }}-${{ matrix.target.goarch }}${{ matrix.target.ext }} \
+            ./internal/cmd
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: v5vpn-rea-${{ matrix.target.goos }}-${{ matrix.target.goarch }}
+          path: dist/v5vpn-rea-${{ matrix.target.goos }}-${{ matrix.target.goarch }}${{ matrix.target.ext }}
