@@ -6,7 +6,7 @@
   "main": "./internal/cmd",
   "out": "build",
   "updates": {
-    "publicKey": "REPLACE_WITH_OUTPUT_OF_MYGO_KEYGEN",
+    "publicKey": "v5XetXmz4jCAgqdZ83E8ygOZsv2bEDO0PRf0rRYyXcA=",
     "github": "hygkui/v5vpn-rea-client",
     "tagPrefix": "v",
     "deltas": 3
