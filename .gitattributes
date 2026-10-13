@@ -1,0 +1,18 @@
+# Default line ending policy: store everything as LF, regardless of OS.
+* text=auto eol=lf
+
+# Source files - explicit LF to defend against core.autocrlf drift.
+*.go text eol=lf
+*.md text eol=lf
+*.js text eol=lf
+*.css text eol=lf
+*.html text eol=lf
+*.xml text eol=lf
+*.ini text eol=lf
+*.json text eol=lf
+*.bat text eol=lf
+
+# Binary assets.
+*.png binary
+*.ico binary
+*.syso binary

@@ -1,0 +1,37 @@
+# Binaries
+/v5vpn-rea
+*.exe
+*.exe~
+*.syso
+*.dll
+*.so
+*.dylib
+*.log
+
+# Go workspace
+go.work
+go.work.sum
+
+# Local user config (contains saved credentials)
+setting.xml
+
+# Local secret inventory (never commit)
+REDACT_LOCAL.txt
+
+# Private backup directory (local-only snapshots of configs and build output)
+/.backup/
+
+# Build output
+/build/
+mygo-update.key
+mygo-update.pub
+
+# Test binary
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# OS files
+Thumbs.db
+.DS_Store
