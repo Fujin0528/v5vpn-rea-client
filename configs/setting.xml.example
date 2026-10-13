@@ -2,11 +2,13 @@
 <!--
   Template configuration for V5VPN client.
 
-  Copy this file to setting.xml (or configs/setting.xml) and replace
+  Copy this file to setting.xml (project root) and replace
   the placeholder credentials below. The DES-CBC key/IV used to
   decode stored passwords lives in internal/crypto/crypto.go; this
-  template uses synthetic ciphertext generated with that routine so
-  you can verify the loader round-trips.
+  template uses synthetic ciphertext ("Demo-Pass-2026!" encrypted
+  with that routine) for the demo user "alice" so you can verify
+  the loader round-trips. The username/password below are
+  synthetic fixtures for tests and local development only.
 
   NEVER commit a populated setting.xml to version control. The file
   is listed in .gitignore.
@@ -17,8 +19,9 @@
     <Gateway0 Name="demo-gateway" Ip="203.0.113.10" Port="443" algo="0">
       <USER LastUserName="alice" authtype="0" certtype="0" certautologin="0">
         <!-- Replace Name with base64("your-username") and Pwd with the
-             DES-CBC ciphertext of your password (see crypto.go). -->
-        <User0 Name="YWxpY2U=" Pwd="REPLACE_WITH_DES_CBC_CIPHERTEXT" rpwd="1" auto="0"></User0>
+             DES-CBC ciphertext of your password (see crypto.go).
+             The values below are synthetic test fixtures. -->
+        <User0 Name="YWxpY2U=" Pwd="oP+Rz3ZCmFL+ioim5LqD5Q==" rpwd="1" auto="0"></User0>
       </USER>
     </Gateway0>
   </GATEWAY>

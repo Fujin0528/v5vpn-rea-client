@@ -21,6 +21,9 @@ REDACT_LOCAL.txt
 # Private backup directory (local-only snapshots of configs and build output)
 /.backup/
 
+# Local agent collaboration notes (vibe-coding scratch docs, never commit)
+/.agent/
+
 # Build output
 /build/
 mygo-update.key

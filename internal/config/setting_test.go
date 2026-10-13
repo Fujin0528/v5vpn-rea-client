@@ -6,12 +6,19 @@ import (
 )
 
 func TestLoadSettingXML(t *testing.T) {
-	localPath := SettingXMLFilename
+	// Prefer the synthetic fixture (configs/setting.xml.example) so this
+	// test runs everywhere, including CI. A real configs/setting.xml with
+	// production credentials must never exist in the repo; if one is
+	// present locally it takes precedence for manual verification.
+	localPath := "../../configs/setting.xml.example"
 	if _, err := os.Stat(localPath); os.IsNotExist(err) {
-		localPath = "../../../configs/setting.xml"
+		localPath = "../../configs/setting.xml"
 	}
 	if _, err := os.Stat(localPath); os.IsNotExist(err) {
-		t.Skip("Local setting.xml not found, skipping test")
+		localPath = SettingXMLFilename
+	}
+	if _, err := os.Stat(localPath); os.IsNotExist(err) {
+		t.Skip("No setting.xml fixture found, skipping test")
 	}
 
 	cfg, err := LoadSettingXML(localPath)
