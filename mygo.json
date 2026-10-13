@@ -1,0 +1,20 @@
+{
+  "name": "v5vpn-rea",
+  "identifier": "io.github.hygkui.v5vpn-rea",
+  "version": "0.1.0",
+  "copyright": "Copyright 2026 hygkui and contributors",
+  "main": "./internal/cmd",
+  "out": "build",
+  "updates": {
+    "publicKey": "REPLACE_WITH_OUTPUT_OF_MYGO_KEYGEN",
+    "github": "hygkui/v5vpn-rea-client",
+    "tagPrefix": "v",
+    "deltas": 3
+  },
+  "linux": {
+    "maintainer": "hygkui <hygkui@users.noreply.github.com>",
+    "comment": "Unofficial V5VPN SSL VPN portal client",
+    "categories": ["Network", "Utility"],
+    "depends": ["libwebkit2gtk-4.1-0"]
+  }
+}
