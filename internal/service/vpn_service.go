@@ -308,12 +308,18 @@ func (s *VPNService) GetStatus() map[string]any {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// Logs has its own mutex (logMu); read its length under that lock to
+	// avoid racing with Log().
+	s.logMu.Lock()
+	logCount := len(s.Logs)
+	s.logMu.Unlock()
+
 	return map[string]any{
 		"status":         s.Status,
 		"statusDetail":   s.StatusDetail,
 		"resources":      s.Resources,
 		"lastUseGateway": s.Config.LastUseGateway,
-		"logCount":       len(s.Logs),
+		"logCount":       logCount,
 	}
 }
 
