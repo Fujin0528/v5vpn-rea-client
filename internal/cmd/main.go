@@ -455,6 +455,18 @@ func startHTTPServer(port int, uiFS fs.FS, vpnService *service.VPNService) int {
 		_ = json.NewEncoder(w).Encode(map[string]bool{"success": true})
 	})
 
+	mux.HandleFunc("/api/check-updates", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		// Same as the tray "Check for Updates..." item: opens the updater
+		// window (or reports dev-build/unavailable there).
+		updater.CheckForUpdates()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]bool{"success": true})
+	})
+
 	// Static UI assets
 	mux.Handle("/", http.FileServer(http.FS(uiFS)))
 

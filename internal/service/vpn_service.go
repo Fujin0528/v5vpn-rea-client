@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/egoist/mygo/plugins/updater"
 	"github.com/hygkui/v5vpn-rea-client/internal/config"
 	"github.com/hygkui/v5vpn-rea-client/internal/protocol"
 	"github.com/hygkui/v5vpn-rea-client/internal/proxy"
@@ -101,6 +102,14 @@ func (s *VPNService) OpenURL(rawURL string) error {
 		cmd = exec.Command("xdg-open", rawURL)
 	}
 	return cmd.Start()
+}
+
+// CheckForUpdates opens the mygo self-update window, same as the tray
+// "Check for Updates..." menu item. Exposed to the frontend so the footer
+// buttons can trigger a check without going through the tray.
+func (s *VPNService) CheckForUpdates() bool {
+	updater.CheckForUpdates()
+	return true
 }
 
 // Log adds a log entry with timestamp and level

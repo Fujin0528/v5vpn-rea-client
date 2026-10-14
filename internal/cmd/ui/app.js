@@ -149,6 +149,13 @@
           body: JSON.stringify({ mode })
         });
       } catch (_) {}
+    },
+    async checkUpdates() {
+      if (window.VPNService && window.VPNService.checkForUpdates) {
+        return await window.VPNService.checkForUpdates();
+      }
+      const res = await fetch('/api/check-updates', { method: 'POST' });
+      return await res.json();
     }
   };
 
@@ -169,6 +176,19 @@
       e.preventDefault();
       const url = a.dataset.url || a.href;
       if (url) api.openURL(url);
+    });
+  });
+
+  // Footer update buttons: trigger the native updater window
+  document.querySelectorAll('.js-check-updates').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const original = btn.innerHTML;
+      btn.disabled = true;
+      btn.innerHTML = '⏳ 正在检查…';
+      try {
+        await api.checkUpdates();
+      } catch (_) {}
+      setTimeout(() => { btn.innerHTML = original; btn.disabled = false; }, 2000);
     });
   });
 

@@ -382,6 +382,17 @@ label {
   cursor: pointer;
 }
 
+button.github-link {
+  font: inherit;
+}
+
+.footer-links {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+
 .github-link:hover {
   color: #fff;
   border-color: var(--accent);
