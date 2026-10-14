@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.1
+
+- "Check for updates" buttons in the login and connected footers
+  (same trigger as the tray menu, via `/api/check-updates` or the
+  `VPNService.checkForUpdates` IPC call).
+- Release flow: workflow publishes automatically once all platform
+  builds pass, and takes the release notes from this changelog.
+
 ## 0.1.0
 
 Initial public release.
