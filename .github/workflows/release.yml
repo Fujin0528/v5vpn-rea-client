@@ -25,11 +25,30 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+          ver="${GITHUB_REF_NAME#v}"
+          awk -v ver="$ver" '
+            /^## / {
+              if (found) exit
+              h = $0; gsub(/[\[\]]/, "", h)
+              if (h == "## " ver || h ~ "^## " ver " ") { found = 1 }
+              next
+            }
+            found
+          ' CHANGELOG.md > /tmp/release-notes.md
+          if [ ! -s /tmp/release-notes.md ]; then
+            echo "No CHANGELOG section for $ver, falling back to generated notes"
             gh release create "$GITHUB_REF_NAME" \
               --draft --verify-tag \
               --title "$GITHUB_REF_NAME" \
               --generate-notes
+          elif ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" \
+              --draft --verify-tag \
+              --title "$GITHUB_REF_NAME" \
+              --notes-file /tmp/release-notes.md
+          else
+            gh release edit "$GITHUB_REF_NAME" \
+              --notes-file /tmp/release-notes.md
           fi
 
   build:
