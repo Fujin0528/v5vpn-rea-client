@@ -21,7 +21,11 @@ import (
 //go:embed all:ui
 var uiEmbedFS embed.FS
 
-const AppVersion = "v2.0.0"
+// AppVersion MUST match mygo.json "version" (with "v" prefix); the
+// TestAppVersionMatchesMygoJSON test fails the build if they drift.
+// NOTE: "2.0" is the gateway protocol version (/vpn/version.xml), not the
+// app version — do not "fix" this back to v2.0.0.
+var AppVersion = "v0.1.0"
 
 var mainWindow *mygo.Window
 
@@ -112,7 +116,7 @@ func main() {
 		win := mygo.NewWindow(mygo.WindowOptions{
 			Title:  fmt.Sprintf("V5VPN 现代客户端 %s (MyGo)", AppVersion),
 			Width:  460,
-			Height: 620,
+			Height: 700,
 			URL:    fmt.Sprintf("http://127.0.0.1:%d/index.html", actualPort),
 		})
 		mainWindow = win
@@ -338,10 +342,10 @@ func startHTTPServer(port int, uiFS fs.FS, vpnService *service.VPNService) int {
 			mygo.RunOnMain(func() {
 				switch req.Mode {
 				case "login":
-					mainWindow.SetSize(460, 620)
+					mainWindow.SetSize(460, 700)
 					mainWindow.Center()
 				case "connected":
-					mainWindow.SetSize(960, 640)
+					mainWindow.SetSize(1248, 832)
 					mainWindow.Center()
 				case "settings":
 					mainWindow.SetSize(720, 620)

@@ -357,10 +357,65 @@ label {
 }
 
 .login-footer {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
   text-align: center;
   margin-top: 20px;
   font-size: 0.74rem;
   color: var(--text-dim);
+}
+
+.github-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-muted);
+  text-decoration: none;
+  font-size: 0.78rem;
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.03);
+  transition: all 0.15s ease;
+  cursor: pointer;
+}
+
+.github-link:hover {
+  color: #fff;
+  border-color: var(--accent);
+  background: rgba(16, 185, 129, 0.1);
+}
+
+.github-icon {
+  flex-shrink: 0;
+}
+
+.star-badge {
+  color: #fbbf24;
+  font-weight: 600;
+}
+
+.connected-footer {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 10px 24px;
+  background: var(--bg-secondary);
+  border-top: 1px solid var(--border);
+  font-size: 0.74rem;
+  color: var(--text-dim);
+}
+
+.connected-footer .github-link {
+  font-size: 0.74rem;
+  padding: 2px 8px;
+}
+
+.footer-sep {
+  opacity: 0.5;
 }
 
 /* ==================== 2. 登录后视图 (工作台) ==================== */

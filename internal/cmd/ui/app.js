@@ -163,6 +163,15 @@
     }
   });
 
+  // External links (GitHub footer etc.): open in system browser, not WebView
+  document.querySelectorAll('.js-open-external').forEach(a => {
+    a.addEventListener('click', (e) => {
+      e.preventDefault();
+      const url = a.dataset.url || a.href;
+      if (url) api.openURL(url);
+    });
+  });
+
   // Modal Controls
   openSettingsBtn.addEventListener('click', () => {
     renderGatewayManagerTable();
@@ -517,6 +526,9 @@
       rememberPwdCheckbox.checked = config.remember !== false;
       if (config.appVersion) {
         document.querySelectorAll('.version-badge').forEach(el => {
+          el.textContent = config.appVersion;
+        });
+        document.querySelectorAll('.app-version-text').forEach(el => {
           el.textContent = config.appVersion;
         });
       }
