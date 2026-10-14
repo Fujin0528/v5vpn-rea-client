@@ -1,13 +1,13 @@
 package service
 
 import (
+	"context"
 	"fmt"
 	"os/exec"
 	"runtime"
 	"sync"
 	"time"
 
-	"github.com/egoist/mygo/plugins/updater"
 	"github.com/hygkui/v5vpn-rea-client/internal/config"
 	"github.com/hygkui/v5vpn-rea-client/internal/protocol"
 	"github.com/hygkui/v5vpn-rea-client/internal/proxy"
@@ -23,6 +23,7 @@ type VPNService struct {
 	Resources      []protocol.VPNResource
 	Logs           []string
 	OnStatusChange func(string)
+	appVersion     string
 	mu             sync.Mutex
 	logMu          sync.Mutex
 	onLog          func(string)
@@ -104,12 +105,49 @@ func (s *VPNService) OpenURL(rawURL string) error {
 	return cmd.Start()
 }
 
-// CheckForUpdates opens the mygo self-update window, same as the tray
-// "Check for Updates..." menu item. Exposed to the frontend so the footer
-// buttons can trigger a check without going through the tray.
-func (s *VPNService) CheckForUpdates() bool {
-	updater.CheckForUpdates()
-	return true
+// SetAppVersion sets the application version used for update checks
+func (s *VPNService) SetAppVersion(ver string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.appVersion = ver
+}
+
+// CheckForUpdates checks GitHub releases for a newer version than currentVersion.
+func (s *VPNService) CheckForUpdates() *UpdateInfo {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	s.mu.Lock()
+	current := s.appVersion
+	s.mu.Unlock()
+	if current == "" {
+		current = "v0.1.1"
+	}
+
+	repo := "hygkui/v5vpn-rea-client"
+
+	// 1. Try manifest from releases/latest/download/ (no rate limit, contains release notes and assets)
+	if info, err := CheckUpdateManifest(ctx, repo, current); err == nil && info != nil {
+		return info
+	}
+
+	// 2. Try 302 redirect of https://github.com/<repo>/releases/latest (no rate limit)
+	if info, err := CheckGitHubReleaseRedirect(ctx, repo, current); err == nil && info != nil {
+		return info
+	}
+
+	// 3. Fallback to GitHub REST API
+	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", repo)
+	info, err := CheckUpdateFromURL(ctx, apiURL, current)
+	if err != nil {
+		return &UpdateInfo{
+			HasUpdate:      false,
+			CurrentVersion: current,
+			Error:          "检查更新失败（请检查网络连接或直接访问 GitHub Releases）",
+			ReleaseURL:     "https://github.com/" + repo + "/releases",
+		}
+	}
+	return info
 }
 
 // Log adds a log entry with timestamp and level

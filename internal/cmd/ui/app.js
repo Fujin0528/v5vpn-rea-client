@@ -179,16 +179,38 @@
     });
   });
 
-  // Footer update buttons: trigger the native updater window
+  // Footer update buttons: trigger the update check with clear UI feedback
   document.querySelectorAll('.js-check-updates').forEach(btn => {
     btn.addEventListener('click', async () => {
       const original = btn.innerHTML;
       btn.disabled = true;
       btn.innerHTML = '⏳ 正在检查…';
       try {
-        await api.checkUpdates();
-      } catch (_) {}
-      setTimeout(() => { btn.innerHTML = original; btn.disabled = false; }, 2000);
+        const res = await api.checkUpdates();
+        if (res && res.error) {
+          btn.innerHTML = '❌ 检查失败';
+          alert('检查更新失败：\n' + res.error + '\n\n您可以手动前往 GitHub Releases 页面查看。');
+        } else if (res && res.hasUpdate) {
+          btn.innerHTML = '🎉 发现新版 ' + res.latestVersion;
+          const notes = res.releaseNotes ? ('\n\n更新说明：\n' + res.releaseNotes) : '';
+          const msg = `发现新版本 ${res.latestVersion}（当前版本: ${res.currentVersion}）${notes}\n\n是否打开浏览器前往下载？`;
+          if (confirm(msg)) {
+            await api.openURL(res.releaseURL || 'https://github.com/hygkui/v5vpn-rea-client/releases');
+          }
+        } else if (res) {
+          btn.innerHTML = '✔ 已是最新版 (' + res.currentVersion + ')';
+        } else {
+          btn.innerHTML = '✔ 已是最新版本';
+        }
+      } catch (e) {
+        btn.innerHTML = '❌ 检查异常';
+        alert('检查更新异常：' + (e.message || e));
+      } finally {
+        setTimeout(() => {
+          btn.innerHTML = original;
+          btn.disabled = false;
+        }, 3000);
+      }
     });
   });
 

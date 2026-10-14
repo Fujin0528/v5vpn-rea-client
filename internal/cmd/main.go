@@ -13,7 +13,6 @@ import (
 	"strings"
 
 	"github.com/egoist/mygo"
-	"github.com/egoist/mygo/plugins/updater"
 	"github.com/hygkui/v5vpn-rea-client/internal/config"
 	"github.com/hygkui/v5vpn-rea-client/internal/service"
 )
@@ -61,6 +60,7 @@ func main() {
 			fmt.Println(msg)
 		}
 	})
+	vpnService.SetAppVersion(AppVersion)
 
 	// CLI Connect Mode
 	if *cliMode && *connectGW != "" {
@@ -83,15 +83,8 @@ func main() {
 
 	// Initialize MyGo Desktop Framework
 	log.Printf("Starting V5VPN Client with MyGo framework...")
-	// Auto-update checker: background poll ~10s after launch, plus a
-	// "Check for Updates..." item in the tray menu. When the user
-	// accepts an update mygo.Relaunch() spins up the new binary; we
-	// tear down the active VPN session first so the gateway does not
-	// see an orphan VSG_SESSIONID on the next reconnect.
-	mygo.Use(updater.Plugin)
 	// Belt-and-braces: even if a quit is triggered by a code path that
-	// forgets to call vpnService.Logout() (e.g. an updater-driven
-	// relaunch), the OnBeforeQuit hook fires before the process exits
+	// forgets to call vpnService.Logout(), the OnBeforeQuit hook fires before the process exits
 	// and tears the VPN tunnel down so the gateway does not see an
 	// orphan session on the next reconnect.
 	mygo.App.OnBeforeQuit(func(e *mygo.QuitEvent) {
@@ -219,7 +212,51 @@ func main() {
 						}
 					},
 				},
-				updater.MenuItem(),
+				{
+					Label: "检查更新...",
+					Click: func(item *mygo.MenuItem, w *mygo.Window) {
+						go func() {
+							info := vpnService.CheckForUpdates()
+							if info.Error != "" {
+								res, err := mygo.Dialog.Message(mygo.MessageOptions{
+									Parent:  win,
+									Title:   "检查更新",
+									Message: "检查更新失败",
+									Detail:  info.Error,
+									Buttons: []string{"确定", "前往 GitHub 查看"},
+								})
+								if err == nil && res.Button == 1 {
+									_ = vpnService.OpenURL(info.ReleaseURL)
+								}
+								return
+							}
+
+							if info.HasUpdate {
+								detail := fmt.Sprintf("当前版本: %s\n最新版本: %s\n\n更新说明:\n%s", info.CurrentVersion, info.LatestVersion, info.ReleaseNotes)
+								res, err := mygo.Dialog.Message(mygo.MessageOptions{
+									Parent:        win,
+									Title:         "发现新版本",
+									Message:       fmt.Sprintf("发现新版本 %s！", info.LatestVersion),
+									Detail:        detail,
+									Buttons:       []string{"前往下载", "稍后再说"},
+									DefaultButton: 0,
+									CancelButton:  1,
+								})
+								if err == nil && res.Button == 0 {
+									_ = vpnService.OpenURL(info.ReleaseURL)
+								}
+							} else {
+								_, _ = mygo.Dialog.Message(mygo.MessageOptions{
+									Parent:  win,
+									Title:   "检查更新",
+									Message: "当前已是最新版本",
+									Detail:  fmt.Sprintf("当前版本 %s 已是最新版本，无需更新。", info.CurrentVersion),
+									Buttons: []string{"确定"},
+								})
+							}
+						}()
+					},
+				},
 				mygo.Separator(),
 			}
 
@@ -460,11 +497,9 @@ func startHTTPServer(port int, uiFS fs.FS, vpnService *service.VPNService) int {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		// Same as the tray "Check for Updates..." item: opens the updater
-		// window (or reports dev-build/unavailable there).
-		updater.CheckForUpdates()
+		info := vpnService.CheckForUpdates()
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]bool{"success": true})
+		_ = json.NewEncoder(w).Encode(info)
 	})
 
 	// Static UI assets
