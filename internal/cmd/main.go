@@ -32,7 +32,7 @@ const AppName = "v5vpn-rea"
 // TestAppVersionMatchesMygoJSON test fails the build if they drift.
 // NOTE: "2.0" is the gateway protocol version (/vpn/version.xml), not the
 // app version — do not "fix" this back to v2.0.0.
-var AppVersion = "v0.2.0"
+var AppVersion = "v0.2.1"
 
 var mainWindow *mygo.Window
 

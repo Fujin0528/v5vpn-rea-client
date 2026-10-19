@@ -26,10 +26,10 @@ on:
 
 | 文件 | 位置 | 说明 |
 |:---|:---|:---|
-| `mygo.json` | `"version": "0.2.0"` | 不带 `v`；workflow 用它校验 tag |
-| `internal/cmd/main.go` | `var AppVersion = "v0.2.0"` | 带 `v`；运行时版本与更新检查基准 |
+| `mygo.json` | `"version": "0.2.1"` | 不带 `v`；workflow 用它校验 tag |
+| `internal/cmd/main.go` | `var AppVersion = "v0.2.1"` | 带 `v`；运行时版本与更新检查基准 |
 | `internal/cmd/ui/index.html` | 4 处 `version-badge` / `app-version-text` | 界面显示的版本徽标 |
-| `CHANGELOG.md` | `## 0.2.0` 标题 | 发布说明来源 |
+| `CHANGELOG.md` | `## 0.2.1` 标题 | 发布说明来源 |
 
 `internal/cmd/version_test.go` 的 `TestAppVersionMatchesMygoJSON` 会校验前两者，
 漂移时 CI 失败。
@@ -43,8 +43,8 @@ on:
 `CHANGELOG.md` 是**唯一的发布说明来源**。约定：
 
 - 一级标题 `# 更新日志`；
-- 每个版本一个二级标题，精确匹配版本号：`## 0.2.0`；
-  也兼容 Keep a Changelog 的 `## [0.2.0] - 2026-10-19` 写法（workflow 会去掉方括号）；
+- 每个版本一个二级标题，精确匹配版本号：`## 0.2.1`；
+  也兼容 Keep a Changelog 的 `## [0.2.1] - 2026-10-19` 写法（workflow 会去掉方括号）；
 - 开发中的改动先写在 `## Unreleased` 下，发版时改名为 `## <版本号>`；
 - **内容用中文书写**。
 
