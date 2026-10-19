@@ -224,10 +224,12 @@ func LoadSettingXML(path string) (*AppConfig, error) {
 	return cfg, nil
 }
 
-// SaveSettingXML serializes AppConfig back to setting.xml. If the
-// caller has configured a per-user data directory via SetUserDataDir,
-// the file is created there so an updater-driven replacement of the
-// application directory does not erase the operator's saved credentials.
+// SaveSettingXML serializes AppConfig back to setting.xml. With no target
+// path it writes to the file the config was loaded from (cfg.SourcePath), so
+// a portable setting.xml next to the executable keeps receiving edits; a
+// config with no source file is created in the per-user data directory
+// configured via SetUserDataDir. Together this keeps an updater-driven
+// replacement of the application directory from erasing saved credentials.
 func (cfg *AppConfig) SaveSettingXML(targetPath string) error {
 	if targetPath == "" {
 		return cfg.saveToConfiguredPath("")

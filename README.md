@@ -224,7 +224,11 @@ mygo 内建了 ed25519 签名的自更新机制。`mygo.json` 的 `updates.publi
 | macOS | `~/Library/Application Support/v5vpn-rea/setting.xml` |
 
 这些目录由 `mygo.App.Path(PathUserData)` 解析（`os.UserConfigDir()` 拼上
-`mygo.json` 的 `name`）。**自更新不会擦掉用户配置**，
+应用名）。`mygo build` 从 `mygo.json` 的 `name` 取得应用名；`go build`
+开发者构建没有版本资源，因此 `main` 里通过 `mygo.App.SetName(AppName)`
+显式设置为同一个名字，两种构建读写同一份 `setting.xml`
+（`TestAppNameMatchesMygoJSON` 保证 `mygo.json` 与常量不漂移）。
+**自更新不会擦掉用户配置**，
 因为 mygo build 把应用目录整体替换，而 setting.xml 不再放在那里。
 
 如果想使用旧版「exe 同目录」的布局（例如便携式部署），把 `setting.xml`

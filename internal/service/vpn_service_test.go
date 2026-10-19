@@ -166,6 +166,69 @@ func TestSaveGatewayAddsNewGateway(t *testing.T) {
 	}
 }
 
+// Deleting a gateway leaves a gap in the ID sequence. A new gateway must not
+// fill it with an ID that is still in use, because DeleteGateway matches on
+// the duplicate and would remove both profiles.
+func TestSaveGatewayIDsAreUniqueAfterDelete(t *testing.T) {
+	s := NewVPNService(nil)
+	s.Config = &config.AppConfig{Gateways: []config.GatewayProfile{
+		{ID: "gw-0", Name: "office"},
+		{ID: "gw-1", Name: "home"},
+	}}
+	t.Chdir(t.TempDir())
+
+	if err := s.DeleteGateway("gw-0"); err != nil {
+		t.Fatalf("DeleteGateway failed: %v", err)
+	}
+	if err := s.SaveGateway(config.GatewayProfile{Name: "new"}); err != nil {
+		t.Fatalf("SaveGateway failed: %v", err)
+	}
+
+	gateways := s.GetGateways()
+	if len(gateways) != 2 {
+		t.Fatalf("expected 2 gateways, got %d", len(gateways))
+	}
+	seen := map[string]bool{}
+	for _, gw := range gateways {
+		if seen[gw.ID] {
+			t.Fatalf("duplicate gateway ID %q in %+v", gw.ID, gateways)
+		}
+		seen[gw.ID] = true
+	}
+
+	if err := s.DeleteGateway("gw-0"); err != nil {
+		t.Fatalf("DeleteGateway on the new gateway failed: %v", err)
+	}
+	if got := s.GetGateways(); len(got) != 1 || got[0].Name != "home" {
+		t.Fatalf("deleting the new gateway removed the wrong profiles: %+v", got)
+	}
+}
+
+// An empty account list is how a caller that omits the field arrives over
+// JSON; it must keep the stored credentials just like a nil slice does.
+func TestSaveGatewayTreatsEmptyAccountsAsOmitted(t *testing.T) {
+	s := NewVPNService(nil)
+	s.Config = &config.AppConfig{Gateways: []config.GatewayProfile{{
+		ID:            "gw-0",
+		Name:          "office",
+		SavedAccounts: []config.UserAccount{{Username: "alice", Password: "secret"}},
+	}}}
+	t.Chdir(t.TempDir())
+
+	if err := s.SaveGateway(config.GatewayProfile{
+		Name:          "office",
+		IP:            "198.51.100.7",
+		SavedAccounts: []config.UserAccount{},
+	}); err != nil {
+		t.Fatalf("SaveGateway failed: %v", err)
+	}
+
+	gw := s.GetGateways()[0]
+	if len(gw.SavedAccounts) != 1 || gw.SavedAccounts[0].Password != "secret" {
+		t.Fatalf("empty account list wiped the stored credentials: %+v", gw.SavedAccounts)
+	}
+}
+
 func TestVPNService_LoginGateway2(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test skipped in -short mode")

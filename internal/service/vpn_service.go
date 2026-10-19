@@ -213,6 +213,11 @@ func (s *VPNService) GetGateways() []config.GatewayProfile {
 // from the stored profile. The add-gateway form only submits name/IP/port/algo,
 // so a plain struct assignment used to zero the saved accounts, let the caller
 // silently drop every stored credential, and then write that loss to disk.
+//
+// A non-empty SavedAccounts list still replaces the stored accounts. Nil and
+// empty are both treated as "not supplied": no caller, the UI included, can
+// express "delete every saved credential", and an empty JSON array used to
+// wipe them the same way a plain struct assignment did.
 func (s *VPNService) SaveGateway(gw config.GatewayProfile) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -229,7 +234,7 @@ func (s *VPNService) SaveGateway(gw config.GatewayProfile) error {
 			if gw.LastUserName == "" {
 				gw.LastUserName = existing.LastUserName
 			}
-			if gw.SavedAccounts == nil {
+			if len(gw.SavedAccounts) == 0 {
 				gw.SavedAccounts = existing.SavedAccounts
 			}
 			*existing = gw
@@ -238,11 +243,28 @@ func (s *VPNService) SaveGateway(gw config.GatewayProfile) error {
 	}
 
 	if gw.ID == "" {
-		gw.ID = fmt.Sprintf("gw-%d", len(s.Config.Gateways))
+		gw.ID = nextGatewayID(s.Config.Gateways)
 	}
 	s.Config.Gateways = append(s.Config.Gateways, gw)
 
 	return s.Config.SaveSettingXML("")
+}
+
+// nextGatewayID returns the smallest "gw-N" identifier not already in use.
+// Deriving the ID from len(gateways) reuses the ID of a hidden gap: delete
+// gw-0 out of {gw-0, gw-1}, add a gateway, and it becomes another gw-1.
+// DeleteGateway matches on ID, so the duplicate then removes both profiles.
+func nextGatewayID(gateways []config.GatewayProfile) string {
+	used := make(map[string]bool, len(gateways))
+	for _, gw := range gateways {
+		used[gw.ID] = true
+	}
+	for n := 0; ; n++ {
+		id := fmt.Sprintf("gw-%d", n)
+		if !used[id] {
+			return id
+		}
+	}
 }
 
 // DeleteGateway removes a gateway profile

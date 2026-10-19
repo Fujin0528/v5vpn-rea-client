@@ -20,6 +20,14 @@ import (
 //go:embed all:ui
 var uiEmbedFS embed.FS
 
+// AppName MUST match mygo.json "name". `mygo build` embeds that value in
+// the executable's version resource and mygo.App.Name() reads it from there;
+// a plain `go build` has no resource, so main sets it explicitly with
+// mygo.App.SetName. Without that, developer builds derive the name from the
+// executable and store setting.xml under a different directory than the
+// released binary. TestAppNameMatchesMygoJSON guards the pair.
+const AppName = "v5vpn-rea"
+
 // AppVersion MUST match mygo.json "version" (with "v" prefix); the
 // TestAppVersionMatchesMygoJSON test fails the build if they drift.
 // NOTE: "2.0" is the gateway protocol version (/vpn/version.xml), not the
@@ -50,8 +58,13 @@ func main() {
 	// reading the working directory / exe directory instead of the file this
 	// build actually writes to. The loader also needs this for the
 	// -dump-passwords path, which returns before the GUI ever starts.
-	// mygo.App.Path only touches os.UserConfigDir and App.Name, so it is safe
-	// before mygo.App.Run.
+	//
+	// SetName makes PathUserData resolve to the same directory for every build
+	// flavor: mygo build reads the name from the version resource it embeds,
+	// while a plain go build would otherwise fall back to the executable name
+	// (v5vpn-rea.exe → %APPDATA%\v5vpn-rea.exe). It must run before Path,
+	// which uses the name to build the directory.
+	mygo.App.SetName(AppName)
 	if dataDir, err := mygo.App.Path(mygo.PathUserData); err == nil && dataDir != "" {
 		config.SetUserDataDir(dataDir)
 	}
