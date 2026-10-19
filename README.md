@@ -185,6 +185,24 @@ go tool mygo build -platform windows/amd64,linux/amd64,darwin/arm64 -upload
 / `.deb` 等。`.gitignore` 已把 `mygo-update.key`、`mygo-update.pub` 与
 `/build/` 排除，私钥不会入库。
 
+### 8.1 发版流程
+
+日常开发 merge 到 `master` **不会**产生 Release：`.github/workflows/release.yml`
+只在推送 `v*` tag 时触发。正式发版需要同步四处版本号（`mygo.json`、
+`internal/cmd/main.go`、`internal/cmd/ui/index.html`、`CHANGELOG.md`），
+提交后推送 tag：
+
+```bash
+git tag -a v0.2.1 -m "v0.2.1 - 简要说明"
+git push origin v0.2.1
+```
+
+workflow 会自动创建 draft、构建三平台产物，全部通过后转为正式发布，
+发布说明取自 `CHANGELOG.md` 对应段落（中文）。
+
+完整步骤、发布后验证命令、修改历史 Release 说明的方法以及常见问题，
+见 **[docs/RELEASING.md](docs/RELEASING.md)**。
+
 ## 9. 自更新与签名
 
 mygo 内建了 ed25519 签名的自更新机制。`mygo.json` 的 `updates.publicKey`
