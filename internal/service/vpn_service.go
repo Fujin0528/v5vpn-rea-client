@@ -206,25 +206,41 @@ func (s *VPNService) GetGateways() []config.GatewayProfile {
 	return s.Config.Snapshot().Gateways
 }
 
-// SaveGateway adds or updates a gateway profile
+// SaveGateway adds or updates a gateway profile.
+//
+// When an existing profile matches by ID or name, only the fields the caller
+// actually edits are replaced: ID, SavedAccounts and LastUserName are kept
+// from the stored profile. The add-gateway form only submits name/IP/port/algo,
+// so a plain struct assignment used to zero the saved accounts, let the caller
+// silently drop every stored credential, and then write that loss to disk.
 func (s *VPNService) SaveGateway(gw config.GatewayProfile) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	found := false
 	for i := range s.Config.Gateways {
-		if s.Config.Gateways[i].ID == gw.ID || s.Config.Gateways[i].Name == gw.Name {
-			s.Config.Gateways[i] = gw
-			found = true
-			break
+		existing := &s.Config.Gateways[i]
+		if existing.ID == gw.ID || existing.Name == gw.Name {
+			// Preserve the identity and credential fields the caller did not
+			// supply, so correcting an IP or port cannot cost the operator
+			// their saved passwords.
+			if gw.ID == "" {
+				gw.ID = existing.ID
+			}
+			if gw.LastUserName == "" {
+				gw.LastUserName = existing.LastUserName
+			}
+			if gw.SavedAccounts == nil {
+				gw.SavedAccounts = existing.SavedAccounts
+			}
+			*existing = gw
+			return s.Config.SaveSettingXML("")
 		}
 	}
-	if !found {
-		if gw.ID == "" {
-			gw.ID = fmt.Sprintf("gw-%d", len(s.Config.Gateways))
-		}
-		s.Config.Gateways = append(s.Config.Gateways, gw)
+
+	if gw.ID == "" {
+		gw.ID = fmt.Sprintf("gw-%d", len(s.Config.Gateways))
 	}
+	s.Config.Gateways = append(s.Config.Gateways, gw)
 
 	return s.Config.SaveSettingXML("")
 }

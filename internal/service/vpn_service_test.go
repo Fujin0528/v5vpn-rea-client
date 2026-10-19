@@ -97,6 +97,75 @@ func TestChangePasswordRejectsBlankOrUnchanged(t *testing.T) {
 	}
 }
 
+// The add-gateway form posts only name/IP/port/algo. Editing an existing
+// gateway through it must not wipe the credentials the operator saved by
+// logging in, and must not persist that loss to setting.xml.
+func TestSaveGatewayKeepsSavedAccountsWhenEditing(t *testing.T) {
+	s := NewVPNService(nil)
+	s.Config = &config.AppConfig{
+		Gateways: []config.GatewayProfile{{
+			ID:           "gw-0",
+			Name:         "office",
+			IP:           "203.0.113.10",
+			Port:         443,
+			Algo:         0,
+			LastUserName: "alice",
+			SavedAccounts: []config.UserAccount{
+				{Username: "alice", Password: "secret", Remember: true},
+			},
+		}},
+	}
+	// Keep the test off the real user data directory.
+	t.Chdir(t.TempDir())
+
+	// Same name, corrected IP and port: exactly what the UI submits.
+	if err := s.SaveGateway(config.GatewayProfile{
+		Name: "office",
+		IP:   "198.51.100.7",
+		Port: 8443,
+		Algo: 1,
+	}); err != nil {
+		t.Fatalf("SaveGateway failed: %v", err)
+	}
+
+	gateways := s.GetGateways()
+	if len(gateways) != 1 {
+		t.Fatalf("expected 1 gateway, got %d (a duplicate was appended)", len(gateways))
+	}
+	gw := gateways[0]
+	if gw.IP != "198.51.100.7" || gw.Port != 8443 || gw.Algo != 1 {
+		t.Fatalf("edited fields were not applied: %+v", gw)
+	}
+	if gw.ID != "gw-0" {
+		t.Errorf("gateway ID changed: %q", gw.ID)
+	}
+	if gw.LastUserName != "alice" {
+		t.Errorf("LastUserName was cleared: %q", gw.LastUserName)
+	}
+	if len(gw.SavedAccounts) != 1 || gw.SavedAccounts[0].Password != "secret" {
+		t.Fatalf("saved accounts were wiped: %+v", gw.SavedAccounts)
+	}
+}
+
+// A brand-new gateway still gets an ID and is appended exactly once.
+func TestSaveGatewayAddsNewGateway(t *testing.T) {
+	s := NewVPNService(nil)
+	s.Config = &config.AppConfig{}
+	t.Chdir(t.TempDir())
+
+	if err := s.SaveGateway(config.GatewayProfile{Name: "new", IP: "198.51.100.9", Port: 443}); err != nil {
+		t.Fatalf("SaveGateway failed: %v", err)
+	}
+
+	gateways := s.GetGateways()
+	if len(gateways) != 1 {
+		t.Fatalf("expected 1 gateway, got %d", len(gateways))
+	}
+	if gateways[0].ID != "gw-0" {
+		t.Errorf("new gateway ID = %q, want gw-0", gateways[0].ID)
+	}
+}
+
 func TestVPNService_LoginGateway2(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test skipped in -short mode")
