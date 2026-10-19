@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -59,7 +58,7 @@ func NewClient(ip string, port int, algo int, logger func(string, string, ...any
 	httpClient := &http.Client{
 		Transport: tr,
 		Jar:       jar,
-		Timeout:   15 * time.Second,
+		Timeout:   30 * time.Second,
 	}
 
 	baseURL := fmt.Sprintf("https://%s:%d", ip, port)
@@ -102,14 +101,103 @@ func (c *Client) Handshake() (*VersionResponse, error) {
 	return &v, nil
 }
 
-// Login authenticates user with gateway using AES-128-CBC encrypted credentials
+// Login authenticates user with gateway using AES-128-CBC encrypted credentials.
 func (c *Client) Login(username, password, verifycode string) (*IntegrationInfo, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.authenticate(username, password, verifycode)
+}
 
+// ChangePassword submits the old and new passwords to /vpn/user/auth/pwdchange.
+// Both passwords are base64-encoded with encode=1.
+func (c *Client) ChangePassword(username, oldPassword, newPassword, verifycode string) error {
+	if strings.TrimSpace(newPassword) == "" {
+		return fmt.Errorf("新密码不能为空")
+	}
+	if newPassword == oldPassword {
+		return fmt.Errorf("新密码不能与当前密码相同")
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.Logger("INFO", "Submitting password change for user: %s", username)
+
+	// The 0x100 login challenge may have set VSG_SESSIONID. Refresh it from
+	// the jar so the change request carries the same session as the original
+	// client.
+	c.captureSession()
+
+	changeBody := passwordChangeBody(oldPassword, newPassword)
+	changeURL := fmt.Sprintf("%s/vpn/user/auth/pwdchange", c.BaseURL)
+
+	req, err := http.NewRequest(http.MethodPost, changeURL, strings.NewReader(changeBody))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("User-Agent", "LeadSec VPN Client")
+	// A non-nil jar attaches VSG_SESSIONID itself; setting the header too
+	// would make Go send the same cookie twice.
+	if c.HTTPClient.Jar == nil && c.SessionCookie != "" {
+		req.Header.Set("Cookie", c.SessionCookie)
+	}
+
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		c.Logger("ERROR", "Password change request failed: %v", err)
+		return fmt.Errorf("修改密码网络请求失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, readErr := io.ReadAll(resp.Body)
+	if readErr != nil {
+		return fmt.Errorf("读取修改密码响应失败: %w", readErr)
+	}
+	respBody = prepareGatewayXML(respBody)
+	c.Logger("INFO", "Password change response status: %s", resp.Status)
+
+	var authResp AuthResponse
+	parseErr := xml.Unmarshal(respBody, &authResp)
+	if parseErr != nil {
+		c.Logger("WARN", "Password change response was not XML: %s", string(respBody))
+	}
+	resultCode := strings.TrimSpace(authResp.Result.Code)
+
+	// A gateway error is authoritative even when it arrives with a non-200
+	// status, so surface it before the HTTP status check.
+	if parseErr == nil && resultCode != "" && !isSuccessCode(resultCode) {
+		authErr := newAuthError(resultCode, authResp.Result.Msg)
+		c.Logger("ERROR", "Gateway rejected password change: %s", authErr.Error())
+		return authErr
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("password change failed with HTTP status %d: %s", resp.StatusCode, string(respBody))
+	}
+	if parseErr != nil {
+		return fmt.Errorf("修改密码响应无法解析: %w", parseErr)
+	}
+	if resultCode == "" {
+		return fmt.Errorf("修改密码响应缺少结果码，无法确认修改成功")
+	}
+
+	c.captureSession()
+	c.Logger("SUCCESS", "Password changed successfully for user: %s", username)
+	return nil
+}
+
+// AuthPassword verifies the user credentials against /vpn/user/auth/password
+// and captures the session cookie without fetching integration resources.
+func (c *Client) AuthPassword(username, password, verifycode string) (*AuthResponse, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.authPasswordLocked(username, password, verifycode)
+}
+
+func (c *Client) authPasswordLocked(username, password, verifycode string) (*AuthResponse, error) {
 	c.Logger("INFO", "Initiating password authentication for user: %s", username)
 
-	// Encrypt username and password using AES-128-CBC
 	encUser, err := crypto.EncryptAuthParam(username)
 	if err != nil {
 		return nil, fmt.Errorf("failed to encrypt username: %w", err)
@@ -119,58 +207,26 @@ func (c *Client) Login(username, password, verifycode string) (*IntegrationInfo,
 		return nil, fmt.Errorf("failed to encrypt password: %w", err)
 	}
 
-	// In V5VPN protocol (SecController.dll), for version >= 1.0 (such as version 2.0 gateways),
-	// credentials are encrypted using AES-128-CBC and encode parameter MUST be "2".
-	// encode=1 indicates Base64 encoding only (without AES).
-	// Passing encode=1 with AES ciphertext caused gateway to report "用户名或密码错误" (0x8000001A).
-	// Format is raw parameter concatenation as implemented in SecController.dll without URL-escaping.
-	authBody := fmt.Sprintf("username=%s&password=%s&encode=2&verifycode=%s", encUser, encPwd, verifycode)
+	// encode=2 tells a v2.0 gateway to AES-128-CBC decrypt. encode=1 is
+	// legacy base64 and makes the gateway answer 0x8000001A. The body is
+	// raw concatenation without URL-escaping.
+	authBody := passwordAuthBody(encUser, encPwd, verifycode)
 
-	authURL := fmt.Sprintf("%s/vpn/user/auth/password", c.BaseURL)
-	req, err := http.NewRequest("POST", authURL, strings.NewReader(authBody))
+	authResp, respBody, statusCode, err := c.postAuth(authBody)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("User-Agent", "LeadSec VPN Client")
 
-	resp, err := c.HTTPClient.Do(req)
-	if err != nil {
-		c.Logger("ERROR", "Auth request failed: %v", err)
-		return nil, fmt.Errorf("auth request network error: %w", err)
-	}
-	defer resp.Body.Close()
+	c.captureSession()
 
-	respBody, _ := io.ReadAll(resp.Body)
-	c.Logger("INFO", "Auth response status: %s", resp.Status)
-
-	// Parse XML response body to detect gateway errors
-	var authResp AuthResponse
-	if err := xml.Unmarshal(respBody, &authResp); err == nil && authResp.Result.Code != "" {
-		codeVal, _ := strconv.ParseUint(strings.TrimPrefix(authResp.Result.Code, "0x"), 16, 64)
-		if authResp.Result.Code != "0" && authResp.Result.Code != "0x0" && codeVal != 0 {
-			errMsg := authResp.Result.Msg
-			if errMsg == "" {
-				errMsg = "网关拒绝登录认证"
-			}
-			c.Logger("ERROR", "Gateway authentication failed: %s (code: %s)", errMsg, authResp.Result.Code)
-			return nil, fmt.Errorf("登录失败: %s (错误代码: %s)", errMsg, authResp.Result.Code)
-		}
+	if authResp.Result.Code != "" && !isSuccessCode(authResp.Result.Code) {
+		authErr := newAuthError(authResp.Result.Code, authResp.Result.Msg)
+		c.Logger("ERROR", "Gateway authentication failed: %s", authErr.Error())
+		return &authResp, authErr
 	}
 
-	// Check cookies for session ID (VSG_SESSIONID)
-	u, _ := url.Parse(c.BaseURL)
-	for _, cookie := range c.HTTPClient.Jar.Cookies(u) {
-		if strings.EqualFold(cookie.Name, "VSG_SESSIONID") && cookie.Value != "" {
-			c.SessionID = cookie.Value
-			c.SessionCookie = cookie.String()
-			c.Logger("SUCCESS", "Acquired Session ID: %s", c.SessionID)
-			break
-		}
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("login failed with HTTP status %d: %s", resp.StatusCode, string(respBody))
+	if statusCode != http.StatusOK {
+		return nil, fmt.Errorf("login failed with HTTP status %d: %s", statusCode, string(respBody))
 	}
 
 	if c.SessionID == "" {
@@ -178,7 +234,15 @@ func (c *Client) Login(username, password, verifycode string) (*IntegrationInfo,
 		return nil, fmt.Errorf("登录未下发有效会话ID (可能凭证错误或需要图形验证码)")
 	}
 
-	// Fetch integration resources
+	return &authResp, nil
+}
+
+// authenticate posts /vpn/user/auth/password for login authentication. Caller holds c.mu.
+func (c *Client) authenticate(username, password, verifycode string) (*IntegrationInfo, error) {
+	if _, err := c.authPasswordLocked(username, password, verifycode); err != nil {
+		return nil, err
+	}
+
 	integration, err := c.fetchIntegrationInfo()
 	if err != nil {
 		c.Logger("ERROR", "Fetch integration info failed: %v", err)
@@ -191,14 +255,55 @@ func (c *Client) Login(username, password, verifycode string) (*IntegrationInfo,
 
 	c.isLoggedIn = true
 
-	// Start heartbeat
 	interval := 180 * time.Second
-	if c.Integration != nil && c.Integration.Session.DetectInterval > 0 {
+	if c.Integration.Session.DetectInterval > 0 {
 		interval = time.Duration(c.Integration.Session.DetectInterval) * time.Second
 	}
 	c.startHeartbeatLoop(interval)
 
 	return c.Integration, nil
+}
+
+func (c *Client) postAuth(authBody string) (AuthResponse, []byte, int, error) {
+	authURL := fmt.Sprintf("%s/vpn/user/auth/password", c.BaseURL)
+	req, err := http.NewRequest(http.MethodPost, authURL, strings.NewReader(authBody))
+	if err != nil {
+		return AuthResponse{}, nil, 0, err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("User-Agent", "LeadSec VPN Client")
+
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		c.Logger("ERROR", "Auth request failed: %v", err)
+		return AuthResponse{}, nil, 0, fmt.Errorf("auth request network error: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	respBody = prepareGatewayXML(respBody)
+	c.Logger("INFO", "Auth response status: %s", resp.Status)
+
+	var authResp AuthResponse
+	if err := xml.Unmarshal(respBody, &authResp); err != nil {
+		c.Logger("WARN", "Auth response was not XML: %s", string(respBody))
+	}
+	return authResp, respBody, resp.StatusCode, nil
+}
+
+func (c *Client) captureSession() {
+	u, err := url.Parse(c.BaseURL)
+	if err != nil || c.HTTPClient.Jar == nil {
+		return
+	}
+	for _, cookie := range c.HTTPClient.Jar.Cookies(u) {
+		if strings.EqualFold(cookie.Name, "VSG_SESSIONID") && cookie.Value != "" {
+			c.SessionID = cookie.Value
+			c.SessionCookie = cookie.String()
+			c.Logger("SUCCESS", "Acquired Session ID: %s", c.SessionID)
+			return
+		}
+	}
 }
 
 // fetchIntegrationInfo retrieves the integration.xml containing resources and policies

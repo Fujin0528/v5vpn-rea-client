@@ -2,9 +2,11 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os/exec"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -13,20 +15,29 @@ import (
 	"github.com/hygkui/v5vpn-rea-client/internal/proxy"
 )
 
+// passwordChallenge retains the HTTP client that received a 0x100 login
+// challenge. /vpn/user/auth/pwdchange must reuse it so the VSG_SESSIONID
+// cookie issued by that response is sent with the change request.
+type passwordChallenge struct {
+	client   *protocol.Client
+	username string
+}
+
 // VPNService is the backend service exposed to the MyGo frontend
 type VPNService struct {
-	Config         *config.AppConfig
-	Client         *protocol.Client
-	ProxyMgr       *proxy.ProxyManager
-	Status         string // "Disconnected", "Connecting", "Connected", "Error"
-	StatusDetail   string
-	Resources      []protocol.VPNResource
-	Logs           []string
-	OnStatusChange func(string)
-	appVersion     string
-	mu             sync.Mutex
-	logMu          sync.Mutex
-	onLog          func(string)
+	Config            *config.AppConfig
+	Client            *protocol.Client
+	ProxyMgr          *proxy.ProxyManager
+	Status            string // "Disconnected", "Connecting", "Connected", "Error"
+	StatusDetail      string
+	Resources         []protocol.VPNResource
+	Logs              []string
+	OnStatusChange    func(string)
+	appVersion        string
+	passwordChallenge *passwordChallenge
+	mu                sync.Mutex
+	logMu             sync.Mutex
+	onLog             func(string)
 }
 
 // NewVPNService initializes the VPN service with loaded settings
@@ -238,28 +249,11 @@ func (s *VPNService) Login(gwIdentifier, username, password, verifycode string, 
 	gwPort := gw.Port
 	gwAlgo := gw.Algo
 	s.Config.LastUseGateway = gw.Name
+	// A fresh authentication attempt supersedes any previous challenge.
+	s.passwordChallenge = nil
 
-	// Save or update credentials if remember is true
 	if remember {
-		gw.LastUserName = username
-		accountFound := false
-		for idx := range gw.SavedAccounts {
-			if gw.SavedAccounts[idx].Username == username {
-				gw.SavedAccounts[idx].Password = password
-				gw.SavedAccounts[idx].Remember = remember
-				gw.SavedAccounts[idx].Auto = auto
-				accountFound = true
-				break
-			}
-		}
-		if !accountFound {
-			gw.SavedAccounts = append(gw.SavedAccounts, config.UserAccount{
-				Username: username,
-				Password: password,
-				Remember: remember,
-				Auto:     auto,
-			})
-		}
+		s.storeAccountLocked(gw, username, password, remember, auto)
 		_ = s.Config.SaveSettingXML("")
 	}
 	s.mu.Unlock()
@@ -277,19 +271,151 @@ func (s *VPNService) Login(gwIdentifier, username, password, verifycode string, 
 	}
 
 	// Step 2: Authenticate
-	integration, err := client.Login(username, password, verifycode)
-	if err != nil {
+	if _, err = client.Login(username, password, verifycode); err != nil {
+		if protocol.IsPasswordExpired(err) {
+			// Keep this client so ChangePassword can reuse its jar and send
+			// the VSG_SESSIONID issued with the 0x100 response.
+			s.mu.Lock()
+			s.passwordChallenge = &passwordChallenge{
+				client:   client,
+				username: username,
+			}
+			s.mu.Unlock()
+		}
 		s.setStatus("Error", fmt.Sprintf("认证失败: %v", err))
 		return nil, err
 	}
 
+	return s.connectTunnel(client, username)
+}
+
+// ChangePassword replaces an expired VPN password and then connects.
+// When the gateway changes the password without opening a session, this
+// signs in with the new password.
+func (s *VPNService) ChangePassword(gwIdentifier, username, password, newPassword, verifycode string, remember, auto bool) (map[string]any, error) {
+	if strings.TrimSpace(newPassword) == "" {
+		return nil, fmt.Errorf("新密码不能为空")
+	}
+	if newPassword == password {
+		return nil, fmt.Errorf("新密码不能与当前密码相同")
+	}
+
+	s.mu.Lock()
+	if s.Status == "Connecting" || s.Status == "Connected" {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("VPN is already connected or connecting")
+	}
+	gw := s.Config.FindGateway(gwIdentifier)
+	if gw == nil {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("gateway %q not found", gwIdentifier)
+	}
+	gwName := gw.Name
+	gwIP := gw.IP
+	gwPort := gw.Port
+	gwAlgo := gw.Algo
+	s.Config.LastUseGateway = gw.Name
+	s.mu.Unlock()
+
+	s.setStatus("Connecting", fmt.Sprintf("Changing password on %s (%s:%d)...", gwName, gwIP, gwPort))
+	s.Log("INFO", "Changing password for %s on %s (%s:%d)...", username, gwName, gwIP, gwPort)
+
+	s.mu.Lock()
+	client := s.Client
+	challenge := s.passwordChallenge
+	s.mu.Unlock()
+
+	// Reuse the HTTP client that received the 0x100 challenge when it belongs
+	// to this gateway and user; its cookie jar carries VSG_SESSIONID.
+	if challenge != nil && challenge.username == username &&
+		challenge.client.GatewayIP == gwIP && challenge.client.GatewayPort == gwPort {
+		client = challenge.client
+	}
+	if client == nil || client.GatewayIP != gwIP || client.GatewayPort != gwPort {
+		client = protocol.NewClient(gwIP, gwPort, gwAlgo, s.Log)
+		if _, err := client.Handshake(); err != nil {
+			s.setStatus("Error", fmt.Sprintf("Handshake failed: %v", err))
+			return nil, err
+		}
+	}
+
+	// Ensure the client has an active session cookie (VSG_SESSIONID) required by pwdchange.
+	if client.SessionID == "" {
+		if _, err := client.AuthPassword(username, password, verifycode); err != nil {
+			if !protocol.IsPasswordExpired(err) {
+				s.setStatus("Error", fmt.Sprintf("验证当前密码失败: %v", err))
+				return nil, err
+			}
+		}
+	}
+
+	if err := client.ChangePassword(username, password, newPassword, verifycode); err != nil {
+		s.setStatus("Error", fmt.Sprintf("修改密码失败: %v", err))
+		return nil, err
+	}
+
+	s.mu.Lock()
+	if s.passwordChallenge != nil && s.passwordChallenge.client == client {
+		s.passwordChallenge = nil
+	}
+	s.Status = "Disconnected"
+	s.StatusDetail = "密码已更新，正在登录"
+	s.mu.Unlock()
+	s.Log("SUCCESS", "Password changed for %s; signing in with the new password", username)
+	return s.Login(gwIdentifier, username, newPassword, verifycode, remember, auto)
+}
+
+// AuthErrorCode returns the stable machine-readable code for a gateway
+// authentication rejection, or "" when err is not an auth error. The frontend
+// keys its login messaging off this code instead of parsing error text.
+func AuthErrorCode(err error) string {
+	var authErr *protocol.AuthError
+	if !errors.As(err, &authErr) {
+		return ""
+	}
+	switch authErr.Kind {
+	case protocol.AuthKindPasswordExpired:
+		return "password_expired"
+	case protocol.AuthKindBadCredentials:
+		return "bad_credentials"
+	case protocol.AuthKindVerifyCode:
+		return "verify_code"
+	default:
+		return ""
+	}
+}
+
+// IsPasswordExpired reports a gateway password-change challenge.
+func IsPasswordExpired(err error) bool {
+	return AuthErrorCode(err) == "password_expired"
+}
+
+func (s *VPNService) storeAccountLocked(gw *config.GatewayProfile, username, password string, remember, auto bool) {
+	gw.LastUserName = username
+	for idx := range gw.SavedAccounts {
+		if gw.SavedAccounts[idx].Username == username {
+			gw.SavedAccounts[idx].Password = password
+			gw.SavedAccounts[idx].Remember = remember
+			gw.SavedAccounts[idx].Auto = auto
+			return
+		}
+	}
+	gw.SavedAccounts = append(gw.SavedAccounts, config.UserAccount{
+		Username: username,
+		Password: password,
+		Remember: remember,
+		Auto:     auto,
+	})
+}
+
+func (s *VPNService) connectTunnel(client *protocol.Client, username string) (map[string]any, error) {
+	integration := client.Integration
 	if integration == nil {
 		s.setStatus("Error", "未获取到网关资源")
 		return nil, fmt.Errorf("登录完成但未收到网关资源列表")
 	}
 
-	// Step 3: Setup TCP Proxy Tunnel
-	proxyMgr := proxy.NewProxyManager(gw.IP, gw.Port, client.SessionID, s.Log)
+	proxyMgr := proxy.NewProxyManager(client.GatewayIP, client.GatewayPort, client.SessionID, s.Log)
 	resources, err := proxyMgr.StartProxies(integration.ResourceList.TCPUDPResources)
 	if err != nil {
 		s.Log("WARN", "Proxy start partially encountered issues: %v", err)
@@ -326,6 +452,7 @@ func (s *VPNService) Logout() (bool, error) {
 	client := s.Client
 	s.ProxyMgr = nil
 	s.Client = nil
+	s.passwordChallenge = nil
 	s.Status = "Disconnected"
 	s.StatusDetail = "Disconnected"
 	s.Resources = nil

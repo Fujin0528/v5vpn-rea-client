@@ -73,6 +73,7 @@
               <input type="checkbox" id="auto-login-checkbox">
               <span>自动登录</span>
             </label>
+            <a href="javascript:void(0)" id="voluntary-change-pwd-link" class="voluntary-change-pwd-link" style="margin-left: auto; font-size: 13px; color: #3b82f6; text-decoration: none; cursor: pointer;">修改密码</a>
           </div>
 
           <!-- 登录按钮 -->
@@ -81,6 +82,23 @@
               <span class="btn-spinner" style="display: none;"></span>
               <span id="connect-btn-text">立即连接</span>
             </button>
+          </div>
+
+          <!-- 口令过期：在当前客户端改密，而不是只报账密错误 -->
+          <div id="password-change-panel" class="password-change-panel" style="display: none;">
+            <p class="password-change-hint">网关要求先修改已过期的登录密码。修改成功后会用新密码继续连接。</p>
+            <div class="form-group">
+              <label for="new-password-input">新密码：</label>
+              <input type="password" id="new-password-input" class="form-control" placeholder="请输入新密码" autocomplete="new-password">
+            </div>
+            <div class="form-group">
+              <label for="confirm-password-input">确认新密码：</label>
+              <input type="password" id="confirm-password-input" class="form-control" placeholder="再次输入新密码" autocomplete="new-password">
+            </div>
+            <div class="password-change-actions">
+              <button type="button" id="change-password-btn" class="btn btn-primary">修改密码并连接</button>
+              <button type="button" id="cancel-change-password-btn" class="btn btn-secondary">返回</button>
+            </div>
           </div>
         </form>
 
@@ -113,6 +131,9 @@
         </div>
       </div>
       <div class="header-actions">
+        <button id="connected-change-pwd-btn" class="btn btn-secondary" style="margin-right: 8px;">
+          <span>🔑 修改密码</span>
+        </button>
         <button id="disconnect-btn" class="btn btn-danger">
           <span>🛑 断开连接</span>
         </button>
