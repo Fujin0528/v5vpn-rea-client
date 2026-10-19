@@ -220,10 +220,11 @@ mygo 内建了 ed25519 签名的自更新机制。`mygo.json` 的 `updates.publi
 | 平台 | setting.xml 实际存储位置 |
 |:---|:---|
 | Windows | `%APPDATA%\v5vpn-rea\setting.xml` |
-| Linux | `~/.local/share/v5vpn-rea/setting.xml` |
+| Linux | `~/.config/v5vpn-rea/setting.xml`（或 `$XDG_CONFIG_HOME/v5vpn-rea/setting.xml`） |
 | macOS | `~/Library/Application Support/v5vpn-rea/setting.xml` |
 
-这些目录由 `mygo.App.Path(PathUserData)` 解析。**自更新不会擦掉用户配置**，
+这些目录由 `mygo.App.Path(PathUserData)` 解析（`os.UserConfigDir()` 拼上
+`mygo.json` 的 `name`）。**自更新不会擦掉用户配置**，
 因为 mygo build 把应用目录整体替换，而 setting.xml 不再放在那里。
 
 如果想使用旧版「exe 同目录」的布局（例如便携式部署），把 `setting.xml`
