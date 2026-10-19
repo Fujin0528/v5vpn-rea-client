@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/hygkui/v5vpn-rea-client/internal/crypto"
@@ -305,4 +306,30 @@ func (cfg *AppConfig) FindGateway(identifier string) *GatewayProfile {
 		}
 	}
 	return nil
+}
+
+// Clone returns a deep copy of the gateway profile. SavedAccounts is the only
+// reference field; slices.Clone keeps nil as nil, so an absent account list
+// stays distinguishable from an empty one for SaveGateway's preservation rule.
+func (gw GatewayProfile) Clone() GatewayProfile {
+	clone := gw
+	clone.SavedAccounts = slices.Clone(gw.SavedAccounts)
+	return clone
+}
+
+// Snapshot returns a deep copy of the configuration. Callers that expose the
+// config outside the lock (the HTTP API, the tray menu) must use this instead
+// of sharing the live pointer with the writers that mutate it.
+func (cfg *AppConfig) Snapshot() *AppConfig {
+	if cfg == nil {
+		return nil
+	}
+	snapshot := *cfg
+	if cfg.Gateways != nil {
+		snapshot.Gateways = make([]GatewayProfile, len(cfg.Gateways))
+		for i, gw := range cfg.Gateways {
+			snapshot.Gateways[i] = gw.Clone()
+		}
+	}
+	return &snapshot
 }

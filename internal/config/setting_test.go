@@ -41,3 +41,43 @@ func TestLoadSettingXML(t *testing.T) {
 		}
 	}
 }
+
+// Snapshot is what the service hands to the HTTP API and the tray menu, so
+// mutating it must not reach back into the live config.
+func TestSnapshotIsIndependent(t *testing.T) {
+	cfg := &AppConfig{
+		LastUseGateway: "gw-a",
+		Gateways: []GatewayProfile{{
+			Name:          "gw-a",
+			IP:            "203.0.113.10",
+			SavedAccounts: []UserAccount{{Username: "alice", Password: "secret"}},
+		}},
+	}
+
+	snap := cfg.Snapshot()
+	if snap == nil {
+		t.Fatal("Snapshot returned nil for a non-nil config")
+	}
+
+	snap.LastUseGateway = "gw-b"
+	snap.Gateways[0].Name = "renamed"
+	snap.Gateways[0].SavedAccounts[0].Password = "leaked"
+
+	if cfg.LastUseGateway != "gw-a" {
+		t.Errorf("LastUseGateway leaked into the live config: %q", cfg.LastUseGateway)
+	}
+	if cfg.Gateways[0].Name != "gw-a" {
+		t.Errorf("gateway name leaked into the live config: %q", cfg.Gateways[0].Name)
+	}
+	if cfg.Gateways[0].SavedAccounts[0].Password != "secret" {
+		t.Errorf("saved account leaked into the live config: %q", cfg.Gateways[0].SavedAccounts[0].Password)
+	}
+	if snap.Gateways[0].IP != "203.0.113.10" {
+		t.Errorf("snapshot lost unrelated fields: %q", snap.Gateways[0].IP)
+	}
+
+	var nilCfg *AppConfig
+	if nilCfg.Snapshot() != nil {
+		t.Error("Snapshot on a nil config should return nil")
+	}
+}

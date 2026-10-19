@@ -183,7 +183,10 @@ func main() {
 			var isConn bool
 
 			if statusStr == "Connected" {
-				gwName := vpnService.GetConfig().LastUseGateway
+				// GetStatus already carries the gateway name; copying the whole
+				// config here would deep-copy every gateway and cleartext
+				// password on each status change just to read one field.
+				gwName, _ := st["lastUseGateway"].(string)
 				statusLabel = fmt.Sprintf("状态: 已连接 [%s]", gwName)
 				isConn = true
 				tray.SetToolTip(fmt.Sprintf("V5VPN - 已连接 [%s]", gwName))

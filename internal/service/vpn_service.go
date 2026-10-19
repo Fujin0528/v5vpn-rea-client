@@ -182,18 +182,28 @@ func (s *VPNService) Log(level string, format string, args ...any) {
 	}
 }
 
-// GetConfig returns the full application configuration
+// GetConfig returns a snapshot copy of the application configuration.
+//
+// The returned value is a deep copy: Login rewrites LastUseGateway and
+// SaveGateway/DeleteGateway replace Gateways under s.mu, so handing out the
+// live *config.AppConfig let callers (the /api/config handler encodes it,
+// the tray menu reads LastUseGateway) race with those writes. Mutating the
+// returned config is a no-op on the service, as intended for a getter.
 func (s *VPNService) GetConfig() *config.AppConfig {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.Config
+	return s.Config.Snapshot()
 }
 
-// GetGateways returns configured gateway profiles
+// GetGateways returns a deep copy of the configured gateway profiles.
 func (s *VPNService) GetGateways() []config.GatewayProfile {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.Config.Gateways
+	if s.Config == nil {
+		return nil
+	}
+	// Reuse Snapshot's copy so the two paths cannot drift apart.
+	return s.Config.Snapshot().Gateways
 }
 
 // SaveGateway adds or updates a gateway profile
