@@ -4,39 +4,62 @@ import (
 	"testing"
 )
 
+// TestLiveVPNServiceCheckForUpdates exercises the real GitHub release lookup.
+// It deliberately makes no assumption about which version is current: the
+// repository publishes new releases regularly, so a hard-coded "latest" value
+// would fail on every release. Instead it asserts the self-consistent
+// relationship between the reported latest version and HasUpdate.
 func TestLiveVPNServiceCheckForUpdates(t *testing.T) {
-	s := NewVPNService(nil)
-	s.SetAppVersion("v0.1.1")
+	if testing.Short() {
+		t.Skip("network integration test skipped in -short mode")
+	}
 
+	s := NewVPNService(nil)
+
+	// 1. Checking against the reported latest version must not offer an update.
+	s.SetAppVersion("v0.0.0")
+	baseline := s.CheckForUpdates()
+	if baseline == nil {
+		t.Fatal("expected non-nil UpdateInfo")
+	}
+	if baseline.Error != "" {
+		t.Fatalf("unexpected error: %s", baseline.Error)
+	}
+	if baseline.LatestVersion == "" {
+		t.Fatal("expected non-empty LatestVersion")
+	}
+
+	s.SetAppVersion(baseline.LatestVersion)
 	info := s.CheckForUpdates()
 	if info == nil {
 		t.Fatal("expected non-nil UpdateInfo")
 	}
-
-	t.Logf("Update check result for v0.1.1: HasUpdate=%v, LatestVersion=%s, CurrentVersion=%s, Error=%s, ReleaseURL=%s",
-		info.HasUpdate, info.LatestVersion, info.CurrentVersion, info.Error, info.ReleaseURL)
-
+	t.Logf("Update check result for %s: HasUpdate=%v, LatestVersion=%s, Error=%s, ReleaseURL=%s",
+		baseline.LatestVersion, info.HasUpdate, info.LatestVersion, info.Error, info.ReleaseURL)
 	if info.Error != "" {
 		t.Fatalf("unexpected error: %s", info.Error)
 	}
-
 	if info.HasUpdate {
-		t.Errorf("for v0.1.1 vs latest (v0.1.1), HasUpdate should be false")
-	}
-	if info.LatestVersion != "v0.1.1" {
-		t.Errorf("expected LatestVersion == v0.1.1, got %s", info.LatestVersion)
+		t.Errorf("for %s vs latest (%s), HasUpdate should be false",
+			baseline.LatestVersion, info.LatestVersion)
 	}
 
-	// Now test when current version is v0.1.0
-	s.SetAppVersion("v0.1.0")
+	// 2. An older version must be offered the latest release, with notes.
+	s.SetAppVersion("v0.0.0")
 	infoOld := s.CheckForUpdates()
-	t.Logf("Update check result for v0.1.0: HasUpdate=%v, LatestVersion=%s, CurrentVersion=%s, Notes=%d chars",
-		infoOld.HasUpdate, infoOld.LatestVersion, infoOld.CurrentVersion, len(infoOld.ReleaseNotes))
-
-	if !infoOld.HasUpdate {
-		t.Errorf("for v0.1.0 vs latest (v0.1.1), HasUpdate should be true!")
+	if infoOld == nil {
+		t.Fatal("expected non-nil UpdateInfo")
 	}
-	if infoOld.LatestVersion != "v0.1.1" {
-		t.Errorf("expected LatestVersion == v0.1.1, got %s", infoOld.LatestVersion)
+	t.Logf("Update check result for v0.0.0: HasUpdate=%v, LatestVersion=%s, Notes=%d chars",
+		infoOld.HasUpdate, infoOld.LatestVersion, len(infoOld.ReleaseNotes))
+	if infoOld.Error != "" {
+		t.Fatalf("unexpected error: %s", infoOld.Error)
+	}
+	if !infoOld.HasUpdate {
+		t.Errorf("for v0.0.0 vs latest (%s), HasUpdate should be true", infoOld.LatestVersion)
+	}
+	if infoOld.LatestVersion != baseline.LatestVersion {
+		t.Errorf("LatestVersion drifted between checks: %s vs %s",
+			infoOld.LatestVersion, baseline.LatestVersion)
 	}
 }

@@ -132,7 +132,10 @@ func (s *VPNService) CheckForUpdates() *UpdateInfo {
 	current := s.appVersion
 	s.mu.Unlock()
 	if current == "" {
-		current = "v0.1.1"
+		// Unknown build version: assume the oldest possible one so a real
+		// release is always offered, rather than pinning a stale literal
+		// that would silently drift out of date on every release.
+		current = "v0.0.0"
 	}
 
 	repo := "hygkui/v5vpn-rea-client"
