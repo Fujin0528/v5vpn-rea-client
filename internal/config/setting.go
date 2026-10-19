@@ -130,13 +130,18 @@ func configCandidates() []string {
 // empty string if none has been set.
 func UserDataDir() string { return userDataDir }
 
-// SaveSettingXML writes the config back to its source file. If a per-user
-// data directory has been configured, the file is created there
-// (preserving the location LoadSettingXML picked up on startup) so an
-// updater-driven application-directory replacement does not erase the
-// operator's saved credentials.
+// SaveSettingXML writes the config back to the file it was loaded from.
+//
+// Writing back to cfg.SourcePath (when the loader found one) is what makes
+// portable deployments work: read exe/setting.xml, edit it, and the edit must
+// land in that same file. Preferring userDataDir unconditionally would create
+// a second copy there that then shadows the portable file on the next start,
+// which looks exactly like "my changes disappeared after a restart".
 func (cfg *AppConfig) saveToConfiguredPath(targetPath string) error {
-	if userDataDir != "" && targetPath == "" {
+	if targetPath == "" && cfg.SourcePath != "" {
+		targetPath = cfg.SourcePath
+	}
+	if targetPath == "" && userDataDir != "" {
 		if err := os.MkdirAll(userDataDir, 0o700); err != nil {
 			return fmt.Errorf("cannot create user data dir %s: %w", userDataDir, err)
 		}

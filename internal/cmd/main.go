@@ -44,6 +44,18 @@ func main() {
 	httpPort := flag.Int("port", 0, "Serve web UI on custom HTTP port (0 for auto)")
 	flag.Parse()
 
+	// Resolve the per-user data directory BEFORE anything loads setting.xml.
+	// NewVPNService calls config.LoadSettingXML("") in its constructor, so
+	// registering the directory afterwards left every mode (GUI and CLI)
+	// reading the working directory / exe directory instead of the file this
+	// build actually writes to. The loader also needs this for the
+	// -dump-passwords path, which returns before the GUI ever starts.
+	// mygo.App.Path only touches os.UserConfigDir and App.Name, so it is safe
+	// before mygo.App.Run.
+	if dataDir, err := mygo.App.Path(mygo.PathUserData); err == nil && dataDir != "" {
+		config.SetUserDataDir(dataDir)
+	}
+
 	// Handle password dumping
 	if *dumpPasswords {
 		runDumpPasswords()
@@ -94,16 +106,6 @@ func main() {
 			log.Printf("OnBeforeQuit logout error (ignored): %v", err)
 		}
 	})
-	// Tell the config package where the production build stores its
-	// saved credentials. mygo.App.Path(PathUserData) returns a per-user
-	// directory such as %APPDATA%\Roaming5vpn-rea on Windows or
-	// ~/.local/share/v5vpn-rea on Linux. An updater-driven replacement
-	// of the application directory no longer erases the operator's
-	// saved credentials when the file lives here instead of next to
-	// the executable.
-	if dataDir, err := mygo.App.Path(mygo.PathUserData); err == nil && dataDir != "" {
-		config.SetUserDataDir(dataDir)
-	}
 	mygo.BindAs("VPNService", vpnService)
 	mygo.SetFrontend(uiFS)
 

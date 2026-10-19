@@ -2,6 +2,7 @@ package config
 
 import (
 	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -79,5 +80,105 @@ func TestSnapshotIsIndependent(t *testing.T) {
 	var nilCfg *AppConfig
 	if nilCfg.Snapshot() != nil {
 		t.Error("Snapshot on a nil config should return nil")
+	}
+}
+
+// The loader must find the file in the per-user data directory once
+// SetUserDataDir has been called, otherwise a GUI build that writes there
+// would read defaults from the working directory on every start.
+func TestLoadSettingXMLHonoursUserDataDir(t *testing.T) {
+	dir := t.TempDir()
+	copyFixture(t, filepath.Join(dir, SettingXMLFilename))
+
+	previous := UserDataDir()
+	SetUserDataDir(dir)
+	t.Cleanup(func() { SetUserDataDir(previous) })
+
+	// Run from a directory with no setting.xml so only the user data dir can
+	// satisfy the lookup.
+	t.Chdir(t.TempDir())
+
+	cfg, err := LoadSettingXML("")
+	if err != nil {
+		t.Fatalf("LoadSettingXML did not consult the user data dir: %v", err)
+	}
+	if len(cfg.Gateways) == 0 {
+		t.Fatal("loaded 0 gateways from the user data dir")
+	}
+	if cfg.SourcePath != filepath.Join(dir, SettingXMLFilename) {
+		t.Errorf("SourcePath = %q, want the user data dir copy", cfg.SourcePath)
+	}
+}
+
+// A portable deployment keeps setting.xml next to the executable. Saving must
+// write back to that same file; landing in the user data dir instead creates a
+// second copy that shadows the portable one on the next start.
+func TestSaveSettingXMLWritesBackToSourcePath(t *testing.T) {
+	portableDir := t.TempDir()
+	portablePath := filepath.Join(portableDir, SettingXMLFilename)
+	copyFixture(t, portablePath)
+
+	userData := t.TempDir()
+	previous := UserDataDir()
+	SetUserDataDir(userData)
+	t.Cleanup(func() { SetUserDataDir(previous) })
+
+	cfg, err := LoadSettingXML(portablePath)
+	if err != nil {
+		t.Fatalf("LoadSettingXML(%q) failed: %v", portablePath, err)
+	}
+
+	cfg.LastUseGateway = "portable-edit"
+	if err := cfg.SaveSettingXML(""); err != nil {
+		t.Fatalf("SaveSettingXML failed: %v", err)
+	}
+
+	saved, err := LoadSettingXML(portablePath)
+	if err != nil {
+		t.Fatalf("reloading the portable file failed: %v", err)
+	}
+	if saved.LastUseGateway != "portable-edit" {
+		t.Errorf("edit did not land in the portable file: %q", saved.LastUseGateway)
+	}
+	if _, err := os.Stat(filepath.Join(userData, SettingXMLFilename)); err == nil {
+		t.Error("save also wrote a shadow copy into the user data dir")
+	}
+}
+
+// Without a source file the save still has to land somewhere usable.
+func TestSaveSettingXMLFallsBackToUserDataDir(t *testing.T) {
+	userData := t.TempDir()
+	previous := UserDataDir()
+	SetUserDataDir(userData)
+	t.Cleanup(func() { SetUserDataDir(previous) })
+
+	cfg := &AppConfig{LastUseGateway: "fresh-install"}
+	if err := cfg.SaveSettingXML(""); err != nil {
+		t.Fatalf("SaveSettingXML failed: %v", err)
+	}
+
+	target := filepath.Join(userData, SettingXMLFilename)
+	if _, err := os.Stat(target); err != nil {
+		t.Fatalf("expected %s to be created: %v", target, err)
+	}
+
+	saved, err := LoadSettingXML(target)
+	if err != nil {
+		t.Fatalf("reloading %s failed: %v", target, err)
+	}
+	if saved.LastUseGateway != "fresh-install" {
+		t.Errorf("LastUseGateway = %q, want fresh-install", saved.LastUseGateway)
+	}
+}
+
+// copyFixture places the synthetic setting.xml at the given path.
+func copyFixture(t *testing.T, dst string) {
+	t.Helper()
+	data, err := os.ReadFile("../../configs/setting.xml.example")
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	if err := os.WriteFile(dst, data, 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
 	}
 }
