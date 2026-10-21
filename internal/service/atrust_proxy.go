@@ -22,6 +22,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -38,10 +39,46 @@ import (
 // 比控制面的 30s 短：用户在等一个网页打开，等 30 秒才失败没有意义。
 const atrustDialTimeout = 20 * time.Second
 
+// tunnelDialer 是代理层对数据面的**全部**依赖。
+//
+// 为什么是接口而不是 *atrust.Client：`*atrust.Client.DialTCP` 的返回类型是
+// 具体的 *atrust.TCPConn，Go 的接口不协变，所以它无法直接满足
+// `DialTCP(...) (net.Conn, error)`。用一层适配器（atrustDialer）把返回类型
+// 放宽到 net.Conn，换来的是：代理层的测试可以注入任意实现，不必真的去连 441。
+//
+// 这个接口刻意只有一个方法——代理只需要"给我一条到目标的连接"，
+// 不需要知道会话、签名、路由。
+type tunnelDialer interface {
+	DialTCP(ctx context.Context, host string, port int) (net.Conn, error)
+}
+
+// clientSession 是 atrustSession 的真实实现。
+//
+// 用嵌入而不是逐方法转发：*atrust.Client 已经提供了控制面的全部方法，
+// 只有 DialTCP 的返回类型需要放宽（*atrust.TCPConn → net.Conn）。
+type clientSession struct{ *atrust.Client }
+
+// DialTCP 把具体返回类型适配成 net.Conn，并对 nil 客户端给出可读错误。
+func (s clientSession) DialTCP(ctx context.Context, host string, port int) (net.Conn, error) {
+	if s.Client == nil {
+		// 代理是在 goroutine 里转发数据的，空指针 panic 会直接掀掉整个进程。
+		return nil, errors.New("aTrust 客户端未初始化")
+	}
+	return s.Client.DialTCP(ctx, host, port)
+}
+
 // ATrustProxy 管理 aTrust 资源的本地监听。
 type ATrustProxy struct {
-	client *atrust.Client
+	dialer tunnelDialer
 	logf   func(format string, args ...any)
+
+	// preferred 记录"上一次会话里这个目标分到的本地地址"。
+	//
+	// 存在的理由：目标端口（通常是 443）在本机被占用时，监听会退回随机
+	// 端口。刷新资源时若重新随机一次，用户已经配好的本地地址就失效了——
+	// 表现为"点一下刷新，所有客户端都连不上"。所以在随机兜底之前，
+	// 先试着拿回上次那个地址。
+	preferred map[string]string
 
 	mu        sync.Mutex
 	listeners map[string]net.Listener // key = 资源标识
@@ -51,14 +88,44 @@ type ATrustProxy struct {
 
 // NewATrustProxy 创建代理管理器。
 func NewATrustProxy(client *atrust.Client, logf func(string, ...any)) *ATrustProxy {
+	return NewATrustProxyWithDialer(clientSession{client}, logf)
+}
+
+// NewATrustProxyWithDialer 用任意数据面实现创建代理管理器，供测试注入。
+func NewATrustProxyWithDialer(dialer tunnelDialer, logf func(string, ...any)) *ATrustProxy {
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
 	return &ATrustProxy{
-		client:    client,
+		dialer:    dialer,
 		logf:      logf,
+		preferred: map[string]string{},
 		listeners: map[string]net.Listener{},
 	}
+}
+
+// SetPreferredAddrs 让新实例继承上一次会话的本地地址分配。
+//
+// 刷新资源时调用：目标端口在本机被占用而退回随机端口的情况下，
+// 这一步保证刷新前后用户看到的地址是同一个。
+func (p *ATrustProxy) SetPreferredAddrs(addrs map[string]string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.preferred = make(map[string]string, len(addrs))
+	for k, v := range addrs {
+		p.preferred[k] = v
+	}
+}
+
+// AddrMap 返回当前"目标 → 本地地址"的分配，供下一次刷新继承。
+func (p *ATrustProxy) AddrMap() map[string]string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make(map[string]string, len(p.listeners))
+	for k, ln := range p.listeners {
+		out[k] = ln.Addr().String()
+	}
+	return out
 }
 
 // Start 为每条 TCP 资源起一个本地监听，返回带 LocalProxy 的资源列表。
@@ -119,8 +186,20 @@ func (p *ATrustProxy) listen(key, targetHost string, targetPort int) (net.Listen
 	}
 	p.mu.Unlock()
 
-	// 优先用目标端口本身（用户看到的地址更直观），被占用则退回随机端口。
+	// 优先用目标端口本身（用户看到的地址更直观）。
+	// 其次用上次会话分到的地址（刷新时保持稳定）。
+	// 都被占用才退回随机端口——那时确实没有更好的选择。
 	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", targetPort))
+	if err != nil {
+		p.mu.Lock()
+		prev := p.preferred[key]
+		p.mu.Unlock()
+		if prev != "" {
+			if ln, err = net.Listen("tcp", prev); err == nil {
+				p.logf("%s 端口 %d 不可用，沿用上次的本地地址 %s", key, targetPort, prev)
+			}
+		}
+	}
 	if err != nil {
 		ln, err = net.Listen("tcp", "127.0.0.1:0")
 	}
@@ -169,7 +248,7 @@ func (p *ATrustProxy) forward(local net.Conn, targetHost string, targetPort int)
 	ctx, cancel := context.WithTimeout(context.Background(), atrustDialTimeout)
 	defer cancel()
 
-	remote, err := p.client.DialTCP(ctx, targetHost, targetPort)
+	remote, err := p.dialer.DialTCP(ctx, targetHost, targetPort)
 	if err != nil {
 		p.logf("建立隧道失败 (%s:%d): %v", targetHost, targetPort, err)
 		return

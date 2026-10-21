@@ -75,10 +75,31 @@ type ATrustService struct {
 
 	username string
 
+	// proxyDialer 覆盖代理层的数据面实现。nil 时走真实的 aTrust 隧道。
+	//
+	// 它是**未导出**的：生产路径永远用真实实现，只有同包的测试会设置它，
+	// 以便在不连 441 的前提下验证"资源 → 本地端口"整条链。
+	proxyDialer tunnelDialer
+
 	// OnStatusChange 在状态变化时被异步调用，用于刷新托盘与窗口尺寸。
 	OnStatusChange func(string)
 
 	mu sync.Mutex
+}
+
+// newProxy 按当前配置建造一个代理实例。
+//
+// 抽成方法而不是直接调 NewATrustProxy：测试注入假数据面后，
+// 这条路径仍然和生产共用一个入口，避免"测试走 A、生产走 B"。
+func (s *ATrustService) newProxy(client *atrust.Client, logf func(string, ...any)) *ATrustProxy {
+	s.mu.Lock()
+	dialer := s.proxyDialer
+	s.mu.Unlock()
+
+	if dialer != nil {
+		return NewATrustProxyWithDialer(dialer, logf)
+	}
+	return NewATrustProxy(client, logf)
 }
 
 // NewATrustService 创建 aTrust 后端服务。
@@ -334,7 +355,7 @@ func (s *ATrustService) loadResources(client *atrust.Client) {
 	items, unknownKeys := atrust.ExtractResources(raw)
 
 	// 锁外起代理（会 listen 端口），再回来持锁发布。
-	proxy := NewATrustProxy(client, func(format string, args ...any) {
+	proxy := s.newProxy(client, func(format string, args ...any) {
 		s.host.Log("INFO", "aTrust: "+format, args...)
 	})
 	proxied := proxy.Start(items)
@@ -403,13 +424,26 @@ func (s *ATrustService) RefreshResources() (map[string]any, error) {
 
 	items, unknownKeys := atrust.ExtractResources(raw)
 
-	// 刷新时同样重建代理：资源可能变了，旧监听对应的目标可能已不存在。
+	// 刷新时重建代理：资源可能变了，旧监听对应的目标可能已不存在。
 	//
-	// 这里不能直接复用旧 proxy：它的监听是绑定在旧目标列表上的。
-	// 新建 + 替换保证"资源表里看到的每条都是可连的"。
-	newProxy := NewATrustProxy(client, func(format string, args ...any) {
+	// ⚠ 必须先停旧代理、再起新的。两者监听的是**同一批端口**
+	// （127.0.0.1:<目标端口>），旧的不停，新的一律绑不上，会静默退回
+	// 随机端口——用户会看到"每刷新一次，本地代理地址就全变了"，
+	// 已经配好的客户端立刻失效。
+	newProxy := s.newProxy(client, func(format string, args ...any) {
 		s.host.Log("INFO", "aTrust: "+format, args...)
 	})
+
+	s.mu.Lock()
+	oldProxy := s.proxy
+	s.proxy = nil
+	s.mu.Unlock()
+	if oldProxy != nil {
+		// 先记下旧分配，再停它——停完之后就取不到了。
+		newProxy.SetPreferredAddrs(oldProxy.AddrMap())
+		oldProxy.Stop()
+	}
+
 	proxied := newProxy.Start(items)
 
 	s.mu.Lock()
@@ -418,17 +452,12 @@ func (s *ATrustService) RefreshResources() (map[string]any, error) {
 		newProxy.Stop()
 		return nil, fmt.Errorf("会话已在刷新期间结束")
 	}
-	oldProxy := s.proxy
 	s.proxy = newProxy
 	s.Resources = proxied
 	s.resourceState = ResourceReady
 	s.resourceError = ""
 	s.StatusDetail = fmt.Sprintf("已连接 %s（%d 个应用）", s.username, len(proxied))
 	s.mu.Unlock()
-
-	if oldProxy != nil {
-		oldProxy.Stop()
-	}
 
 	if len(items) == 0 && len(unknownKeys) > 0 {
 		s.host.Log("WARN", "aTrust: 资源树里没有识别出应用数组，顶层键为 %v", unknownKeys)

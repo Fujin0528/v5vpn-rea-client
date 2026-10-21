@@ -276,6 +276,12 @@ func resourceFromMap(m map[string]any) Resource {
 		// 没有名字的资源在界面上不可用；用地址兜底，避免一条空行。
 		r.Name = r.RemoteIP
 	}
+	// 扁平数组形态里 protocol 常常整个缺失（{"name","host","port"}）。
+	// 留空会让上层把它当成"非 TCP"跳过，表现为资源在列表里但没有本地代理。
+	// 与 resourcesFromApp 的处理保持一致：缺省即 TCP。
+	if r.Protocol == "" {
+		r.Protocol = "tcp"
+	}
 	r.Status = "active"
 	return r
 }
