@@ -45,7 +45,12 @@ type GatewayXML struct {
 	IP      string   `xml:"Ip,attr"`
 	Port    int      `xml:"Port,attr"`
 	Algo    int      `xml:"algo,attr"` // 0: Standard, 1: GM/国密
-	User    UserList `xml:"USER"`
+	// Protocol selects the backend for this gateway. Omitted when empty so
+	// the file stays readable by the original V5VPN client, which has no
+	// such attribute; and an absent attribute means V5VPN on read-back,
+	// which is exactly the zero-value semantics GatewayProfile relies on.
+	Protocol string   `xml:"protocol,attr,omitempty"`
+	User     UserList `xml:"USER"`
 }
 
 type UserList struct {
@@ -246,6 +251,7 @@ func LoadSettingXML(path string) (*AppConfig, error) {
 			IP:             gw.IP,
 			Port:           gw.Port,
 			Algo:           gw.Algo,
+			Protocol:       gw.Protocol,
 			LastUserName:   gw.User.LastUserName,
 			AuthType:       gw.User.AuthType,
 			CertType:       gw.User.CertType,
@@ -308,11 +314,12 @@ func (cfg *AppConfig) saveToPath(targetPath string) error {
 	for i, gw := range cfg.Gateways {
 		gwTag := fmt.Sprintf("Gateway%d", i)
 		gwXML := GatewayXML{
-			XMLName: xml.Name{Local: gwTag},
-			Name:    gw.Name,
-			IP:      gw.IP,
-			Port:    gw.Port,
-			Algo:    gw.Algo,
+			XMLName:  xml.Name{Local: gwTag},
+			Name:     gw.Name,
+			IP:       gw.IP,
+			Port:     gw.Port,
+			Algo:     gw.Algo,
+			Protocol: gw.Protocol,
 			User: UserList{
 				LastUserName:  gw.LastUserName,
 				AuthType:      gw.AuthType,
