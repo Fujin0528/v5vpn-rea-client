@@ -95,6 +95,14 @@ type fakeGateway struct {
 	server *httptest.Server
 	sid    string
 	next   string // psw 返回的 nextService
+
+	// failResource 为真时 clientResource 返回业务错误码，
+	// 用于验证"资源拉取失败但会话仍有效"。
+	failResource bool
+
+	// resourcePorts 是资源树里使用的端口。默认取高位固定端口，
+	// 避免代理落到随机端口导致断言无法比较。
+	resourcePorts []int
 }
 
 func newFakeGateway(t *testing.T) *fakeGateway {
@@ -161,10 +169,22 @@ func newFakeGateway(t *testing.T) *fakeGateway {
 		if r.Method != http.MethodPost {
 			t.Errorf("clientResource 必须用 POST，实际 %s", r.Method)
 		}
+		if g.failResource {
+			// 业务码非 0：Client 会把它转成 APIError。
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"code": 5001, "message": "resource service unavailable",
+			})
+			return
+		}
+		ports := g.resourcePorts
+		if len(ports) == 0 {
+			ports = []int{443, 8443}
+		}
 		writeJSON(w, map[string]any{
 			"appListV2": []any{
-				map[string]any{"name": "OA", "host": "10.0.0.5", "port": 443},
-				map[string]any{"name": "GitLab", "host": "10.0.0.6", "port": 8443},
+				map[string]any{"name": "OA", "host": "10.0.0.5", "port": ports[0]},
+				map[string]any{"name": "GitLab", "host": "10.0.0.6", "port": ports[len(ports)-1]},
 			},
 		})
 	})
