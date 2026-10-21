@@ -138,7 +138,13 @@ func main() {
 	if *httpPort > 0 {
 		serverPort = *httpPort
 	}
-	actualPort := startHTTPServer(serverPort, uiFS, vpnService)
+
+	// aTrust 后端与 V5VPN 并列。它借用 VPNService 的配置与日志
+	// （ATrustHost 接口），但连接状态完全独立。
+	atrustService := service.NewATrustService(vpnService)
+	svcPair := &backends{v5vpn: vpnService, atrust: atrustService}
+
+	actualPort := startHTTPServer(serverPort, uiFS, vpnService, atrustService)
 
 	// Initialize MyGo Desktop Framework
 	log.Printf("Starting V5VPN Client with MyGo framework...")
@@ -146,12 +152,15 @@ func main() {
 	// forgets to call vpnService.Logout(), the OnBeforeQuit hook fires before the process exits
 	// and tears the VPN tunnel down so the gateway does not see an
 	// orphan session on the next reconnect.
+	//
+	// 只登出当前有会话的后端（§14.5.2 边界三）：aTrust 未连接时
+	// 不该在 V5VPN 的日志里留一条 "Tearing down VPN session"。
 	mygo.App.OnBeforeQuit(func(e *mygo.QuitEvent) {
-		if _, err := vpnService.Logout(); err != nil {
-			log.Printf("OnBeforeQuit logout error (ignored): %v", err)
-		}
+		svcPair.logoutActive()
 	})
 	mygo.BindAs("VPNService", vpnService)
+	// 名字必须与 VPNService 不同：mygo 按服务名注册，同名会 panic。
+	mygo.BindAs("ATrustService", atrustService)
 	mygo.SetFrontend(uiFS)
 
 	mygo.App.WhenReady(func() {
@@ -204,7 +213,7 @@ func main() {
 					case 1: // 完全退出（可选是否重启用于自更新）
 						log.Printf("Exiting V5VPN client upon user confirmation...")
 						isExiting = true
-						_, _ = vpnService.Logout()
+						svcPair.logoutActive()
 						mygo.RunOnMain(func() {
 							win.Destroy()
 							mygo.App.Quit()
@@ -228,27 +237,45 @@ func main() {
 			return
 		}
 
-		// Function to update tray menu with real-time connection status
+		// Function to update tray menu with real-time connection status.
+		//
+		// 两个后端都要看：只看 V5VPN 会让 aTrust 已连接时托盘显示"未连接"，
+		// 并且菜单里会给出"登录 VPN"而不是"断开 VPN"。
 		updateTray := func() {
-			st := vpnService.GetStatus()
-			statusStr, _ := st["status"].(string)
+			v5st := vpnService.GetStatus()
+			v5Status, _ := v5st["status"].(string)
+			atst := atrustService.GetStatus()
+			atStatus, _ := atst["status"].(string)
+
+			v5Conn := v5Status == "Connected"
+			atConn := atStatus == "Connected"
+			v5Busy := v5Status == "Connecting"
+			atBusy := atStatus == "Connecting"
+
 			var statusLabel string
 			var isConn bool
 
-			if statusStr == "Connected" {
+			switch {
+			case v5Conn:
 				// GetStatus already carries the gateway name; copying the whole
 				// config here would deep-copy every gateway and cleartext
 				// password on each status change just to read one field.
-				gwName, _ := st["lastUseGateway"].(string)
+				gwName, _ := v5st["lastUseGateway"].(string)
 				statusLabel = fmt.Sprintf("状态: 已连接 [%s]", gwName)
 				isConn = true
 				tray.SetToolTip(fmt.Sprintf("V5VPN - 已连接 [%s]", gwName))
 				_ = tray.SetIcon(trayIconConnected, false)
-			} else if statusStr == "Connecting" {
+			case atConn:
+				gwName, _ := atst["lastUseGateway"].(string)
+				statusLabel = fmt.Sprintf("状态: 已连接 [%s · aTrust]", gwName)
+				isConn = true
+				tray.SetToolTip(fmt.Sprintf("V5VPN - 已连接 [%s · aTrust]", gwName))
+				_ = tray.SetIcon(trayIconConnected, false)
+			case v5Busy || atBusy:
 				statusLabel = "状态: 正在连接..."
 				tray.SetToolTip("V5VPN - 正在连接...")
 				_ = tray.SetIcon(trayIconDisconnected, false)
-			} else {
+			default:
 				statusLabel = "状态: 未连接"
 				tray.SetToolTip("V5VPN - 未连接")
 				_ = tray.SetIcon(trayIconDisconnected, false)
@@ -322,7 +349,8 @@ func main() {
 				menuItems = append(menuItems, &mygo.MenuItem{
 					Label: "断开 VPN",
 					Click: func(item *mygo.MenuItem, w *mygo.Window) {
-						go vpnService.Logout()
+						// 只断开有会话的那一个（可能是 V5VPN，也可能是 aTrust）。
+						go svcPair.logoutActive()
 					},
 				})
 			} else {
@@ -345,7 +373,7 @@ func main() {
 					Click: func(item *mygo.MenuItem, w *mygo.Window) {
 						go func() {
 							isExiting = true
-							_, _ = vpnService.Logout()
+							svcPair.logoutActive()
 							mygo.RunOnMain(func() {
 								if win != nil {
 									win.Destroy()
@@ -400,8 +428,37 @@ func main() {
 	}
 }
 
-// startHTTPServer starts the local REST and asset server
-func startHTTPServer(port int, uiFS fs.FS, vpnService *service.VPNService) int {
+// startHTTPServer starts the local REST and asset server.
+//
+// atrustSvc 单独传入而不是塞进 VPNService：两条后端在 service 层就是
+// 并列的独立类型，捆绑会让"改 aTrust 不会碰到 V5VPN"这条边界失效。
+func startHTTPServer(port int, uiFS fs.FS, vpnService *service.VPNService, atrustSvc *service.ATrustService) int {
+	mux := newAPIRouter(uiFS, vpnService, atrustSvc)
+
+	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		ln, err = net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			log.Fatalf("Failed to bind local HTTP server: %v", err)
+		}
+	}
+	actualPort := ln.Addr().(*net.TCPAddr).Port
+
+	go func() {
+		log.Printf("UI Bridge server listening at http://127.0.0.1:%d", actualPort)
+		if err := http.Serve(ln, mux); err != nil {
+			log.Printf("HTTP server terminated: %v", err)
+		}
+	}()
+	return actualPort
+}
+
+// newAPIRouter 构造全部路由，不监听端口。
+//
+// 单独抽出来是为了可测：路由表里最容易出错的是"请求被送到了错误的
+// 后端"这种接线错误，而不是任何单个 handler 的逻辑。能在不启监听、
+// 不建窗口的前提下用 httptest 打进来，这类错误才能被测试覆盖。
+func newAPIRouter(uiFS fs.FS, vpnService *service.VPNService, atrustSvc *service.ATrustService) *http.ServeMux {
 	mux := http.NewServeMux()
 
 	// API Routes
@@ -423,6 +480,24 @@ func startHTTPServer(port int, uiFS fs.FS, vpnService *service.VPNService) int {
 		w.Header().Set("Content-Type", "application/json")
 		st := vpnService.GetStatus()
 		st["appVersion"] = AppVersion
+
+		// 两个后端都有会话时，UI 需要知道该渲染哪一份资源表。
+		// 这里把"当前激活的后端"一并给出：V5VPN 优先（老用户的主路径），
+		// 它没有会话时才看 aTrust。与 /api/logout 的判定保持一致。
+		//
+		// 注意不能简单地用 aTrust 状态覆盖 status：V5VPN 的
+		// statusDetail / resourceError 与 aTrust 语义不同，
+		// 混在一起会让界面把两种失败原因显示成同一条。
+		active := (&backends{v5vpn: vpnService, atrust: atrustSvc}).active()
+		st["activeBackend"] = active
+		if active == "atrust" {
+			at := atrustSvc.GetStatus()
+			for k, v := range at {
+				st[k] = v
+			}
+			// appVersion 必须保留，前端用它显示版本号。
+			st["appVersion"] = AppVersion
+		}
 		_ = json.NewEncoder(w).Encode(st)
 	})
 
@@ -618,13 +693,15 @@ func startHTTPServer(port int, uiFS fs.FS, vpnService *service.VPNService) int {
 	})
 
 	mux.HandleFunc("/api/logout", func(w http.ResponseWriter, r *http.Request) {
-		_, err := vpnService.Logout()
+		// 共用入口：UI 的断开按钮不区分协议。按"谁在活动"决定断开谁，
+		// 否则 aTrust 连接时点断开会去登出 V5VPN（一个空会话）而毫无效果。
+		//
+		// 两个后端同时活动是不正常状态（登录时会拆旧会话），但真发生时
+		// 全部断开比留下一个孤儿会话好。
+		state := &backends{v5vpn: vpnService, atrust: atrustSvc}
+		state.logoutActive()
+
 		w.Header().Set("Content-Type", "application/json")
-		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
-			return
-		}
 		_ = json.NewEncoder(w).Encode(map[string]bool{"success": true})
 	})
 
@@ -702,25 +779,69 @@ func startHTTPServer(port int, uiFS fs.FS, vpnService *service.VPNService) int {
 		_ = json.NewEncoder(w).Encode(info)
 	})
 
+	// ---------- aTrust 后端 ----------
+	//
+	// 与 /api/*（V5VPN）完全并列、互不复用。前端按 gateway.protocol 选择
+	// 打到哪一组 endpoint；两条链路共享的只有 setting.xml 里的网关表。
+	mux.HandleFunc("/api/atrust/login", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			GWID     string `json:"gwId"`
+			Username string `json:"username"`
+			Password string `json:"password"`
+			Remember bool   `json:"remember"`
+			Auto     bool   `json:"auto"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		res, err := atrustSvc.Login(req.GWID, req.Username, req.Password, req.Remember, req.Auto)
+		writeATrustResult(w, res, err)
+	})
+
+	mux.HandleFunc("/api/atrust/status", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		st := atrustSvc.GetStatus()
+		st["appVersion"] = AppVersion
+		// activeBackend 与 /api/status 保持同一语义，前端可以用同一段
+		// 轮询代码处理两种响应。
+		st["activeBackend"] = (&backends{v5vpn: vpnService, atrust: atrustSvc}).active()
+		_ = json.NewEncoder(w).Encode(st)
+	})
+
+	mux.HandleFunc("/api/atrust/logout", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if _, err := atrustSvc.Logout(); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]bool{"success": true})
+	})
+
+	mux.HandleFunc("/api/atrust/resources/refresh", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		res, err := atrustSvc.RefreshResources()
+		if err != nil {
+			w.WriteHeader(http.StatusBadGateway)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(res)
+	})
+
 	// Static UI assets
 	mux.Handle("/", http.FileServer(http.FS(uiFS)))
 
-	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
-	if err != nil {
-		ln, err = net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			log.Fatalf("Failed to bind local HTTP server: %v", err)
-		}
-	}
-	actualPort := ln.Addr().(*net.TCPAddr).Port
-
-	go func() {
-		log.Printf("UI Bridge server listening at http://127.0.0.1:%d", actualPort)
-		if err := http.Serve(ln, mux); err != nil {
-			log.Printf("HTTP server terminated: %v", err)
-		}
-	}()
-	return actualPort
+	return mux
 }
 
 // runDumpPasswords dumps decrypted passwords from original installation
@@ -781,6 +902,26 @@ func writeLoginResult(w http.ResponseWriter, res map[string]any, err error) {
 			payload["code"] = code
 		}
 		w.WriteHeader(status)
+		_ = json.NewEncoder(w).Encode(payload)
+		return
+	}
+	_ = json.NewEncoder(w).Encode(res)
+}
+
+// writeATrustResult 是 writeLoginResult 的 aTrust 版本。
+//
+// 单独一个函数而不是加参数复用：两边的错误码集合不同
+// （aTrust 没有 password_expired，V5VPN 没有 mfa_required），
+// 混在一起会让任何一侧新增码值时都要重新确认另一侧。
+func writeATrustResult(w http.ResponseWriter, res map[string]any, err error) {
+	w.Header().Set("Content-Type", "application/json")
+	if err != nil {
+		code := service.ATrustErrorCode(err)
+		payload := map[string]string{"error": err.Error()}
+		if code != "" {
+			payload["code"] = code
+		}
+		w.WriteHeader(http.StatusBadRequest)
 		_ = json.NewEncoder(w).Encode(payload)
 		return
 	}
