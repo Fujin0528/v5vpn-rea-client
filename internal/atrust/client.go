@@ -79,6 +79,19 @@ type Client struct {
 	csrfToken  string
 	authConfig *AuthConfig
 
+	// ---------- 数据面所需的会话材料（tunnel.go） ----------
+	//
+	// 这些字段都由控制面流程填充：username 来自登录参数，deviceID 由
+	// EnsureDeviceID 生成并持久化，signKey 从 antiMITMAttackData 派生，
+	// nodeAddr / currentAppID 在资源树解析后确定。
+	username     string
+	deviceID     string
+	signKey      string
+	nodeAddr     string
+	currentAppID string
+	// resources 保存最近一次资源树解析结果，供 DialTCP 选路。
+	resources *resourceIndex
+
 	// InsecureSkipVerify 由构造时决定。生产环境应当校验证书；
 	// 留出这个开关是因为不少内网网关用自签证书——官方客户端自己也
 	// 有一条 sslVerify skipped 分支（§25.6.6）。

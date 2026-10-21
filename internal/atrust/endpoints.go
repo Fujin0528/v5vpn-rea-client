@@ -111,6 +111,8 @@ func (c *Client) FetchAuthConfig(ctx context.Context) (*AuthConfig, error) {
 	}
 
 	c.setAuthConfig(cfg)
+	// signKey 由 antiMITMAttackData 本地派生（§29.2），数据面请求签名要用。
+	c.setSignKeyFromAntiMITM(cfg.AntiMITMAttackData)
 	c.logf("aTrust authConfig: domains=%v firstAuth=%v randLen=%d",
 		cfg.Domains, cfg.FirstAuth, len(cfg.AntiReplayRand))
 	return cfg, nil
@@ -251,6 +253,9 @@ func (c *Client) OnlineInfo(ctx context.Context) (*OnlineInfo, error) {
 // 返回原始 map 而不做结构投影：资源树的形状尚未与真实网关比对过
 // （mock 只给了最小可用集），过早固化模型会把错误写进类型里。
 // 上层按需读取自己认识的键即可。
+//
+// ★ 拿到响应后会调用 SetResources 建立路由索引——数据面的选路与
+// appId 都依赖它。调用方不需要额外做什么。
 func (c *Client) ClientResource(ctx context.Context) (map[string]any, error) {
 	if err := c.ensureSession(); err != nil {
 		return nil, err
@@ -266,6 +271,7 @@ func (c *Client) ClientResource(ctx context.Context) (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
+	c.SetResources(*data)
 	return *data, nil
 }
 

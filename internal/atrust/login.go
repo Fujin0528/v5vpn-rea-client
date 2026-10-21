@@ -64,6 +64,9 @@ func (c *Client) Detect(ctx context.Context) error {
 //  4. onlineInfo —— 该端点在登录链里被调用过；它的 isOnline 结果会
 //     影响客户端是否拉起原生 agent。我们作为纯客户端只需要它成功返回。
 func (c *Client) Authenticate(ctx context.Context, username, password string) (*AuthConfig, error) {
+	// 用户名是数据面隧道认证 JSON 的必填字段，先记下来。
+	c.SetUsername(username)
+
 	cfg, err := c.FetchAuthConfig(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("aTrust: 获取 authConfig 失败: %w", err)
