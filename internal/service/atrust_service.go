@@ -124,6 +124,7 @@ func (s *ATrustService) GetStatus() map[string]any {
 		"resources":      resources,
 		"resourceState":  state,
 		"resourceError":  resErr,
+		"resourceCount":  len(resources),
 		"lastUseGateway": s.lastUseGateway(),
 		"logCount":       len(s.host.GetLogs()),
 		"protocol":       config.ProtocolATrust,
