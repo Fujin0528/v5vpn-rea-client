@@ -305,6 +305,11 @@ func (s *ATrustService) loadResources(client *atrust.Client) {
 
 	raw, err := client.ClientResource(ctx)
 
+	// 第一次持锁：只在错误分支里改状态，成功路径**先解锁**再去起代理。
+	//
+	// ⚠ 这里不能把整段都包在锁里：起代理要 listen 端口，可能在扫端口上
+	// 耽搁；而且后面还要再取一次锁来发布结果。sync.Mutex 不可重入，
+	// 同一把锁连取两次会直接死锁（测试里表现为 GetStatus 永远挂住）。
 	s.mu.Lock()
 	if s.Client != client {
 		// 拉取期间会话被替换或登出了。
@@ -324,13 +329,11 @@ func (s *ATrustService) loadResources(client *atrust.Client) {
 		s.host.Log("WARN", "aTrust: 获取应用列表失败（会话仍有效，可重试）: %v", err)
 		return
 	}
+	s.mu.Unlock()
 
 	items, unknownKeys := atrust.ExtractResources(raw)
 
-	// ★ 先替换旧代理，再发布新资源。
-	//
-	// 代理要在锁外启动（它会 listen 端口，可能阻塞），但发布资源必须在锁内。
-	// 顺序是：锁外启动 → 锁内替换。若期间会话被替换，就把刚起的代理停掉。
+	// 锁外起代理（会 listen 端口），再回来持锁发布。
 	proxy := NewATrustProxy(client, func(format string, args ...any) {
 		s.host.Log("INFO", "aTrust: "+format, args...)
 	})

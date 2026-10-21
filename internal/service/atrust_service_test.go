@@ -269,7 +269,12 @@ func TestATrustLoginUnknownGateway(t *testing.T) {
 // TestATrustLoginRecordsDataPlaneGap 验证「数据面未实现」这件事被明确记录。
 //
 // 静默成功会让人以为资源可以访问，这是最糟的失败方式。
-func TestATrustLoginRecordsDataPlaneGap(t *testing.T) {
+// TestATrustLoginReportsDataPlane 验证登录时说明了数据面已经可用。
+//
+// 这条日志的历史：数据面未实现时它写的是「TLS:441 + SOCKS5 尚未实现」，
+// 目的是避免用户以为资源列表可点即通。现在通道实现了，措辞改成告知
+// 可用形态——但仍要说清 UDP 不支持，那个缺口是真实存在的。
+func TestATrustLoginReportsDataPlane(t *testing.T) {
 	g := newFakeGateway(t)
 	host := newFakeHost(g.profile())
 	svc := NewATrustService(host)
@@ -277,8 +282,11 @@ func TestATrustLoginRecordsDataPlaneGap(t *testing.T) {
 	if _, err := svc.Login("gw-atrust-test", "alice", "secret-pass", false, false); err != nil {
 		t.Fatalf("Login 失败: %v", err)
 	}
-	if !host.logContains("数据面通道 TLS:441 + SOCKS5 尚未实现") {
-		t.Errorf("未记录数据面缺口。日志: %v", host.GetLogs())
+	if !host.logContains("数据面使用 TCP 流式通道") {
+		t.Errorf("未说明数据面形态。日志: %v", host.GetLogs())
+	}
+	if !host.logContains("UDP") {
+		t.Errorf("未说明 UDP 不支持。日志: %v", host.GetLogs())
 	}
 }
 
