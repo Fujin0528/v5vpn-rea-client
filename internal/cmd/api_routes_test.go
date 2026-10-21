@@ -162,6 +162,70 @@ func TestLogoutRouteIsShared(t *testing.T) {
 	}
 }
 
+// TestWrongBackendGuard 是 §14.5.2 边界二的接线守卫。
+//
+// 没有它的时候，把 aTrust 网关发到 /api/login 会被真的当作 V5VPN 连接
+// 发出去：对端是 aTrust 网关，于是拿到语焉不详的"未下发有效会话ID"，
+// 同时 V5VPN 后端的状态被改成 Error。界面显示"V5VPN 认证失败"，
+// 而真实原因只是选错了后端。
+func TestWrongBackendGuard(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	v5 := service.NewVPNService(nil)
+	at := service.NewATrustService(v5)
+
+	// 往配置里加一个 aTrust 网关。
+	if err := v5.SaveGateway(config.GatewayProfile{
+		ID: "gw-at", Name: "零信任网关", IP: "198.51.100.20", Port: 443,
+		Protocol: config.ProtocolATrust,
+	}); err != nil {
+		t.Fatalf("保存网关失败: %v", err)
+	}
+
+	uiFS := fstest.MapFS{"index.html": &fstest.MapFile{Data: []byte("<html></html>")}}
+	h := newAPIRouter(uiFS, v5, at)
+
+	// aTrust 网关打到 V5VPN 端点：必须是 409，且不能真的发起连接。
+	rec := postJSON(t, h, "/api/login", `{"gwId":"gw-at","username":"u","password":"p"}`)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d，期望 409。body=%s", rec.Code, rec.Body)
+	}
+	var payload map[string]string
+	_ = json.Unmarshal(rec.Body.Bytes(), &payload)
+	if payload["code"] != "wrong_backend" {
+		t.Errorf("code = %q，期望 wrong_backend", payload["code"])
+	}
+	// V5VPN 后端不应因此进入 Error。
+	if st := v5.GetStatus(); st["status"] != "Disconnected" {
+		t.Errorf("V5VPN 状态被改动: %v", st["status"])
+	}
+}
+
+// TestWrongBackendGuardReverse 验证反方向。
+func TestWrongBackendGuardReverse(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	v5 := service.NewVPNService(nil)
+	at := service.NewATrustService(v5)
+
+	if err := v5.SaveGateway(config.GatewayProfile{
+		ID: "gw-v5", Name: "老网关", IP: "192.0.2.10", Port: 443,
+	}); err != nil {
+		t.Fatalf("保存网关失败: %v", err)
+	}
+
+	uiFS := fstest.MapFS{"index.html": &fstest.MapFile{Data: []byte("<html></html>")}}
+	h := newAPIRouter(uiFS, v5, at)
+
+	rec := postJSON(t, h, "/api/atrust/login", `{"gwId":"gw-v5","username":"u","password":"p"}`)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d，期望 409。body=%s", rec.Code, rec.Body)
+	}
+	var payload map[string]string
+	_ = json.Unmarshal(rec.Body.Bytes(), &payload)
+	if payload["code"] != "wrong_backend" {
+		t.Errorf("code = %q，期望 wrong_backend", payload["code"])
+	}
+}
+
 // TestWriteATrustResultCodes 锁定 aTrust 侧的稳定错误码。
 //
 // 两边码值集合不同（aTrust 没有 password_expired，V5VPN 没有

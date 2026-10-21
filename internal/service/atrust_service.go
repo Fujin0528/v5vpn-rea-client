@@ -118,6 +118,11 @@ func (s *ATrustService) GetStatus() map[string]any {
 	resErr := s.resourceError
 	s.mu.Unlock()
 
+	// nil 切片会被编码成 JSON null，前端 renderResources 里的
+	// resources.length 会抛 TypeError。统一成空数组。
+	if resources == nil {
+		resources = []atrust.Resource{}
+	}
 	return map[string]any{
 		"status":         status,
 		"statusDetail":   detail,

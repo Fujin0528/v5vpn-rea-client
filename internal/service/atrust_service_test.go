@@ -343,6 +343,33 @@ func TestATrustStatusShapeIsUICompatible(t *testing.T) {
 	}
 }
 
+// TestATrustStatusResourcesIsNeverNull 守护前端不崩。
+//
+// nil 切片会被编码成 JSON null，而 renderResources 里直接取
+// resources.length —— null.length 是 TypeError，界面会整块空白而不是
+// 显示"暂无应用"。返回空数组才是可渲染的。
+func TestATrustStatusResourcesIsNeverNull(t *testing.T) {
+	svc := NewATrustService(newFakeHost())
+	st := svc.GetStatus()
+
+	res, ok := st["resources"]
+	if !ok {
+		t.Fatal("缺少 resources 键")
+	}
+	if res == nil {
+		t.Fatal("未连接时 resources 为 nil，会被编码成 JSON null")
+	}
+
+	// 走一遍真实序列化，断言关键字面量是 [] 而不是 null。
+	buf, err := json.Marshal(st)
+	if err != nil {
+		t.Fatalf("序列化失败: %v", err)
+	}
+	if strings.Contains(string(buf), `"resources":null`) {
+		t.Fatalf("resources 被编码成 null: %s", buf)
+	}
+}
+
 // TestATrustGatewayURL 覆盖用户可能填的几种地址形态。
 func TestATrustGatewayURL(t *testing.T) {
 	cases := []struct {

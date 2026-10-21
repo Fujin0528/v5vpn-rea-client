@@ -560,6 +560,17 @@ func newAPIRouter(uiFS fs.FS, vpnService *service.VPNService, atrustSvc *service
 			return
 		}
 
+		// 协议守卫：这个端点只服务 V5VPN 网关。
+		//
+		// 没有它的时候，一个发错端点的 aTrust 请求会被真的当作 V5VPN
+		// 连接发出去——对端是 aTrust 网关，于是拿到一个语焉不详的
+		// "未下发有效会话ID"，同时把 V5VPN 后端的状态改成 Error。
+		// 界面看到的是"V5VPN 认证失败"，而实际原因只是选错了后端。
+		if gw := vpnService.GetConfig().FindGateway(req.GWID); gw != nil && gw.IsATrust() {
+			writeATrustRoutingError(w, gw.Name, config.ProtocolATrust)
+			return
+		}
+
 		res, err := vpnService.Login(req.GWID, req.Username, req.Password, req.VerifyCode, req.Remember, req.Auto)
 		writeLoginResult(w, res, err)
 	})
@@ -799,6 +810,15 @@ func newAPIRouter(uiFS fs.FS, vpnService *service.VPNService, atrustSvc *service
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+
+		// 反向守卫：aTrust 端点只服务 aTrust 网关。
+		// ATrustService.Login 内部也有同样的检查（防止直接调用绕过），
+		// 这里提前拦是为了给出统一的 409 + wrong_backend 形状。
+		if gw := vpnService.GetConfig().FindGateway(req.GWID); gw != nil && !gw.IsATrust() {
+			writeATrustRoutingError(w, gw.Name, gw.EffectiveProtocol())
+			return
+		}
+
 		res, err := atrustSvc.Login(req.GWID, req.Username, req.Password, req.Remember, req.Auto)
 		writeATrustResult(w, res, err)
 	})
@@ -906,6 +926,19 @@ func writeLoginResult(w http.ResponseWriter, res map[string]any, err error) {
 		return
 	}
 	_ = json.NewEncoder(w).Encode(res)
+}
+
+// writeATrustRoutingError 报告"这个网关不属于当前端点"。
+//
+// 用 409 Conflict 而不是 400：请求本身没问题，是它指向的资源
+// （网关）与这个端点不匹配。
+func writeATrustRoutingError(w http.ResponseWriter, gwName, protocol string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusConflict)
+	_ = json.NewEncoder(w).Encode(map[string]string{
+		"error": fmt.Sprintf("网关 %q 使用的是 %s 协议，不能通过当前端点登录", gwName, protocol),
+		"code":  "wrong_backend",
+	})
 }
 
 // writeATrustResult 是 writeLoginResult 的 aTrust 版本。

@@ -51,7 +51,7 @@ var resourceArrayKeys = []string{
 // 直接看到候选，而不是只看到一个空列表。
 func ExtractResources(raw map[string]any) (items []Resource, extraKeys []string) {
 	if raw == nil {
-		return nil, nil
+		return []Resource{}, nil
 	}
 
 	var arr []any
@@ -86,7 +86,9 @@ func ExtractResources(raw map[string]any) (items []Resource, extraKeys []string)
 	}
 
 	if arr == nil {
-		return nil, extraKeys
+		// 返回 nil 而不是 nil 切片会让 JSON 编码成 null，前端 renderResources
+		// 里的 resources.length 就会抛 TypeError。空切片编码成 []。
+		return []Resource{}, extraKeys
 	}
 
 	items = make([]Resource, 0, len(arr))
