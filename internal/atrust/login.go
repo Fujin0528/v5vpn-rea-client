@@ -47,7 +47,11 @@ func (c *Client) Detect(ctx context.Context) error {
 	return nil
 }
 
-// Login 执行完整的口令登录链。
+// Authenticate 执行到 onlineInfo 为止的认证链，**不拉资源树**。
+//
+// 单独拆出来的原因是 UI 的时序：登录请求有 12 秒上限，而 clientResource
+// 在冷启动的网关上可能更慢。先让界面进入"已连接、正在拉取资源"，
+// 再在后台补资源，和 V5VPN 侧的 enterConnected / loadResources 是同一套语义。
 //
 // 步骤与理由（每一步都是实测必需的）：
 //
@@ -59,10 +63,7 @@ func (c *Client) Detect(ctx context.Context) error {
 //     两个键被客户端认识。空串表示没有下一步。
 //  4. onlineInfo —— 该端点在登录链里被调用过；它的 isOnline 结果会
 //     影响客户端是否拉起原生 agent。我们作为纯客户端只需要它成功返回。
-//  5. clientResource —— 资源树。这一步失败不应当让登录失败：
-//     会话已经有效，资源可以稍后重试（与 V5VPN 侧的
-//     ResourceFetchError 语义一致）。
-func (c *Client) Login(ctx context.Context, username, password string) (*LoginResult, error) {
+func (c *Client) Authenticate(ctx context.Context, username, password string) (*AuthConfig, error) {
 	cfg, err := c.FetchAuthConfig(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("aTrust: 获取 authConfig 失败: %w", err)
@@ -84,6 +85,19 @@ func (c *Client) Login(ctx context.Context, username, password string) (*LoginRe
 		c.logf("aTrust onlineInfo 失败（不阻断登录）: %v", err)
 	} else if !info.IsOnline {
 		c.logf("aTrust onlineInfo 返回 isOnline=false（会话可能未被网关确认）")
+	}
+
+	return cfg, nil
+}
+
+// Login 执行完整的口令登录链，含资源树。
+//
+// 资源那一步失败不应当让登录失败：会话已经有效，资源可以稍后重试
+// （与 V5VPN 侧的 ResourceFetchError 语义一致）。
+func (c *Client) Login(ctx context.Context, username, password string) (*LoginResult, error) {
+	cfg, err := c.Authenticate(ctx, username, password)
+	if err != nil {
+		return nil, err
 	}
 
 	res := &LoginResult{
