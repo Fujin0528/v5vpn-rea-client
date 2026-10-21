@@ -333,6 +333,7 @@
               <tr>
                 <th>网关名称</th>
                 <th>IP 地址与端口</th>
+                <th>协议</th>
                 <th>加密模式</th>
                 <th>已存账号</th>
                 <th>操作</th>
@@ -348,6 +349,10 @@
             <input type="text" id="new-gw-name" class="form-control" placeholder="网关名称 (最多20字)" maxlength="20">
             <input type="text" id="new-gw-ip" class="form-control" placeholder="网关 IP 或域名" maxlength="64">
             <input type="number" id="new-gw-port" class="form-control" placeholder="端口" value="443" min="1" max="65535">
+            <select id="new-gw-protocol" class="form-control" title="网关协议：决定由哪个后端登录">
+              <option value="v5vpn">V5VPN</option>
+              <option value="atrust">aTrust 零信任</option>
+            </select>
             <select id="new-gw-algo" class="form-control">
               <option value="0">国际标准 TLS</option>
               <option value="1">国密 GM/SM</option>
