@@ -26,6 +26,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/url"
 	"strings"
 )
 
@@ -68,14 +69,25 @@ type resourceIndex struct {
 	// 测试里也会变成真实网络请求。nil 表示不做域名解析（只用精确规则
 	// 与后缀规则），这也是构造索引时的默认值。
 	resolver func(host string) net.IP
+
+	// gatewayHost 是控制面网关的主机部分，用于展开线路地址里的
+	// {{sdpcHost}} 占位符（见 expandPlaceholder）。为空时占位符无法展开，
+	// 相关线路会被跳过。
+	gatewayHost string
 }
 
 // buildResourceIndex 从 clientResource 的原始响应构造索引。
 //
 // 结构是 data.appList.data.appInfo[]（分组）.apps[]（应用）.addressList[]（路由）。
 // 各层都做宽容处理：任何一个键缺失都不会 panic，只是那条规则不生效。
-func buildResourceIndex(raw map[string]any) *resourceIndex {
-	idx := &resourceIndex{nodeAddrs: map[string]string{}}
+//
+// gatewayHost 用于展开线路地址里的 {{sdpcHost}} 占位符；传空串时
+// 那些线路会被跳过（见 expandPlaceholder）。
+func buildResourceIndex(raw map[string]any, gatewayHost string) *resourceIndex {
+	idx := &resourceIndex{
+		nodeAddrs:   map[string]string{},
+		gatewayHost: gatewayHost,
+	}
 	if raw == nil {
 		return idx
 	}
@@ -134,12 +146,41 @@ func buildResourceIndex(raw map[string]any) *resourceIndex {
 	return idx
 }
 
+// sdpcHostPlaceholder 是"网关自身地址"的占位符。
+//
+// 有的网关（以及 mock）在 addressInfo.address 里不写具体主机，而是给这个
+// 占位符，由客户端替换成它正在连接的那个网关地址。好处是同一条资源树
+// 在任意入口下都成立：本机连 127.0.0.1、远端连公网 IP 都能用。
+//
+// 真实网关用它的场景是"控制面与数据面同一台机器但地址下发时要保持中立"。
+const sdpcHostPlaceholder = "{{sdpcHost}}"
+
+// expandPlaceholder 把线路地址里的 {{sdpcHost}} 换成网关主机。
+//
+// ★ 只替换**主机部分**，端口保持资源树给的原样。
+// 控制面通常连在 :8443，数据面固定 :441，直接把控制面的 host:port 拼上去
+// 会得到 "127.0.0.1:8443:441" 这种畸形地址。
+//
+// 网关主机为空（比如调用方没给 baseURL）时返回空串——调用方据此跳过
+// 这条线路，而不是把字面量 "{{sdpcHost}}" 交给 DNS 去解析（那样报出来的
+// "no such host" 会掩盖真正的配置问题）。
+func (r *resourceIndex) expandPlaceholder(addr string) string {
+	if !strings.Contains(addr, sdpcHostPlaceholder) {
+		return addr
+	}
+	host := r.gatewayHost
+	if host == "" {
+		return ""
+	}
+	return strings.ReplaceAll(addr, sdpcHostPlaceholder, host)
+}
+
 // parseNodeGroups 解析 config.nodeGroupConf。
 //
 // 线路地址的两种写法都接受：
 //
 //	addressInfo[].{type:"wan", address:"host:441"}
-//	addressInfo[].address 为 "{{sdpcHost}}"  → 替换成网关自身地址
+//	addressInfo[].address 为 "{{sdpcHost}}:441"  → 替换成网关主机
 //
 // 后一种是 mock 用的：它让同一条资源树在本机和远端都能用。
 func (r *resourceIndex) parseNodeGroups(ngc map[string]any) {
@@ -167,6 +208,11 @@ func (r *resourceIndex) parseNodeGroups(ngc map[string]any) {
 			}
 			addr := firstString(am, "address", "addr")
 			if addr == "" {
+				continue
+			}
+			addr = r.expandPlaceholder(addr)
+			if addr == "" {
+				// 占位符没解析出来：跳过这条线路，而不是把字面量当主机名。
 				continue
 			}
 			if !strings.Contains(addr, ":") {
@@ -345,6 +391,19 @@ func (r *resourceIndex) nodeFor(e routeEntry) string {
 	return ""
 }
 
+// gatewayHostOf 从 baseURL（形如 https://host:port）取出**纯主机部分**。
+//
+// 注意与 tunnel.go 的 hostOnly 区分：那个接收 host:port，这个接收带
+// scheme 的 URL。混用会得到 "https://127.0.0.1" 这种含协议的主机名，
+// 拼进线路地址后 dial 会报 "too many colons in address"。
+func gatewayHostOf(baseURL string) string {
+	u, err := url.Parse(baseURL)
+	if err != nil || u.Hostname() == "" {
+		return ""
+	}
+	return u.Hostname()
+}
+
 // lookupIPv4 把域名解析成首个 IPv4 地址，失败返回 nil。
 //
 // 只取 IPv4：资源树的 CIDR/区间规则都是 IPv4 形态，IPv6 结果对它们
@@ -441,7 +500,7 @@ func childArray(m map[string]any, key string) []any {
 // 由 ClientResource / Login 自动调用；也可由调用方在自行解析后调用，
 // 让 DialTCP 能选路。
 func (c *Client) SetResources(raw map[string]any) {
-	idx := buildResourceIndex(raw)
+	idx := buildResourceIndex(raw, gatewayHostOf(c.baseURL))
 	// 生产路径才启用 DNS：域名若不在精确规则里，需要解析出 IP 去匹配
 	// CIDR/区间规则（geektrust §4.2 的第二轮）。
 	idx.resolver = lookupIPv4

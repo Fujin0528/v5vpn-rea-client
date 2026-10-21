@@ -200,7 +200,7 @@ func TestResourceIndexRealTree(t *testing.T) {
 		},
 	}
 
-	idx := buildResourceIndex(raw)
+	idx := buildResourceIndex(raw, "gw.example.com")
 
 	if idx.firstAppID != "app-1" {
 		t.Errorf("firstAppID = %q, want app-1", idx.firstAppID)
@@ -259,7 +259,7 @@ func TestResourceIndexPortWildcard(t *testing.T) {
 				},
 			},
 		},
-	})
+	}, "gw.example.com")
 
 	// CIDR 应覆盖任意端口
 	for _, port := range []int{80, 443, 3306} {
@@ -356,6 +356,57 @@ func TestParseNodeGroupAddsDefaultPort(t *testing.T) {
 	})
 	if got := idx.nodeAddrs["ng"]; got != "10.0.0.5:441" {
 		t.Errorf("线路 = %q, want 10.0.0.5:441", got)
+	}
+}
+
+// TestGatewayHostOf 验证从 baseURL 取主机时不会带出 scheme。
+//
+// 这条曾经错过一次：直接对 "https://127.0.0.1:8443" 做 host:port 拆分，
+// 得到的是 "https://127.0.0.1"，拼进线路地址后 dial 报
+// "too many colons in address"——现象像是线路不通，实际是取值错了。
+func TestGatewayHostOf(t *testing.T) {
+	cases := map[string]string{
+		"https://127.0.0.1:8443":     "127.0.0.1",
+		"https://gw.example.com":     "gw.example.com",
+		"https://[2001:db8::1]:8443": "2001:db8::1",
+		"":                           "",
+	}
+	for in, want := range cases {
+		if got := gatewayHostOf(in); got != want {
+			t.Errorf("gatewayHostOf(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// TestExpandSdpcHostPlaceholder 验证 {{sdpcHost}} 只替换主机部分。
+//
+// 这条规则很容易写错成"把控制面的 host:port 整段拼上去"，那样会得到
+// 127.0.0.1:8443:441 这种畸形地址——DNS 会报 no such host，
+// 看起来像是线路不通，实际是拼接错了。
+func TestExpandSdpcHostPlaceholder(t *testing.T) {
+	idx := &resourceIndex{gatewayHost: "127.0.0.1"}
+
+	cases := map[string]string{
+		"{{sdpcHost}}":      "127.0.0.1",
+		"{{sdpcHost}}:441":  "127.0.0.1:441",
+		"10.0.0.1:441":      "10.0.0.1:441", // 不含占位符时原样返回
+		"{{sdpcHost}}:8443": "127.0.0.1:8443",
+	}
+	for in, want := range cases {
+		if got := idx.expandPlaceholder(in); got != want {
+			t.Errorf("expandPlaceholder(%q) = %q, want %q", in, got, want)
+		}
+	}
+
+	// 不知道网关主机时必须返回空串，让调用方跳过这条线路，
+	// 而不是把字面量交给 DNS。
+	empty := &resourceIndex{}
+	if got := empty.expandPlaceholder("{{sdpcHost}}:441"); got != "" {
+		t.Errorf("无网关主机时应返回空串，得到 %q", got)
+	}
+	// 不含占位符的地址即使没有网关主机也要原样保留。
+	if got := empty.expandPlaceholder("10.0.0.1:441"); got != "10.0.0.1:441" {
+		t.Errorf("不含占位符的地址被改动了: %q", got)
 	}
 }
 
