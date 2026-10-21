@@ -948,6 +948,12 @@ func (s *VPNService) GetStatus() map[string]any {
 }
 
 // GetLogs returns all logged messages
+// UserDataDir 返回 setting.xml 所在的每用户目录（未设置时为空）。
+//
+// 由 ATrustHost 接口使用：aTrust 后端要在同一目录下存设备标识文件。
+// 这里只是把 config 包级的取值转出去，不引入额外状态。
+func (s *VPNService) UserDataDir() string { return config.UserDataDir() }
+
 func (s *VPNService) GetLogs() []string {
 	s.logMu.Lock()
 	defer s.logMu.Unlock()

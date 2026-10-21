@@ -49,6 +49,11 @@ type ATrustHost interface {
 	SaveGateway(gw config.GatewayProfile) error
 	GetLogs() []string
 	Log(level string, format string, args ...any)
+	// UserDataDir 是 setting.xml 所在的每用户目录。
+	//
+	// aTrust 后端用它存放设备标识文件（见 atrust.EnsureDeviceID）——
+	// 那个值必须跨进程持久化，又属于后端内部状态，不适合放进用户可见的配置。
+	UserDataDir() string
 }
 
 // ATrustService 是 aTrust 后端的会话与状态容器。
@@ -57,6 +62,9 @@ type ATrustService struct {
 
 	// Client 是当前会话的控制面客户端；未连接时为 nil。
 	Client *atrust.Client
+
+	// proxy 是资源到本地端口的映射；未连接时为 nil。
+	proxy *ATrustProxy
 
 	Status       string // "Disconnected" / "Connecting" / "Connected" / "Error"
 	StatusDetail string
@@ -191,7 +199,9 @@ func (s *ATrustService) Login(gwIdentifier, username, password string, remember,
 	// 不主动登出会让网关侧留下一个孤儿在线记录。
 	s.mu.Lock()
 	stale := s.Client
+	staleProxy := s.proxy
 	s.Client = nil
+	s.proxy = nil
 	s.Resources = nil
 	s.resourceState = ""
 	s.resourceError = ""
@@ -199,6 +209,10 @@ func (s *ATrustService) Login(gwIdentifier, username, password string, remember,
 	s.StatusDetail = fmt.Sprintf("正在连接 %s (%s)...", gw.Name, address)
 	fn := s.OnStatusChange
 	s.mu.Unlock()
+	// 先停代理再关客户端：代理的转发协程还在用 client.DialTCP。
+	if staleProxy != nil {
+		staleProxy.Stop()
+	}
 	if stale != nil {
 		stale.Close()
 	}
@@ -224,6 +238,17 @@ func (s *ATrustService) Login(gwIdentifier, username, password string, remember,
 
 	ctx, cancel := context.WithTimeout(context.Background(), atrustLoginTimeout)
 	defer cancel()
+
+	// 设备标识必须在数据面建连之前就位：隧道认证 JSON 的 deviceId 是必填项，
+	// 且**首次登录后必须保持不变**（换成新值网关会当成新设备，可能要重新授信）。
+	// 存放目录与 setting.xml 同目录。
+	if dir := s.host.UserDataDir(); dir != "" {
+		if id, err := atrust.EnsureDeviceID(dir); err != nil {
+			s.host.Log("WARN", "aTrust: 设备标识不可用（数据面可能无法建连）: %v", err)
+		} else {
+			client.SetDeviceID(id)
+		}
+	}
 
 	if _, err := client.Authenticate(ctx, username, password); err != nil {
 		client.Close()
@@ -252,10 +277,8 @@ func (s *ATrustService) enterConnected(client *atrust.Client, username string) m
 	}
 
 	s.host.Log("SUCCESS", "aTrust: 认证成功，会话已建立；正在后台拉取应用列表...")
-	// 数据面没实现这件事必须说出来。静默地展示一个资源列表，
-	// 会让人以为点击即可访问内网。
-	s.host.Log("INFO", "aTrust: 当前版本仅完成控制面（登录/会话/资源列表）；"+
-		"数据面通道 TLS:441 + SOCKS5 尚未实现，应用列表暂不可访问")
+	s.host.Log("INFO", "aTrust: 数据面使用 TCP 流式通道（TLS:441）；"+
+		"资源加载后会在本地端口上监听，应用列表中的「本地代理」地址可直接访问。UDP 资源暂不支持")
 
 	go s.loadResources(client)
 
@@ -303,12 +326,35 @@ func (s *ATrustService) loadResources(client *atrust.Client) {
 	}
 
 	items, unknownKeys := atrust.ExtractResources(raw)
-	s.Resources = items
+
+	// ★ 先替换旧代理，再发布新资源。
+	//
+	// 代理要在锁外启动（它会 listen 端口，可能阻塞），但发布资源必须在锁内。
+	// 顺序是：锁外启动 → 锁内替换。若期间会话被替换，就把刚起的代理停掉。
+	proxy := NewATrustProxy(client, func(format string, args ...any) {
+		s.host.Log("INFO", "aTrust: "+format, args...)
+	})
+	proxied := proxy.Start(items)
+
+	s.mu.Lock()
+	if s.Client != client {
+		// 拉取期间会话被替换或登出了。
+		s.mu.Unlock()
+		proxy.Stop()
+		return
+	}
+	oldProxy := s.proxy
+	s.proxy = proxy
+	s.Resources = proxied
 	s.resourceState = ResourceReady
 	s.resourceError = ""
-	s.StatusDetail = fmt.Sprintf("已连接 %s（%d 个应用）", s.username, len(items))
+	s.StatusDetail = fmt.Sprintf("已连接 %s（%d 个应用）", s.username, len(proxied))
 	fn := s.OnStatusChange
 	s.mu.Unlock()
+
+	if oldProxy != nil {
+		oldProxy.Stop()
+	}
 
 	if fn != nil {
 		go fn("Connected")
@@ -320,7 +366,8 @@ func (s *ATrustService) loadResources(client *atrust.Client) {
 		s.host.Log("WARN", "aTrust: 资源树里没有识别出应用，未识别的顶层键为 %v；"+
 			"若其中确有资源数据，请把它们加入 resourceTreeKeys/resourceArrayKeys", unknownKeys)
 	}
-	s.host.Log("SUCCESS", "aTrust: 已加载 %d 个应用。", len(items))
+	s.host.Log("SUCCESS", "aTrust: 已加载 %d 个应用（%d 个本地代理监听）。",
+		len(proxied), proxy.ActiveListeners())
 }
 
 // RefreshResources 重新拉取应用列表，供 UI 的「重试」按钮使用。
@@ -353,27 +400,44 @@ func (s *ATrustService) RefreshResources() (map[string]any, error) {
 
 	items, unknownKeys := atrust.ExtractResources(raw)
 
+	// 刷新时同样重建代理：资源可能变了，旧监听对应的目标可能已不存在。
+	//
+	// 这里不能直接复用旧 proxy：它的监听是绑定在旧目标列表上的。
+	// 新建 + 替换保证"资源表里看到的每条都是可连的"。
+	newProxy := NewATrustProxy(client, func(format string, args ...any) {
+		s.host.Log("INFO", "aTrust: "+format, args...)
+	})
+	proxied := newProxy.Start(items)
+
 	s.mu.Lock()
 	if s.Client != client {
 		s.mu.Unlock()
+		newProxy.Stop()
 		return nil, fmt.Errorf("会话已在刷新期间结束")
 	}
-	s.Resources = items
+	oldProxy := s.proxy
+	s.proxy = newProxy
+	s.Resources = proxied
 	s.resourceState = ResourceReady
 	s.resourceError = ""
-	s.StatusDetail = fmt.Sprintf("已连接 %s（%d 个应用）", s.username, len(items))
+	s.StatusDetail = fmt.Sprintf("已连接 %s（%d 个应用）", s.username, len(proxied))
 	s.mu.Unlock()
+
+	if oldProxy != nil {
+		oldProxy.Stop()
+	}
 
 	if len(items) == 0 && len(unknownKeys) > 0 {
 		s.host.Log("WARN", "aTrust: 资源树里没有识别出应用数组，顶层键为 %v", unknownKeys)
 	}
-	s.host.Log("SUCCESS", "aTrust: 已刷新 %d 个应用。", len(items))
+	s.host.Log("SUCCESS", "aTrust: 已刷新 %d 个应用（%d 个本地代理监听）。",
+		len(proxied), newProxy.ActiveListeners())
 
 	return map[string]any{
 		"status":        "Connected",
 		"resourceState": string(ResourceReady),
-		"resourceCount": len(items),
-		"resources":     items,
+		"resourceCount": len(proxied),
+		"resources":     proxied,
 	}, nil
 }
 
@@ -386,7 +450,9 @@ func (s *ATrustService) RefreshResources() (map[string]any, error) {
 func (s *ATrustService) Logout() (bool, error) {
 	s.mu.Lock()
 	client := s.Client
+	proxy := s.proxy
 	s.Client = nil
+	s.proxy = nil
 	s.Resources = nil
 	s.resourceState = ""
 	s.resourceError = ""
@@ -398,6 +464,12 @@ func (s *ATrustService) Logout() (bool, error) {
 
 	if fn != nil {
 		go fn("Disconnected")
+	}
+
+	// 先停代理，让本地端口立刻释放；再登出。
+	// 顺序反过来会让转发协程在网关会话已失效后还在尝试建隧道。
+	if proxy != nil {
+		proxy.Stop()
 	}
 
 	if client == nil {

@@ -32,6 +32,9 @@ type fakeHost struct {
 	cfg      *config.AppConfig
 	logs     []string
 	savedGws []config.GatewayProfile
+	// userDataDir 供 aTrust 后端存放设备标识。默认空串 = 不持久化，
+	// 这样测试不会在真实用户目录里写文件。
+	userDataDir string
 }
 
 func newFakeHost(gateways ...config.GatewayProfile) *fakeHost {
@@ -42,6 +45,13 @@ func (h *fakeHost) GetConfig() *config.AppConfig {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.cfg.Snapshot()
+}
+
+// UserDataDir 返回测试指定的目录（默认为空 = 不落盘）。
+func (h *fakeHost) UserDataDir() string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.userDataDir
 }
 
 func (h *fakeHost) SaveGateway(gw config.GatewayProfile) error {
