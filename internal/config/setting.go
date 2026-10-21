@@ -89,6 +89,41 @@ type GatewayProfile struct {
 	CertAutoLogin  bool          `json:"certAutoLogin"` // remember the certificate login
 	SelectedCertID string        `json:"selectedCertId"`
 	SavedAccounts  []UserAccount `json:"savedAccounts"`
+
+	// Protocol selects which backend serves this gateway.
+	//
+	// Empty means V5VPN. That zero value is deliberate: existing
+	// setting.xml files have no such field, so they deserialize to ""
+	// and keep working without any migration. Only an explicit "atrust"
+	// routes the gateway to the aTrust backend.
+	//
+	// Protocol is a property of the *gateway*, not a global switch —
+	// that is what lets both backends coexist in one install without
+	// V5VPN's path being touched (see ATRUST_PROTOCOL_ANALYSIS.md §14.5).
+	Protocol string `json:"protocol,omitempty"`
+}
+
+// Gateway protocol values. Empty string is V5VPN by convention, not by
+// constant, so that untouched config files keep working.
+const (
+	ProtocolV5VPN  = "v5vpn"
+	ProtocolATrust = "atrust"
+)
+
+// EffectiveProtocol returns the protocol to use for this gateway,
+// normalizing the empty string to ProtocolV5VPN.
+func (g GatewayProfile) EffectiveProtocol() string {
+	switch g.Protocol {
+	case ProtocolATrust:
+		return ProtocolATrust
+	default:
+		return ProtocolV5VPN
+	}
+}
+
+// IsATrust reports whether this gateway is served by the aTrust backend.
+func (g GatewayProfile) IsATrust() bool {
+	return g.EffectiveProtocol() == ProtocolATrust
 }
 
 // AppConfig represents application settings used by the client
