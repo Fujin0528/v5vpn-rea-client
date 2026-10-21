@@ -317,8 +317,8 @@ func (s *ATrustService) loadResources(client *atrust.Client) {
 	// unknownKeys 是 resource.go 的排查钩子：如果真实网关用了我们没预料
 	// 的顶层键，这里会把候选列出来，而不是让资源表静默地空着。
 	if len(items) == 0 && len(unknownKeys) > 0 {
-		s.host.Log("WARN", "aTrust: 资源树里没有识别出应用数组，顶层键为 %v；"+
-			"若确为资源数据，请把它们加入 resourceArrayKeys", unknownKeys)
+		s.host.Log("WARN", "aTrust: 资源树里没有识别出应用，未识别的顶层键为 %v；"+
+			"若其中确有资源数据，请把它们加入 resourceTreeKeys/resourceArrayKeys", unknownKeys)
 	}
 	s.host.Log("SUCCESS", "aTrust: 已加载 %d 个应用。", len(items))
 }

@@ -153,3 +153,197 @@ func TestFirstStringSkipsBool(t *testing.T) {
 		t.Fatalf("空串不应返回值: %q", got)
 	}
 }
+
+// ─── 真实资源树结构（§4.2 / libreatrust resource.rs）───────────────
+
+// realTree 是真实网关 clientResource 的形状，与 mock 下发的完全一致。
+const realTree = `{
+  "appList": {
+    "code": 0,
+    "data": {
+      "appInfo": [
+        {
+          "id": "g1",
+          "name": "演示资源",
+          "accessModel": "L3VPN",
+          "apps": [
+            {
+              "id": "a1",
+              "name": "Mock 控制台",
+              "nodeGroupId": "n1",
+              "addressList": [
+                {"protocol": "tcp", "port": "8443", "host": "127.0.0.1"}
+              ]
+            },
+            {
+              "id": "a2",
+              "name": "内网 Web",
+              "nodeGroupId": "n1",
+              "addressList": [
+                {"protocol": "tcp", "port": "443", "host": "example.internal", "ip": ["10.15.45.163"]},
+                {"protocol": "tcp", "port": "443", "host": "10.15.45.163"}
+              ]
+            }
+          ]
+        },
+        {
+          "id": "g2",
+          "name": "内网网段",
+          "apps": [
+            {
+              "id": "a3",
+              "name": "办公网段",
+              "addressList": [
+                {"protocol": "tcp", "port": "0", "host": "10.20.0.0/16"}
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "sdpPolicy": {"code": 0, "data": {}}
+}`
+
+func parseTree(t *testing.T, raw string) map[string]any {
+	t.Helper()
+	var m map[string]any
+	dec := json.NewDecoder(strings.NewReader(raw))
+	dec.UseNumber()
+	if err := dec.Decode(&m); err != nil {
+		t.Fatalf("解析测试数据: %v", err)
+	}
+	return m
+}
+
+// TestExtractResourcesRealTree 是这次修复的核心用例。
+//
+// 修复前：appList 名下不是数组而是 {code,data:{appInfo}}，旧实现直接放弃，
+// 返回空列表且 extraKeys 里也没有 appList（因为键名认识）——于是
+// 「资源树解析失败」完全静默。真实客户端登录成功后看到的空白资源列表
+// 就是这个原因。
+func TestExtractResourcesRealTree(t *testing.T) {
+	items, _ := ExtractResources(parseTree(t, realTree))
+
+	// 5 条地址条目：a1(1) + a2(2) + a3(1) = 4
+	if len(items) != 4 {
+		t.Fatalf("资源数 = %d，期望 4。实际: %+v", len(items), items)
+	}
+
+	first := items[0]
+	if first.Name != "Mock 控制台" {
+		t.Errorf("name = %q", first.Name)
+	}
+	if first.RemoteIP != "127.0.0.1" || first.RemotePort != "8443" {
+		t.Errorf("地址 = %s:%s", first.RemoteIP, first.RemotePort)
+	}
+	if first.Protocol != "tcp" {
+		t.Errorf("protocol = %q", first.Protocol)
+	}
+	if first.MapID != "a1" {
+		t.Errorf("mapId = %q", first.MapID)
+	}
+	if first.Status != "active" {
+		t.Errorf("status = %q", first.Status)
+	}
+}
+
+// TestExtractResourcesExpandsAddressList 验证「一条应用多条地址」展开成多行。
+//
+// 同一个应用可能有域名入口和内网 IP 入口，它们是**不同的路由**，
+// 合并成一行会丢掉其中一条。
+func TestExtractResourcesExpandsAddressList(t *testing.T) {
+	items, _ := ExtractResources(parseTree(t, realTree))
+
+	var hosts []string
+	for _, it := range items {
+		if it.Name == "内网 Web" {
+			hosts = append(hosts, it.RemoteIP)
+		}
+	}
+	if len(hosts) != 2 {
+		t.Fatalf("内网 Web 应有 2 条地址，实际 %d: %v", len(hosts), hosts)
+	}
+	if hosts[0] != "example.internal" || hosts[1] != "10.15.45.163" {
+		t.Errorf("地址顺序或取值不符: %v", hosts)
+	}
+}
+
+// TestExtractResourcesPortZeroIsWildcard 验证 port "0" 的展示。
+//
+// aTrust 用 0 表示「全部端口」。直接显示 :0 会让人以为要连 0 端口。
+func TestExtractResourcesPortZeroIsWildcard(t *testing.T) {
+	items, _ := ExtractResources(parseTree(t, realTree))
+	for _, it := range items {
+		if it.Name == "办公网段" {
+			if it.RemotePort != "*" {
+				t.Fatalf("port 0 应显示为 *，实际 %q", it.RemotePort)
+			}
+			if it.RemoteIP != "10.20.0.0/16" {
+				t.Fatalf("CIDR 应原样保留，实际 %q", it.RemoteIP)
+			}
+			return
+		}
+	}
+	t.Fatal("未找到「办公网段」")
+}
+
+// TestExtractResourcesAppWithoutAddress 验证没有 addressList 的应用不丢。
+func TestExtractResourcesAppWithoutAddress(t *testing.T) {
+	raw := `{"appList":{"code":0,"data":{"appInfo":[
+	  {"id":"g","name":"组","apps":[{"id":"a","name":"无地址应用"}]}
+	]}}}`
+	items, _ := ExtractResources(parseTree(t, raw))
+	if len(items) != 1 {
+		t.Fatalf("资源数 = %d，期望 1", len(items))
+	}
+	if items[0].Name != "无地址应用" || items[0].MapID != "a" {
+		t.Fatalf("字段不符: %+v", items[0])
+	}
+}
+
+// TestExtractResourcesNameFallsBackToGroup 验证应用没名字时用分组名兜底。
+func TestExtractResourcesNameFallsBackToGroup(t *testing.T) {
+	raw := `{"appList":{"code":0,"data":{"appInfo":[
+	  {"id":"g","name":"分组名","apps":[{"id":"a","addressList":[{"protocol":"tcp","port":"22","host":"10.1.1.1"}]}]}
+	]}}}`
+	items, _ := ExtractResources(parseTree(t, raw))
+	if len(items) != 1 || items[0].Name != "分组名" {
+		t.Fatalf("分组名兜底失败: %+v", items)
+	}
+}
+
+// TestExtractResourcesTreeBeatsFlat 验证树形结构优先于扁平数组。
+//
+// 两者同时存在时（网关做兼容会同时下发新旧两种形状），应当用树形那份：
+// 扁平那份通常是旧版本残留，字段更少。
+func TestExtractResourcesTreeBeatsFlat(t *testing.T) {
+	raw := `{
+	  "appList": {"code":0,"data":{"appInfo":[
+	    {"id":"g","name":"树","apps":[{"id":"a","name":"树里的应用",
+	      "addressList":[{"protocol":"tcp","port":"443","host":"10.9.9.9"}]}]}
+	  ]}},
+	  "resources": [{"name":"扁平里的应用","host":"10.8.8.8","port":"80"}]
+	}`
+	items, _ := ExtractResources(parseTree(t, raw))
+	if len(items) != 1 || items[0].Name != "树里的应用" {
+		t.Fatalf("未优先使用树形结构: %+v", items)
+	}
+}
+
+// TestExtractResourcesRealTreeExtraKeys 验证 sdpPolicy 等非资源键被上报。
+func TestExtractResourcesRealTreeExtraKeys(t *testing.T) {
+	_, extra := ExtractResources(parseTree(t, realTree))
+	found := false
+	for _, k := range extra {
+		if k == "sdpPolicy" {
+			found = true
+		}
+		if k == "appList" {
+			t.Error("appList 是已知键，不应出现在 extraKeys 里")
+		}
+	}
+	if !found {
+		t.Errorf("sdpPolicy 应被列为未识别键（用于排查），实际: %v", extra)
+	}
+}
