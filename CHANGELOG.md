@@ -1,7 +1,13 @@
 # 更新日志
 
-## Unreleased
+## 未发布
 
+- **界面按协议彻底分家**：V5VPN 与 aTrust 不再共用一套界面做运行时隐藏，各自独立一份页面（`/v5vpn/` 与 `/atrust/`，HTML/JS/CSS 三件套）。aTrust 界面里没有加密模式、图形验证码、证书登录、修改密码这些它不支持的能力（原先共用界面里 aTrust 会话仍会露出「修改密码」按钮的问题随分家自然消失）；网关列表各只显示本协议网关——aTrust 侧严格按 `protocol == "atrust"` 过滤，V5VPN 侧按零值语义把无字段的老网关归入自己。
+- **启动自动 + 界面内切换**：启动与根路径（含旧书签 `/index.html`）按 setting.xml 里 `lastUseGateway` 的协议进入对应界面，无记录或网关已删除时兜底 V5VPN；界面顶部提供「切换到另一协议」整页跳转，连接状态由后端保持。aTrust 登录现在会把最近使用的网关写回 `lastUseGateway`（此前只有 V5VPN 会写，aTrust 用户重启后总是落回 V5VPN 界面）。
+- 测试与 mock 网关一并收进仓库：`test/mock/atrust`（零信任网关，保持原有协议字节不变）、`test/mock/v5vpn`（网御网关，库形态便于进程内起停）。
+- 新增协议级集成测试：`internal/atrust/e2e_mock_test.go` 自行构建并拉起 mock 子进程、随机端口，覆盖 authConfig → psw → authCheck → onlineInfo 全链路与资源解析，CI 无需手工起服务。
+- 新增 UI 端到端测试 `test/e2e_ui_test.js`（puppeteer-core + 本机 Edge）：自动构建客户端与 mock、隔离 `APPDATA` 避免污染真实配置，逐步截图并输出 HTML 报告；按场景分别驱动 `/atrust/` 与 `/v5vpn/` 两套界面，覆盖界面切换链接、网关协议过滤与两套界面的差异分支。
+- 新增统一入口 `test/run.sh`（`go` / `ui` / `all` / `all-light`）。
 - 移除 Windows 系统证书库（CryptoAPI/CNG）登录与枚举功能，证书登录仅支持本地 `.p12/.pfx` 文件导入，不再访问需要系统授权的证书库，代码更精简；`-cert-type 1` 不再可用，历史保存为系统证书的网关配置会在下次证书登录时自动回落到文件证书。
 
 ## 0.3.0

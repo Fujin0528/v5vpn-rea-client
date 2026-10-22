@@ -205,8 +205,9 @@ go tool mygo build -platform windows/amd64,linux/amd64,darwin/arm64 -upload
 ### 8.1 发版流程
 
 日常开发 merge 到 `master` **不会**产生 Release：`.github/workflows/release.yml`
-只在推送 `v*` tag 时触发。正式发版需要同步四处版本号（`mygo.json`、
-`internal/cmd/main.go`、`internal/cmd/ui/index.html`、`CHANGELOG.md`），
+只在推送 `v*` tag 时触发。正式发版需要同步版本号（`mygo.json`、
+`internal/cmd/main.go`、两套界面 `internal/cmd/ui/{v5vpn,atrust}/index.html`、
+`CHANGELOG.md`），
 提交后推送 tag：
 
 ```bash
