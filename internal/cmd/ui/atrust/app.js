@@ -1,13 +1,23 @@
-// V5VPN Client Frontend Controller
+// aTrust Client Frontend Controller
+//
+// 这套界面只服务 aTrust 后端（/api/atrust/*）。V5VPN 有一套独立的
+// /v5vpn/，两边不共享 api 层、不共享页面结构，也不在运行时不按协议
+// 隐藏控件——aTrust 没有的能力这里根本没有对应的 DOM。
 (function() {
   // Application State
   let config = null;
   let currentGateway = null;
   let isConnected = false;
   let logPollTimer = null;
-  let authMode = 'password';       // 'password' | 'cert'
-  let selectedCertId = '';
-  let certs = [];
+
+  // ==================== 协议过滤 ====================
+  //
+  // 只认 protocol === 'atrust' 的网关。与后端相反：后端把空串当作
+  // V5VPN，所以这里绝不能"非 atrust 即本协议"，否则老配置里的
+  // V5VPN 网关会出现在 aTrust 界面并打到 aTrust 端点（后端会 409）。
+  function isATrustGateway(gw) {
+    return !!(gw && gw.protocol === 'atrust');
+  }
 
   // DOM Elements - Views
   const viewLogin = document.getElementById('view-login');
@@ -19,44 +29,17 @@
   const gatewaySelect = document.getElementById('gateway-select');
   const openSettingsBtn = document.getElementById('open-settings-btn');
   const gwIpPort = document.getElementById('gw-ip-port');
-  const gwAlgoTag = document.getElementById('gw-algo-tag');
   const usernameInput = document.getElementById('username-input');
   const passwordInput = document.getElementById('password-input');
   const togglePwdBtn = document.getElementById('toggle-pwd-btn');
-  const verifycodeGroup = document.getElementById('verifycode-group');
-  const verifycodeInput = document.getElementById('verifycode-input');
   const rememberPwdCheckbox = document.getElementById('remember-pwd-checkbox');
   const autoLoginCheckbox = document.getElementById('auto-login-checkbox');
   const connectBtn = document.getElementById('connect-btn');
   const connectBtnText = document.getElementById('connect-btn-text');
   const connectSpinner = connectBtn.querySelector('.btn-spinner');
-  const passwordChangePanel = document.getElementById('password-change-panel');
-  const passwordChangeHint = document.querySelector('.password-change-hint');
-  const voluntaryChangePwdLink = document.getElementById('voluntary-change-pwd-link');
-  const newPasswordInput = document.getElementById('new-password-input');
-  const confirmPasswordInput = document.getElementById('confirm-password-input');
-  const changePasswordBtn = document.getElementById('change-password-btn');
-  const cancelChangePasswordBtn = document.getElementById('cancel-change-password-btn');
-
-  // DOM Elements - Authentication Tabs and Certificate Panel
-  const passwordPanel = document.getElementById('password-panel');
-  const certPanel = document.getElementById('cert-panel');
-  const authTabs = Array.from(document.querySelectorAll('.auth-tab'));
-  const certList = document.getElementById('cert-list');
-  const certRefreshBtn = document.getElementById('cert-refresh-btn');
-  const importCertBtn = document.getElementById('import-cert-btn');
-  const importCertPanel = document.getElementById('import-cert-panel');
-  const importCertPath = document.getElementById('import-cert-path');
-  const importCertAlias = document.getElementById('import-cert-alias');
-  const importCertPwd = document.getElementById('import-cert-pwd');
-  const importCertConfirmBtn = document.getElementById('import-cert-confirm-btn');
-  const importCertCancelBtn = document.getElementById('import-cert-cancel-btn');
-  const browseCertBtn = document.getElementById('browse-cert-btn');
-  const certAutoLoginCheckbox = document.getElementById('cert-auto-login-checkbox');
 
   // DOM Elements - Connected View
   const connectedGwName = document.getElementById('connected-gw-name');
-  const connectedChangePwdBtn = document.getElementById('connected-change-pwd-btn');
   const sessionUserVal = document.getElementById('session-user-val');
   const sessionIpVal = document.getElementById('session-ip-val');
   const sessionIdVal = document.getElementById('session-id-val');
@@ -80,7 +63,12 @@
   const gatewaysTbody = document.getElementById('gateways-tbody');
   const addGwBtn = document.getElementById('add-gw-btn');
 
-  // Backend Bridge API (HTTP API or IPC)
+  // Backend Bridge API
+  //
+  // 只打 aTrust 的端点。注意几个「共用」端点是有意为之：
+  //   /api/config、/api/gateways  —— 网关表只有一份（setting.xml）
+  //   /api/logs                   —— 日志宿主是两个后端共用的 VPNService
+  //   /api/window-size、/api/open-url、/api/check-updates —— 与协议无关
   const api = {
     async getConfig() {
       if (window.VPNService && window.VPNService.getConfig) {
@@ -89,21 +77,24 @@
       const res = await fetch('/api/config');
       return await res.json();
     },
-    async login(gwId, username, password, verifycode, remember, auto) {
+    // aTrust 的认证链是四个往返（authConfig → psw → authCheck → onlineInfo），
+    // 冷启动网关上前两个就可能各花几秒，所以超时上限比 V5VPN 宽得多。
+    // 资源拉取是异步的，不在这条链上。
+    async login(gwId, username, password, remember, auto) {
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 12000); // 12s timeout safeguard
+      const timeoutId = setTimeout(() => controller.abort(), 40000);
 
       try {
-        const res = await fetch('/api/login', {
+        const res = await fetch('/api/atrust/login', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ gwId, username, password, verifycode, remember, auto }),
+          body: JSON.stringify({ gwId, username, password, remember, auto }),
           signal: controller.signal
         });
         clearTimeout(timeoutId);
         const data = await res.json();
         if (!res.ok) {
-          const error = new Error(data.error || '登录失败');
+          const error = new Error(data.error || 'aTrust 登录失败');
           error.code = data.code || '';
           throw error;
         }
@@ -111,23 +102,23 @@
       } catch (err) {
         clearTimeout(timeoutId);
         if (err.name === 'AbortError') {
-          throw new Error('网关响应超时(12s)，请检查网络与网关端口连通性');
+          throw new Error('aTrust 网关响应超时(40s)，请检查网络与网关地址');
         }
         throw err;
       }
     },
     async logout() {
-      if (window.VPNService && window.VPNService.logout) {
-        return await window.VPNService.logout();
+      if (window.ATrustService && window.ATrustService.logout) {
+        return await window.ATrustService.logout();
       }
-      const res = await fetch('/api/logout', { method: 'POST' });
+      const res = await fetch('/api/atrust/logout', { method: 'POST' });
       return await res.json();
     },
     async getStatus() {
-      if (window.VPNService && window.VPNService.getStatus) {
-        return await window.VPNService.getStatus();
+      if (window.ATrustService && window.ATrustService.getStatus) {
+        return await window.ATrustService.getStatus();
       }
-      const res = await fetch('/api/status');
+      const res = await fetch('/api/atrust/status');
       return await res.json();
     },
     async getLogs() {
@@ -184,32 +175,6 @@
         });
       } catch (_) {}
     },
-    async changePassword(gwId, username, password, newPassword, verifycode, remember, auto) {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 20000);
-      try {
-        const res = await fetch('/api/change-password', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ gwId, username, password, newPassword, verifycode, remember, auto }),
-          signal: controller.signal
-        });
-        clearTimeout(timeoutId);
-        const data = await res.json();
-        if (!res.ok) {
-          const error = new Error(data.error || '修改密码失败');
-          error.code = data.code || '';
-          throw error;
-        }
-        return data;
-      } catch (err) {
-        clearTimeout(timeoutId);
-        if (err.name === 'AbortError') {
-          throw new Error('网关响应超时(20s)，请检查网络与网关端口连通性');
-        }
-        throw err;
-      }
-    },
     async checkUpdates() {
       if (window.VPNService && window.VPNService.checkForUpdates) {
         return await window.VPNService.checkForUpdates();
@@ -217,77 +182,12 @@
       const res = await fetch('/api/check-updates', { method: 'POST' });
       return await res.json();
     },
+    // 资源刷新走 aTrust 自己的端点：两个后端的资源树形状不同。
     async refreshResources() {
-      if (window.VPNService && window.VPNService.refreshResources) {
-        return await window.VPNService.refreshResources();
-      }
-      const res = await fetch('/api/resources/refresh', { method: 'POST' });
+      const res = await fetch('/api/atrust/resources/refresh', { method: 'POST' });
       const data = await res.json();
-      if (!res.ok) throw new Error(data.error || '重新拉取资源失败');
+      if (!res.ok) throw new Error(data.error || '重新拉取应用列表失败');
       return data;
-    },
-    async listCerts(source) {
-      if (window.VPNService && window.VPNService.listCertificates) {
-        return await window.VPNService.listCertificates(source);
-      }
-      const res = await fetch(`/api/certs?source=${encodeURIComponent(source)}`);
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || '读取证书列表失败');
-      return data;
-    },
-    async importCert(path, alias, password) {
-      if (window.VPNService && window.VPNService.importCertificate) {
-        return await window.VPNService.importCertificate(path, alias, password);
-      }
-      const res = await fetch('/api/certs/import', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ path, alias, password })
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || '导入证书失败');
-      return data;
-    },
-    async deleteCert(id) {
-      if (window.VPNService && window.VPNService.deleteCertificate) {
-        return await window.VPNService.deleteCertificate(id);
-      }
-      const res = await fetch(`/api/certs/${encodeURIComponent(id)}`, { method: 'DELETE' });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || '删除证书失败');
-      return data;
-    },
-    async pickCertFile() {
-      const res = await fetch('/api/cert/pick', { method: 'POST' });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || '无法打开文件选择对话框');
-      return data.path || '';
-    },
-    async loginWithCert(gwId, source, certId, verifycode, auto) {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 20000);
-      try {
-        const res = await fetch('/api/login-cert', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ gwId, source, certId, verifycode, auto }),
-          signal: controller.signal
-        });
-        clearTimeout(timeoutId);
-        const data = await res.json();
-        if (!res.ok) {
-          const error = new Error(data.error || '证书登录失败');
-          error.code = data.code || '';
-          throw error;
-        }
-        return data;
-      } catch (err) {
-        clearTimeout(timeoutId);
-        if (err.name === 'AbortError') {
-          throw new Error('网关响应超时(20s)，请检查网络与网关端口连通性');
-        }
-        throw err;
-      }
     }
   };
 
@@ -383,16 +283,19 @@
   });
 
   // Gateway Selection & Population
+  //
+  // 只填充 aTrust 网关：V5VPN 网关在这一套界面里不出现，也选不中。
   function populateGateways(gateways, lastUsed) {
     gatewaySelect.innerHTML = '';
-    if (!gateways || gateways.length === 0) {
-      gatewaySelect.innerHTML = '<option value="">(暂无网关配置，请在设置中添加)</option>';
+    const own = (gateways || []).filter(isATrustGateway);
+    if (own.length === 0) {
+      gatewaySelect.innerHTML = '<option value="">(暂无 aTrust 网关配置，请在设置中添加)</option>';
       gwIpPort.textContent = '--';
-      gwAlgoTag.textContent = '--';
+      currentGateway = null;
       return;
     }
 
-    gateways.forEach(gw => {
+    own.forEach(gw => {
       const opt = document.createElement('option');
       opt.value = gw.id || gw.name;
       opt.textContent = `${gw.name} (${gw.ip}:${gw.port})`;
@@ -406,17 +309,16 @@
   }
 
   function onGatewayChanged() {
-    if (passwordChangePanel) hidePasswordChangePanel();
     const selectedVal = gatewaySelect.value;
     if (!config || !config.gateways) return;
-    currentGateway = config.gateways.find(g => (g.id === selectedVal || g.name === selectedVal));
-    if (!currentGateway && config.gateways.length > 0) {
-      currentGateway = config.gateways[0];
+    const own = config.gateways.filter(isATrustGateway);
+    currentGateway = own.find(g => (g.id === selectedVal || g.name === selectedVal));
+    if (!currentGateway && own.length > 0) {
+      currentGateway = own[0];
     }
 
     if (currentGateway) {
       gwIpPort.textContent = `${currentGateway.ip}:${currentGateway.port}`;
-      gwAlgoTag.textContent = currentGateway.algo === 1 ? '国密 GM/SM' : '国际标准 TLS';
 
       // Auto-fill remembered accounts
       if (currentGateway.savedAccounts && currentGateway.savedAccounts.length > 0) {
@@ -430,8 +332,6 @@
         usernameInput.value = '';
         passwordInput.value = '';
       }
-
-      restoreAuthPreferences();
     }
   }
 
@@ -449,16 +349,19 @@
   }
 
   // Render Gateways Table in Settings Modal
+  //
+  // 无「加密模式」列：aTrust 的 TLS 参数固定，这个字段对它没有意义。
   function renderGatewayManagerTable() {
     if (!config || !config.gateways) return;
     gatewaysTbody.innerHTML = '';
-    if (config.gateways.length === 0) {
+    const own = config.gateways.filter(isATrustGateway);
+    if (own.length === 0) {
       const tr = document.createElement('tr');
-      tr.innerHTML = `<td colspan="5" class="empty-state" style="padding:24px; text-align:center; color:var(--text-dim);">暂无网关配置，请在下方添加</td>`;
+      tr.innerHTML = `<td colspan="5" class="empty-state" style="padding:24px; text-align:center; color:var(--text-dim);">暂无 aTrust 网关配置，请在下方添加</td>`;
       gatewaysTbody.appendChild(tr);
       return;
     }
-    config.gateways.forEach(gw => {
+    own.forEach(gw => {
       const tr = document.createElement('tr');
       const users = (gw.savedAccounts || []).map(a => a.username).join(', ') || '-';
       const isSelected = currentGateway && (currentGateway.id === gw.id || currentGateway.name === gw.name);
@@ -474,12 +377,12 @@
         <td class="gw-ip-cell" title="${escapeHtml(gw.ip)}:${gw.port}">
           <code class="gw-code">${escapeHtml(gw.ip)}:${gw.port}</code>
         </td>
-        <td><span class="algo-pill ${gw.algo === 1 ? 'algo-gm' : 'algo-tls'}">${gw.algo === 1 ? '国密 GM' : '国际标准'}</span></td>
+        <td><span class="algo-pill proto-atrust">aTrust</span></td>
         <td class="gw-users-cell" title="${escapeHtml(users)}">${escapeHtml(users)}</td>
         <td>
           <div class="action-btn-cell">
-            ${isSelected 
-              ? '<span class="badge-current-gw">✓ 当前选中</span>' 
+            ${isSelected
+              ? '<span class="badge-current-gw">✓ 当前选中</span>'
               : `<button class="btn btn-select btn-sm select-gw-btn" data-id="${gw.id || gw.name}">切换</button>`}
             <button class="btn btn-delete btn-sm delete-gw-btn" data-id="${gw.id || gw.name}" title="删除此网关配置">删除</button>
           </div>
@@ -511,11 +414,13 @@
   }
 
   // Add Gateway
+  //
+  // 只加 aTrust 网关：协议由所在界面决定，表单里没有协议下拉，
+  // 也没有加密算法——aTrust 的数据面固定走 TLS:441，与本表单无关。
   addGwBtn.addEventListener('click', async () => {
     const name = document.getElementById('new-gw-name').value.trim();
     const ip = document.getElementById('new-gw-ip').value.trim();
     const port = parseInt(document.getElementById('new-gw-port').value, 10) || 443;
-    const algo = parseInt(document.getElementById('new-gw-algo').value, 10) || 0;
 
     if (!name || !ip) {
       alert('请填写网关名称和 IP 地址');
@@ -526,7 +431,7 @@
       return;
     }
 
-    await api.saveGateway({ name, ip, port, algo });
+    await api.saveGateway({ name, ip, port, protocol: 'atrust' });
     document.getElementById('new-gw-name').value = '';
     document.getElementById('new-gw-ip').value = '';
     await reloadGatewaysData();
@@ -534,14 +439,9 @@
 
   // Login Form Submission
   async function handleLogin() {
-    if (authMode === 'cert') {
-      await handleCertLogin();
-      return;
-    }
     const gwId = gatewaySelect.value;
     const username = usernameInput.value.trim();
     const password = passwordInput.value;
-    const verifycode = verifycodeInput.value.trim();
     const remember = rememberPwdCheckbox.checked;
     const auto = autoLoginCheckbox.checked;
 
@@ -554,360 +454,35 @@
     setConnectingState(true);
 
     try {
-      const res = await api.login(gwId, username, password, verifycode, remember, auto);
-      showConnectedView(res);
-    } catch (err) {
-      const msg = friendlyLoginError(err);
-      if (isPasswordExpired(err)) {
-        showPasswordChangePanel();
-      }
-      showLoginAlert(msg, 'error');
-      setConnectingState(false);
-    }
-  }
-
-  function isPasswordExpired(err) {
-    // Only the backend's 0x100 challenge may open the change-password panel.
-    return !!(err && err.code === 'password_expired');
-  }
-
-  function friendlyLoginError(err) {
-    if (isPasswordExpired(err)) {
-      return '网关提示：账号口令已过期，请在下方设置新密码。';
-    }
-    if (err && err.code === 'bad_credentials') {
-      return '网关提示：用户名或密码错误，请检查输入的账号或密码！';
-    }
-    if (err && err.code) {
-      const certMsg = friendlyCertError(err.code);
-      if (certMsg) return certMsg;
-    }
-    return (err && err.message) || '未知错误';
-  }
-
-  // friendlyCertError maps the backend's stable certificate codes to text.
-  function friendlyCertError(code) {
-    switch (code) {
-      case 'cert_invalid':
-        return '网关提示：证书验证失败，请重新选择证书或确认网关已信任该证书。';
-      case 'cert_unavailable':
-        return '网关提示：该用户或网关未启用证书认证方式。';
-      case 'cert_expired':
-        return '网关提示：证书已过期，请更换证书或联系管理员续期。';
-      case 'cert_revoked':
-        return '网关提示：证书已被注销，请重新选择证书进行认证。';
-      case 'cert_signature':
-        return '网关提示：证书签名错误，请重新选择证书进行认证。';
-      default:
-        return '';
-    }
-  }
-
-  function showPasswordChangePanel(isVoluntary = false) {
-    if (passwordChangeHint) {
-      if (isVoluntary) {
-        passwordChangeHint.textContent = '您已确认修改密码，请在下方设置新密码。修改成功后将自动使用新密码连接。';
-      } else {
-        passwordChangeHint.textContent = '网关要求先修改已过期的登录密码。修改成功后会用新密码继续连接。';
-      }
-    }
-    passwordChangePanel.style.display = 'block';
-    connectBtn.style.display = 'none';
-    newPasswordInput.focus();
-  }
-
-  function hidePasswordChangePanel() {
-    passwordChangePanel.style.display = 'none';
-    connectBtn.style.display = '';
-    newPasswordInput.value = '';
-    confirmPasswordInput.value = '';
-  }
-
-  async function handleChangePassword() {
-    const gwId = gatewaySelect.value;
-    const username = usernameInput.value.trim();
-    const password = passwordInput.value;
-    const newPassword = newPasswordInput.value;
-    const verifycode = verifycodeInput.value.trim();
-    const remember = rememberPwdCheckbox.checked;
-    const auto = autoLoginCheckbox.checked;
-
-    if (!gwId || !username || !password) {
-      showLoginAlert('请输入网关、用户名和当前登录密码', 'error');
-      return;
-    }
-    if (!newPassword) {
-      showLoginAlert('请输入新密码', 'error');
-      return;
-    }
-    if (newPassword !== confirmPasswordInput.value) {
-      showLoginAlert('两次输入的新密码不一致', 'error');
-      return;
-    }
-    if (newPassword === password) {
-      showLoginAlert('新密码不能与当前密码相同', 'error');
-      return;
-    }
-
-    hideLoginAlert();
-    changePasswordBtn.disabled = true;
-    changePasswordBtn.textContent = '正在修改密码...';
-    try {
-      const res = await api.changePassword(gwId, username, password, newPassword, verifycode, remember, auto);
-      passwordInput.value = newPassword;
-      hidePasswordChangePanel();
-      showConnectedView(res);
-    } catch (err) {
-      showLoginAlert(err.message || '修改密码失败', 'error');
-    } finally {
-      changePasswordBtn.disabled = false;
-      changePasswordBtn.textContent = '修改密码并连接';
-    }
-  }
-
-  // ==================== 证书登录 ====================
-  function setAuthMode(mode) {
-    authMode = mode === 'cert' ? 'cert' : 'password';
-    authTabs.forEach(tab => {
-      const active = tab.dataset.mode === authMode;
-      tab.classList.toggle('is-active', active);
-      tab.setAttribute('aria-selected', active ? 'true' : 'false');
-    });
-    passwordPanel.style.display = authMode === 'password' ? '' : 'none';
-    certPanel.style.display = authMode === 'cert' ? '' : 'none';
-    hidePasswordChangePanel();
-    hideLoginAlert();
-    updateConnectButtonLabel();
-    if (authMode === 'cert') {
-      loadCertificates();
-    }
-  }
-
-  function updateConnectButtonLabel() {
-    if (connectBtn.disabled) return;
-    connectBtnText.textContent = authMode === 'cert' ? '证书安全连接' : '立即连接';
-  }
-
-  authTabs.forEach(tab => {
-    tab.addEventListener('click', () => setAuthMode(tab.dataset.mode));
-  });
-
-  async function loadCertificates() {
-    certList.innerHTML = '<p class="cert-empty">正在检测证书...</p>';
-    try {
-      const list = await api.listCerts(0);
-      certs = Array.isArray(list) ? list : [];
-    } catch (err) {
-      certs = [];
-      certList.innerHTML = `<p class="cert-empty">${escapeHtml(err.message || '读取证书列表失败')}</p>`;
-      return;
-    }
-
-    if (certs.length === 0) {
-      certList.innerHTML = '<p class="cert-empty">未找到已导入的证书。点击「导入证书」添加 .p12/.pfx 文件。</p>';
-      return;
-    }
-
-    // Keep the selection stable across refreshes, else preselect the first.
-    if (!certs.some(c => c.id === selectedCertId)) {
-      selectedCertId = certs[0].id;
-    }
-
-    certList.innerHTML = '';
-    certs.forEach(cert => {
-      const item = document.createElement('div');
-      item.className = 'cert-item' + (cert.isExpired ? ' cert-item-expired' : '') +
-        (cert.id === selectedCertId ? ' is-selected' : '');
-      item.dataset.id = cert.id;
-
-      const radio = document.createElement('input');
-      radio.type = 'radio';
-      radio.name = 'cert-choice';
-      radio.checked = cert.id === selectedCertId;
-      radio.addEventListener('change', () => {
-        selectedCertId = cert.id;
-        certList.querySelectorAll('.cert-item').forEach(el => {
-          el.classList.toggle('is-selected', el.dataset.id === cert.id);
-        });
-      });
-      item.appendChild(radio);
-
-      const main = document.createElement('div');
-      main.className = 'cert-main';
-      main.innerHTML =
-        `<div class="cert-name">${escapeHtml(cert.name || cert.id)}` +
-        (cert.isExpired ? '<span class="cert-badge-expired">已过期</span>' : '') +
-        `</div>` +
-        `<div class="cert-meta">颁发者：${escapeHtml(cert.issuer || '-')}</div>` +
-        `<div class="cert-meta">有效期：${escapeHtml(cert.validFrom || '-')} 到 ${escapeHtml(cert.validTo || '-')}</div>`;
-      item.appendChild(main);
-
-      if (cert.source === 0) {
-        const del = document.createElement('button');
-        del.type = 'button';
-        del.className = 'cert-delete-btn';
-        del.textContent = '删除';
-        del.addEventListener('click', async (e) => {
-          e.stopPropagation();
-          if (!confirm(`确定删除证书「${cert.name || cert.id}」吗？`)) return;
-          try {
-            await api.deleteCert(cert.id);
-            showLoginAlert('证书已删除', 'info');
-          } catch (err) {
-            showLoginAlert(err.message || '删除证书失败', 'error');
-          }
-          await loadCertificates();
-        });
-        item.appendChild(del);
-      }
-
-      item.addEventListener('click', () => {
-        radio.checked = true;
-        radio.dispatchEvent(new Event('change'));
-      });
-
-      certList.appendChild(item);
-    });
-  }
-
-  async function handleCertLogin() {
-    const gwId = gatewaySelect.value;
-    const verifycode = verifycodeInput.value.trim();
-    const auto = certAutoLoginCheckbox.checked;
-
-    if (!gwId) {
-      showLoginAlert('请选择网关节点', 'error');
-      return;
-    }
-    if (!selectedCertId) {
-      showLoginAlert('请先选择一张证书', 'error');
-      return;
-    }
-
-    hideLoginAlert();
-    setConnectingState(true);
-    try {
-      const res = await api.loginWithCert(gwId, 0, selectedCertId, verifycode, auto);
+      const res = await api.login(gwId, username, password, remember, auto);
       showConnectedView(res);
     } catch (err) {
       showLoginAlert(friendlyLoginError(err), 'error');
       setConnectingState(false);
-      if (err && (err.code === 'cert_expired' || err.code === 'cert_invalid' || err.code === 'cert_revoked')) {
-        loadCertificates();
-      }
     }
   }
 
-  certRefreshBtn.addEventListener('click', () => loadCertificates());
-
-  importCertBtn.addEventListener('click', () => {
-    const visible = importCertPanel.style.display !== 'none';
-    importCertPanel.style.display = visible ? 'none' : 'block';
-    certList.style.display = visible ? '' : 'none';
-  });
-
-  importCertCancelBtn.addEventListener('click', () => {
-    importCertPanel.style.display = 'none';
-    certList.style.display = '';
-    importCertPath.value = '';
-    importCertAlias.value = '';
-    importCertPwd.value = '';
-  });
-
-  browseCertBtn.addEventListener('click', async () => {
-    try {
-      const path = await api.pickCertFile();
-      if (path) {
-        importCertPath.value = path;
-      } else {
-        showLoginAlert('未选择证书文件', 'info');
-      }
-    } catch (err) {
-      showLoginAlert((err && err.message) || '无法打开文件选择对话框，请手动输入路径', 'error');
-    }
-  });
-
-  importCertConfirmBtn.addEventListener('click', async () => {
-    const path = importCertPath.value.trim();
-    if (!path) {
-      showLoginAlert('请选择证书文件', 'error');
-      return;
-    }
-    importCertConfirmBtn.disabled = true;
-    importCertConfirmBtn.textContent = '正在导入...';
-    try {
-      const info = await api.importCert(path, importCertAlias.value.trim(), importCertPwd.value);
-      importCertCancelBtn.click();
-      selectedCertId = info.id || '';
-      await loadCertificates();
-      showLoginAlert(`证书「${info.name || info.id}」导入成功`, 'info');
-    } catch (err) {
-      showLoginAlert((err && err.message) || '导入证书失败', 'error');
-    } finally {
-      importCertConfirmBtn.disabled = false;
-      importCertConfirmBtn.textContent = '导入';
-    }
-  });
-
-  // Restore the gateway's remembered authentication mode and certificate.
-  function restoreAuthPreferences() {
-    if (!currentGateway) {
-      setAuthMode('password');
-      return;
-    }
-    if (currentGateway.authType === 1) {
-      selectedCertId = currentGateway.selectedCertId || '';
-      certAutoLoginCheckbox.checked = currentGateway.certAutoLogin === true;
-      setAuthMode('cert');
-    } else {
-      setAuthMode('password');
+  // friendlyLoginError 只映射 aTrust 后端会给出的码。
+  //
+  // mfa_required 是 aTrust 独有的：网关要求二次认证，本版本没有实现
+  // 对应的交互，必须明确告诉用户而不是显示原始英文。
+  function friendlyLoginError(err) {
+    if (!err) return '未知错误';
+    switch (err.code) {
+      case 'mfa_required':
+        return '网关要求多因素认证（MFA），当前版本尚未支持，请联系管理员或使用官方客户端。';
+      case 'wrong_backend':
+        return '该网关不是 aTrust 网关，请到 V5VPN 界面登录。';
+      case 'not_atrust_gateway':
+        return '该网关不是 aTrust 网关，请到 V5VPN 界面登录。';
+      default:
+        return err.message || '未知错误';
     }
   }
 
   loginForm.addEventListener('submit', (e) => {
     e.preventDefault();
-    if (passwordChangePanel.style.display !== 'none') {
-      handleChangePassword();
-      return;
-    }
     handleLogin();
-  });
-  voluntaryChangePwdLink?.addEventListener('click', (e) => {
-    e.preventDefault();
-    const gwId = gatewaySelect.value;
-    const username = usernameInput.value.trim();
-    const password = passwordInput.value;
-    if (!gwId || !username || !password) {
-      showLoginAlert('请先选择网关并输入账号与当前密码', 'error');
-      return;
-    }
-    if (!confirm('当前密码有效（未过期），是否确认修改密码？')) {
-      return;
-    }
-    hideLoginAlert();
-    showPasswordChangePanel(true);
-  });
-
-  connectedChangePwdBtn?.addEventListener('click', async (e) => {
-    e.preventDefault();
-    if (!confirm('当前处于正常连接状态，是否确认修改密码？\n确认后将断开当前连接并进入修改密码界面。')) {
-      return;
-    }
-    try {
-      await api.logout();
-    } catch (_) {}
-    showLoginView();
-    showPasswordChangePanel(true);
-  });
-
-  changePasswordBtn.addEventListener('click', (e) => {
-    e.preventDefault();
-    handleChangePassword();
-  });
-
-  cancelChangePasswordBtn.addEventListener('click', () => {
-    hidePasswordChangePanel();
-    hideLoginAlert();
   });
 
   connectBtn.addEventListener('click', (e) => {
@@ -923,7 +498,7 @@
     } else {
       connectBtn.disabled = false;
       connectSpinner.style.display = 'none';
-      updateConnectButtonLabel();
+      connectBtnText.textContent = '立即连接';
     }
   }
 
@@ -952,10 +527,6 @@
       sessionIdVal.textContent = info.sessionId || '-';
       sessionIpVal.textContent = info.loginAddress || (currentGateway ? `${currentGateway.ip}:${currentGateway.port}` : '-');
       renderResources(info.resources || []);
-      // Certificate sessions have no password to change; hide the shortcut.
-      if (connectedChangePwdBtn) {
-        connectedChangePwdBtn.style.display = info.authType === 'certificate' ? 'none' : '';
-      }
       setResourceState(info.resourceState || 'ready', info.resourceError || '');
     }
     startResourcePolling();
@@ -976,21 +547,21 @@
       resourceErrorBanner.style.display = state === 'error' ? 'flex' : 'none';
     }
     if (resourceErrorText && state === 'error') {
-      resourceErrorText.textContent = message || '网关未在超时时间内返回资源列表。';
+      resourceErrorText.textContent = message || '网关未在超时时间内返回应用列表。';
     }
     if (state === 'loading') {
       resourcesTbody.innerHTML = `
         <tr>
           <td colspan="6" class="empty-state">
             <span class="mini-spinner" style="display:inline-block;vertical-align:middle;margin-right:8px;"></span>
-            正在从网关拉取受保护的内网资源，请稍候...
+            正在从网关拉取受保护的应用，请稍候...
           </td>
         </tr>
       `;
     } else if (state === 'error' && (!resourcesTbody.children.length || resCount.textContent === '0')) {
       resourcesTbody.innerHTML = `
         <tr>
-          <td colspan="6" class="empty-state">资源列表获取失败，VPN 已连接。请点击「重新拉取资源」重试。</td>
+          <td colspan="6" class="empty-state">应用列表获取失败，aTrust 会话仍有效。请点击「重新拉取应用」重试。</td>
         </tr>
       `;
     }
@@ -1084,10 +655,10 @@
       setResourceState('ready', '');
       renderResources((res && res.resources) || []);
     } catch (err) {
-      setResourceState('error', (err && err.message) || '重新拉取资源失败');
+      setResourceState('error', (err && err.message) || '重新拉取应用失败');
     } finally {
       refreshResourcesBtn.disabled = false;
-      refreshResourcesBtn.textContent = '🔄 重新拉取资源';
+      refreshResourcesBtn.textContent = '🔄 重新拉取应用';
     }
   });
 
@@ -1121,7 +692,7 @@
     if (!resources || resources.length === 0) {
       resourcesTbody.innerHTML = `
         <tr>
-          <td colspan="6" class="empty-state">VPN 隧道中未发现受保护的 TCP 映射资源。</td>
+          <td colspan="6" class="empty-state">零信任会话中未发现受保护的 TCP 映射应用。</td>
         </tr>
       `;
       return;

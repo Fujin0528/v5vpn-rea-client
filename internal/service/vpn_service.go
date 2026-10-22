@@ -229,6 +229,25 @@ func (s *VPNService) GetGateways() []config.GatewayProfile {
 	return s.Config.Snapshot().Gateways
 }
 
+// SetLastUseGateway records which gateway was used most recently.
+//
+// aTrust 后端通过 ATrustHost 接口调用它：两边共用 setting.xml 里同一个
+// LastUseGateway 字段，cmd 侧按它决定启动时先打开哪套界面
+// （见 cmd.initialUIPath）。与 V5VPN 的 Login 路径一致，写入后立即
+// 持久化，失败返回给调用方记日志。
+func (s *VPNService) SetLastUseGateway(name string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.Config == nil {
+		return fmt.Errorf("配置尚未加载")
+	}
+	if s.Config.LastUseGateway == name {
+		return nil
+	}
+	s.Config.LastUseGateway = name
+	return s.Config.SaveSettingXML("")
+}
+
 // SaveGateway adds or updates a gateway profile.
 //
 // When an existing profile matches by ID or name, only the fields the caller
@@ -948,6 +967,12 @@ func (s *VPNService) GetStatus() map[string]any {
 }
 
 // GetLogs returns all logged messages
+// UserDataDir 返回 setting.xml 所在的每用户目录（未设置时为空）。
+//
+// 由 ATrustHost 接口使用：aTrust 后端要在同一目录下存设备标识文件。
+// 这里只是把 config 包级的取值转出去，不引入额外状态。
+func (s *VPNService) UserDataDir() string { return config.UserDataDir() }
+
 func (s *VPNService) GetLogs() []string {
 	s.logMu.Lock()
 	defer s.logMu.Unlock()

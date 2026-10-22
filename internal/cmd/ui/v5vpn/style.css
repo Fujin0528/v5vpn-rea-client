@@ -458,6 +458,33 @@ button.github-link {
   opacity: 0.5;
 }
 
+.proto-switch {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 14px;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.03);
+  font-size: 0.78rem;
+}
+
+.proto-switch-current {
+  color: var(--text-dim);
+}
+
+.proto-switch-link {
+  color: #38bdf8;
+  text-decoration: none;
+  font-weight: 600;
+}
+
+.proto-switch-link:hover {
+  text-decoration: underline;
+}
+
 /* ==================== 2. 登录后视图 (工作台) ==================== */
 .view-connected {
   display: flex;
@@ -878,9 +905,18 @@ button.github-link {
 
 .modal-table .data-table th:nth-child(1) { width: 22%; } /* 网关名称 */
 .modal-table .data-table th:nth-child(2) { width: 24%; } /* IP与端口 */
-.modal-table .data-table th:nth-child(3) { width: 15%; } /* 加密模式 */
+.modal-table .data-table th:nth-child(3) { width: 20%; } /* 协议 / 加密模式 */
 .modal-table .data-table th:nth-child(4) { width: 17%; } /* 已存账号 */
-.modal-table .data-table th:nth-child(5) { width: 22%; } /* 操作 */
+.modal-table .data-table th:nth-child(5) { width: 17%; } /* 操作 */
+
+/* 协议徽章与加密模式徽章并排放在一格里：两枚徽章都很窄，
+   分列会浪费一整列宽度。 */
+.gw-proto-cell {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
 
 .gw-row {
   transition: background-color 0.15s ease;
@@ -1023,6 +1059,14 @@ button.github-link {
   border: 1px solid rgba(168, 85, 247, 0.25);
 }
 
+/* 协议徽章。与加密模式徽章视觉同级但颜色不同：
+   前者说的是"由哪个后端登录"，后者说的是"用什么算法"，两者正交。 */
+.algo-pill.proto-v5vpn {
+  background: rgba(148, 163, 184, 0.12);
+  color: #cbd5e1;
+  border: 1px solid rgba(148, 163, 184, 0.28);
+}
+
 .add-gw-card {
   background: #111a2f;
   border: 1px solid rgba(255, 255, 255, 0.08);
@@ -1039,7 +1083,8 @@ button.github-link {
 
 .gw-inputs-grid {
   display: grid;
-  grid-template-columns: 1.4fr 1.6fr 0.8fr 1.2fr auto;
+  /* 名称 / IP / 端口 / 算法 / 添加按钮 —— 协议由所在界面决定，不再是表单项 */
+  grid-template-columns: 1.4fr 1.6fr 0.8fr 1.1fr auto;
   gap: 12px;
   align-items: center;
 }

@@ -22,17 +22,20 @@ on:
 
 ## 2. 发版前的版本号同步
 
-版本号在仓库中有 **4 处**，必须保持一致：
+版本号在仓库中有 **5 处**（界面按协议分成两套，各有一份 index.html），必须保持一致：
 
 | 文件 | 位置 | 说明 |
 |:---|:---|:---|
 | `mygo.json` | `"version": "0.2.1"` | 不带 `v`；workflow 用它校验 tag |
 | `internal/cmd/main.go` | `var AppVersion = "v0.2.1"` | 带 `v`；运行时版本与更新检查基准 |
-| `internal/cmd/ui/index.html` | 4 处 `version-badge` / `app-version-text` | 界面显示的版本徽标 |
+| `internal/cmd/ui/v5vpn/index.html` | 4 处 `version-badge` / `app-version-text` | V5VPN 界面显示的版本徽标 |
+| `internal/cmd/ui/atrust/index.html` | 4 处 `version-badge` / `app-version-text` | aTrust 界面显示的版本徽标 |
 | `CHANGELOG.md` | `## 0.2.1` 标题 | 发布说明来源 |
 
-`internal/cmd/version_test.go` 的 `TestAppVersionMatchesMygoJSON` 会校验前两者，
-漂移时 CI 失败。
+`internal/cmd/version_test.go` 会替 CI 校验这些副本：
+`TestAppVersionMatchesMygoJSON` 比较 mygo.json 与 main.go，
+`TestUIVersionBadgesMatchAppVersion` 检查两套 index.html 的全部版本徽标，
+任何一处漂移都会让 CI 失败。
 
 > `AppVersion` 与网关协议版本 `"2.0"` 无关，不要混用。
 
@@ -66,10 +69,11 @@ git checkout master
 git pull
 git status
 
-# 2) 版本号同步（见第 2 节）：mygo.json / main.go / index.html
+# 2) 版本号同步（见第 2 节）：mygo.json / main.go / 两套 index.html
 #    CHANGELOG.md 的 ## Unreleased 改为 ## <版本号>
 #    提交
-git add mygo.json internal/cmd/main.go internal/cmd/ui/index.html CHANGELOG.md
+git add mygo.json internal/cmd/main.go CHANGELOG.md \
+        internal/cmd/ui/v5vpn/index.html internal/cmd/ui/atrust/index.html
 git commit -m "chore(release): bump to v0.2.1"
 git push origin master
 

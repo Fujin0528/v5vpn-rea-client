@@ -45,7 +45,12 @@ type GatewayXML struct {
 	IP      string   `xml:"Ip,attr"`
 	Port    int      `xml:"Port,attr"`
 	Algo    int      `xml:"algo,attr"` // 0: Standard, 1: GM/国密
-	User    UserList `xml:"USER"`
+	// Protocol selects the backend for this gateway. Omitted when empty so
+	// the file stays readable by the original V5VPN client, which has no
+	// such attribute; and an absent attribute means V5VPN on read-back,
+	// which is exactly the zero-value semantics GatewayProfile relies on.
+	Protocol string   `xml:"protocol,attr,omitempty"`
+	User     UserList `xml:"USER"`
 }
 
 type UserList struct {
@@ -89,6 +94,41 @@ type GatewayProfile struct {
 	CertAutoLogin  bool          `json:"certAutoLogin"` // remember the certificate login
 	SelectedCertID string        `json:"selectedCertId"`
 	SavedAccounts  []UserAccount `json:"savedAccounts"`
+
+	// Protocol selects which backend serves this gateway.
+	//
+	// Empty means V5VPN. That zero value is deliberate: existing
+	// setting.xml files have no such field, so they deserialize to ""
+	// and keep working without any migration. Only an explicit "atrust"
+	// routes the gateway to the aTrust backend.
+	//
+	// Protocol is a property of the *gateway*, not a global switch —
+	// that is what lets both backends coexist in one install without
+	// V5VPN's path being touched (see ATRUST_PROTOCOL_ANALYSIS.md §14.5).
+	Protocol string `json:"protocol,omitempty"`
+}
+
+// Gateway protocol values. Empty string is V5VPN by convention, not by
+// constant, so that untouched config files keep working.
+const (
+	ProtocolV5VPN  = "v5vpn"
+	ProtocolATrust = "atrust"
+)
+
+// EffectiveProtocol returns the protocol to use for this gateway,
+// normalizing the empty string to ProtocolV5VPN.
+func (g GatewayProfile) EffectiveProtocol() string {
+	switch g.Protocol {
+	case ProtocolATrust:
+		return ProtocolATrust
+	default:
+		return ProtocolV5VPN
+	}
+}
+
+// IsATrust reports whether this gateway is served by the aTrust backend.
+func (g GatewayProfile) IsATrust() bool {
+	return g.EffectiveProtocol() == ProtocolATrust
 }
 
 // AppConfig represents application settings used by the client
@@ -211,6 +251,7 @@ func LoadSettingXML(path string) (*AppConfig, error) {
 			IP:             gw.IP,
 			Port:           gw.Port,
 			Algo:           gw.Algo,
+			Protocol:       gw.Protocol,
 			LastUserName:   gw.User.LastUserName,
 			AuthType:       gw.User.AuthType,
 			CertType:       gw.User.CertType,
@@ -273,11 +314,12 @@ func (cfg *AppConfig) saveToPath(targetPath string) error {
 	for i, gw := range cfg.Gateways {
 		gwTag := fmt.Sprintf("Gateway%d", i)
 		gwXML := GatewayXML{
-			XMLName: xml.Name{Local: gwTag},
-			Name:    gw.Name,
-			IP:      gw.IP,
-			Port:    gw.Port,
-			Algo:    gw.Algo,
+			XMLName:  xml.Name{Local: gwTag},
+			Name:     gw.Name,
+			IP:       gw.IP,
+			Port:     gw.Port,
+			Algo:     gw.Algo,
+			Protocol: gw.Protocol,
 			User: UserList{
 				LastUserName:  gw.LastUserName,
 				AuthType:      gw.AuthType,
