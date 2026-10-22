@@ -34,6 +34,20 @@ mygo-update.pub
 # Test binary
 *.test
 
+# Test harness output (UI E2E reports, screenshots, node deps)
+/test/results/
+/test/node_modules/
+/test/package-lock.json
+
+# Mock gateway runtime artifacts (generated on first run, never committed)
+# test/mock/atrust writes these into its -dir when started.
+/test/mock/atrust/mock_rsa.pem
+/test/mock/atrust/mock_tls_cert.pem
+/test/mock/atrust/mock_tls_key.pem
+/test/mock/atrust/requests.log
+/test/mock/atrust/run.log
+/test/mock/atrust/sessions.json
+
 # Output of the go coverage tool
 *.out
 

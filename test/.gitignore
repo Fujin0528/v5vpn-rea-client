@@ -1,0 +1,11 @@
+# Test execution output (reports, screenshots, logs)
+results/
+
+# Node dependencies
+node_modules/
+package-lock.json
+
+# Generated certificate fixtures
+*.p12
+*.pfx
+*.log

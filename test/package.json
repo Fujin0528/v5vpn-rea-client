@@ -1,0 +1,14 @@
+{
+  "name": "v5vpn-rea-e2e",
+  "version": "1.0.0",
+  "private": true,
+  "description": "End-to-end tests for v5vpn-rea: UI automation against the in-repo mock gateways",
+  "scripts": {
+    "test": "node e2e_ui_test.js",
+    "test:atrust": "node e2e_ui_test.js --scenario=atrust",
+    "test:v5vpn": "node e2e_ui_test.js --scenario=v5vpn"
+  },
+  "dependencies": {
+    "puppeteer-core": "^24.0.0"
+  }
+}
