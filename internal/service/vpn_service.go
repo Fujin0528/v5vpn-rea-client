@@ -476,12 +476,12 @@ func (s *VPNService) LoginWithPasswordAndCert(gwIdentifier, username, password, 
 // certificate file that lives outside the store (the CLI form). The file is
 // loaded in place and never copied; the two-factor choice is not persisted
 // because there is no store id to remember.
-func (s *VPNService) LoginWithPasswordAndCertExternal(gwIdentifier, username, password, certPath, certPassword string) (map[string]any, error) {
+func (s *VPNService) LoginWithPasswordAndCertExternal(gwIdentifier, username, password, certPath, certPassword, verifycode string) (map[string]any, error) {
 	cert, err := certstore.LoadTLSFile(certPath, certPassword)
 	if err != nil {
 		return nil, err
 	}
-	return s.loginWithPasswordCert(gwIdentifier, username, password, "", cert, nil, false, false)
+	return s.loginWithPasswordCert(gwIdentifier, username, password, verifycode, cert, nil, false, false)
 }
 
 // loginWithPasswordCert runs the shared two-factor login sequence. afterAuth,
@@ -526,7 +526,8 @@ func (s *VPNService) loginWithPasswordCert(gwIdentifier, username, password, ver
 		return nil, err
 	}
 
-	if _, err := client.AuthPasswordWithCert(cert, username, password, verifycode); err != nil {
+	authResp, err := client.AuthPasswordWithCert(cert, username, password, verifycode)
+	if err != nil {
 		if protocol.IsPasswordExpired(err) {
 			// Keep the certificate with the challenge — the re-login that
 			// follows the password change runs the same two-step flow and
@@ -539,10 +540,18 @@ func (s *VPNService) loginWithPasswordCert(gwIdentifier, username, password, ver
 		return nil, err
 	}
 
-	if afterAuth != nil {
-		afterAuth(gwID)
+	// The gateway decides whether the certificate factor was needed. When it
+	// accepted the password alone, recording the session as two-factor would
+	// force the two-factor tab on the next launch for a gateway that never
+	// asked for a certificate.
+	if authResp != nil && authResp.CertFactorUsed {
+		if afterAuth != nil {
+			afterAuth(gwID)
+		}
+		return s.enterConnected(client, username, cert, authTypePasswordCertificate), nil
 	}
-	return s.enterConnected(client, username, cert, authTypePasswordCertificate), nil
+	s.rememberPasswordMode(gwName)
+	return s.enterConnected(client, username, nil, authTypePassword), nil
 }
 
 // ResourceLoadState is exposed to the UI while the portal resource list loads.
@@ -800,12 +809,12 @@ func (s *VPNService) LoginWithCert(gwIdentifier string, source int, certID, veri
 // copied. It takes strings rather than a tls.Certificate because every exported
 // VPNService method is also bridged to the frontend, and a tls.Certificate
 // cannot cross the JSON IPC boundary.
-func (s *VPNService) LoginWithCertExternal(gwIdentifier, certPath, certPassword string) (map[string]any, error) {
+func (s *VPNService) LoginWithCertExternal(gwIdentifier, certPath, certPassword, verifycode string) (map[string]any, error) {
 	cert, err := certstore.LoadTLSFile(certPath, certPassword)
 	if err != nil {
 		return nil, err
 	}
-	return s.loginWithLoadedCert(gwIdentifier, cert, "", nil)
+	return s.loginWithLoadedCert(gwIdentifier, cert, verifycode, nil)
 }
 
 // loginWithLoadedCert runs the certificate authentication and tunnel setup for
@@ -824,7 +833,9 @@ func (s *VPNService) loginWithLoadedCert(gwIdentifier string, cert *tls.Certific
 	}
 	gwID, gwName, gwIP, gwPort, gwAlgo := gw.ID, gw.Name, gw.IP, gw.Port, gw.Algo
 	s.Config.LastUseGateway = gw.Name
-	s.passwordChallenge = nil
+	// A password-expired challenge belongs to the password flow. Dropping it
+	// here would throw away the session cookie a later ChangePassword needs,
+	// just because a certificate login was attempted in between.
 	preAuth = s.pendingClientLocked(gw)
 	s.mu.Unlock()
 
@@ -839,10 +850,12 @@ func (s *VPNService) loginWithLoadedCert(gwIdentifier string, cert *tls.Certific
 	client.SetTLSClientCertificate(cert)
 
 	if _, err := client.Handshake(); err != nil {
+		client.ClearTLSClientCertificate()
 		s.setStatus("Error", fmt.Sprintf("Handshake failed: %v", err))
 		return nil, err
 	}
 	if err := client.AuthCertOnly(cert, verifycode); err != nil {
+		client.ClearTLSClientCertificate()
 		s.setStatus("Error", fmt.Sprintf("证书认证失败: %v", err))
 		return nil, err
 	}
@@ -1024,8 +1037,16 @@ func (s *VPNService) ChangePassword(gwIdentifier, username, password, newPasswor
 
 	// A two-factor gateway needs the certificate on every login, so the
 	// follow-up sign-in runs the full password + certificate flow again; a
-	// plain password login would be rejected right after the change.
+	// plain password login would be rejected right after the change. The
+	// follow-up must reuse the client that just changed the password: its
+	// cookie jar holds the session the captcha was issued against, and a fresh
+	// client resubmitting the same code is rejected.
 	if challengeCert != nil {
+		s.mu.Lock()
+		if gw := s.Config.FindGateway(gwIdentifier); gw != nil {
+			s.storePendingClientLocked(gw, client)
+		}
+		s.mu.Unlock()
 		res, loginErr := s.loginWithPasswordCert(gwIdentifier, username, newPassword, verifycode, challengeCert, nil, remember, auto)
 		if loginErr != nil {
 			s.Log("WARN", "Password changed, but the follow-up two-factor login failed: %v", loginErr)

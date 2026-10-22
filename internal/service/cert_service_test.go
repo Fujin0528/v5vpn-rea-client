@@ -278,6 +278,44 @@ func TestLoginWithPasswordAndCert(t *testing.T) {
 	}
 }
 
+// TestLoginWithPasswordAndCertPasswordOnlyGateway covers a gateway that
+// accepts the password alone even though the user picked the two-factor tab.
+// The session must be recorded as a plain password login: persisting the
+// two-factor flag would force the two-factor tab on the next launch for a
+// gateway that never asked for a certificate.
+func TestLoginWithPasswordAndCertPasswordOnlyGateway(t *testing.T) {
+	server := newTwoFactorGateway(t, nil, `<RESULT code="0" msg="ok"/>`)
+	host, port := hostPortOf(t, server.URL)
+
+	t.Chdir(t.TempDir())
+	store := mustStore(t)
+	certID := mustImportCert(t, store, "two-factor-client")
+
+	s := &VPNService{
+		Config: &config.AppConfig{Gateways: []config.GatewayProfile{{
+			ID:   "gw-0",
+			Name: "gw",
+			IP:   host,
+			Port: port,
+		}}},
+		CertStore: store,
+		Status:    "Disconnected",
+	}
+	defer s.Logout()
+
+	res, err := s.LoginWithPasswordAndCert("gw", "alice", "secret", "", 0, certID, false, false)
+	if err != nil {
+		t.Fatalf("LoginWithPasswordAndCert: %v", err)
+	}
+	if res["authType"] != "password" {
+		t.Fatalf("authType = %v, want password", res["authType"])
+	}
+	gw := s.GetGateways()[0]
+	if gw.CertWithPassword {
+		t.Fatalf("a password-only success was recorded as two-factor: %+v", gw)
+	}
+}
+
 // A rejected two-factor login must not rewrite the stored mode.
 func TestLoginWithPasswordAndCertRejectedKeepsSavedMode(t *testing.T) {
 	server := newTwoFactorGateway(t, nil, `<RESULT code="0x101" msg="用户名或密码错误"/>`)
