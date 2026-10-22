@@ -18,14 +18,29 @@ import (
 	"github.com/hygkui/v5vpn-rea-client/internal/service"
 )
 
+// testUIFS 模拟分家后的嵌入式目录：根下没有 index.html，两套界面各在
+// 自己的子目录里。若哪天有人把根 index.html 加回来，根重定向测试会
+// 立刻发现路由不再经过重定向。
+func testUIFS() fstest.MapFS {
+	page := func(proto string) *fstest.MapFile {
+		return &fstest.MapFile{Data: []byte("<html><body>" + proto + "</body></html>")}
+	}
+	return fstest.MapFS{
+		"icon.png":          &fstest.MapFile{Data: []byte("png")},
+		"v5vpn/index.html":  page("v5vpn"),
+		"v5vpn/app.js":      &fstest.MapFile{Data: []byte("// v5vpn")},
+		"atrust/index.html": page("atrust"),
+		"atrust/app.js":     &fstest.MapFile{Data: []byte("// atrust")},
+	}
+}
+
 // newTestRouter 构造路由表，不监听端口也不建窗口。
 func newTestRouter(t *testing.T) (http.Handler, *service.VPNService, *service.ATrustService) {
 	t.Helper()
 	t.Setenv("HOME", t.TempDir())
 	v5 := service.NewVPNService(nil)
 	at := service.NewATrustService(v5)
-	uiFS := fstest.MapFS{"index.html": &fstest.MapFile{Data: []byte("<html></html>")}}
-	return newAPIRouter(uiFS, v5, at), v5, at
+	return newAPIRouter(testUIFS(), v5, at), v5, at
 }
 
 func postJSON(t *testing.T, h http.Handler, path, body string) *httptest.ResponseRecorder {
@@ -181,8 +196,7 @@ func TestWrongBackendGuard(t *testing.T) {
 		t.Fatalf("保存网关失败: %v", err)
 	}
 
-	uiFS := fstest.MapFS{"index.html": &fstest.MapFile{Data: []byte("<html></html>")}}
-	h := newAPIRouter(uiFS, v5, at)
+	h := newAPIRouter(testUIFS(), v5, at)
 
 	// aTrust 网关打到 V5VPN 端点：必须是 409，且不能真的发起连接。
 	rec := postJSON(t, h, "/api/login", `{"gwId":"gw-at","username":"u","password":"p"}`)
@@ -212,8 +226,7 @@ func TestWrongBackendGuardReverse(t *testing.T) {
 		t.Fatalf("保存网关失败: %v", err)
 	}
 
-	uiFS := fstest.MapFS{"index.html": &fstest.MapFile{Data: []byte("<html></html>")}}
-	h := newAPIRouter(uiFS, v5, at)
+	h := newAPIRouter(testUIFS(), v5, at)
 
 	rec := postJSON(t, h, "/api/atrust/login", `{"gwId":"gw-v5","username":"u","password":"p"}`)
 	if rec.Code != http.StatusConflict {
@@ -297,3 +310,88 @@ func TestATrustGatewayProtocolRouting(t *testing.T) {
 type errPlain struct{}
 
 func (errPlain) Error() string { return "plain error" }
+
+// TestRootRedirectsToProtocolUI 验证根路径按「上次使用的网关」协议分流。
+//
+// 分家后根下没有 index.html：没有这条重定向，窗口会退化成 ui/ 的目录
+// 清单。这里同时覆盖两个方向 —— 上次用 aTrust 落 /atrust/，上次用
+// V5VPN 落 /v5vpn/，未知记录按 V5VPN 兜底。
+func TestRootRedirectsToProtocolUI(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	v5 := service.NewVPNService(nil)
+	at := service.NewATrustService(v5)
+	h := newAPIRouter(testUIFS(), v5, at)
+
+	if err := v5.SaveGateway(config.GatewayProfile{
+		ID: "gw-v5", Name: "老网关", IP: "192.0.2.10", Port: 443,
+	}); err != nil {
+		t.Fatalf("保存网关失败: %v", err)
+	}
+	if err := v5.SaveGateway(config.GatewayProfile{
+		ID: "gw-at", Name: "零信任网关", IP: "198.51.100.20", Port: 443,
+		Protocol: config.ProtocolATrust,
+	}); err != nil {
+		t.Fatalf("保存网关失败: %v", err)
+	}
+
+	cases := []struct {
+		name     string
+		lastUse  string
+		wantPath string
+	}{
+		{"上次用 aTrust", "零信任网关", uiPathATrust},
+		{"上次用 V5VPN", "老网关", uiPathV5VPN},
+		{"记录已失效", "已删除的网关", uiPathV5VPN},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if err := v5.SetLastUseGateway(c.lastUse); err != nil {
+				t.Fatalf("SetLastUseGateway: %v", err)
+			}
+			for _, path := range []string{"/", "/index.html"} {
+				req := httptest.NewRequest(http.MethodGet, path, nil)
+				rec := httptest.NewRecorder()
+				h.ServeHTTP(rec, req)
+
+				if rec.Code != http.StatusFound {
+					t.Fatalf("GET %s = %d，期望 302", path, rec.Code)
+				}
+				if loc := rec.Header().Get("Location"); loc != c.wantPath {
+					t.Errorf("GET %s -> Location %q，期望 %q", path, loc, c.wantPath)
+				}
+			}
+		})
+	}
+}
+
+// TestStaticFilesStillServed 验证根重定向没有误伤 FileServer：
+// 子目录页面、共享图标、脚本都还要能取到。
+//
+// 路径与窗口 URL 的关系：窗口直接打开 /v5vpn/ 或 /atrust/，静态资源
+// 由同一台服务器以 http://127.0.0.1:<port>/... 提供。
+func TestStaticFilesStillServed(t *testing.T) {
+	h, _, _ := newTestRouter(t)
+
+	for _, tc := range []struct {
+		path string
+		want string
+	}{
+		{"/v5vpn/", "v5vpn"},
+		{"/atrust/", "atrust"},
+		{"/v5vpn/app.js", "// v5vpn"},
+		{"/atrust/app.js", "// atrust"},
+		{"/icon.png", "png"},
+	} {
+		req := httptest.NewRequest(http.MethodGet, tc.path, nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Errorf("GET %s = %d，期望 200", tc.path, rec.Code)
+			continue
+		}
+		if !strings.Contains(rec.Body.String(), tc.want) {
+			t.Errorf("GET %s body = %q，期望包含 %q", tc.path, rec.Body.String(), tc.want)
+		}
+	}
+}

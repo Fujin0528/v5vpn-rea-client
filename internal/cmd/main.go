@@ -168,7 +168,9 @@ func main() {
 			Title:  fmt.Sprintf("V5VPN 现代客户端 %s (MyGo)", AppVersion),
 			Width:  460,
 			Height: 718,
-			URL:    fmt.Sprintf("http://127.0.0.1:%d/index.html", actualPort),
+			// 两套界面按协议分家后没有统一的 /index.html，先打开哪一套
+			// 取决于上次使用的网关协议（见 ui_routes.go）。
+			URL: fmt.Sprintf("http://127.0.0.1:%d%s", actualPort, initialUIPath(vpnService.GetConfig())),
 		})
 		mainWindow = win
 		var isExiting bool
@@ -858,8 +860,20 @@ func newAPIRouter(uiFS fs.FS, vpnService *service.VPNService, atrustSvc *service
 		_ = json.NewEncoder(w).Encode(res)
 	})
 
-	// Static UI assets
-	mux.Handle("/", http.FileServer(http.FS(uiFS)))
+	// Static UI assets. 两套界面各自在 /v5vpn/ 与 /atrust/ 下（uiFS 以
+	// ui/ 目录为根，子目录直接对应根路径），根目录没有 index.html ——
+	// 直接交给 FileServer 会把 uiFS 列成目录清单。
+	// 根路径（和旧书签里的 /index.html）按上次使用的网关协议重定向到对应
+	// 界面；其余路径原样交给 FileServer。
+	fileServer := http.FileServer(http.FS(uiFS))
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/", "/index.html":
+			http.Redirect(w, r, initialUIPath(vpnService.GetConfig()), http.StatusFound)
+			return
+		}
+		fileServer.ServeHTTP(w, r)
+	})
 
 	return mux
 }

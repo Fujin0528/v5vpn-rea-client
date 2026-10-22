@@ -1,4 +1,7 @@
 // V5VPN Client Frontend Controller
+//
+// 本文件只服务 V5VPN 后端。aTrust 有一套独立的 /atrust/，
+// 两套界面各自只认自己的网关与端点，运行时不按协议隐藏控件。
 (function() {
   // Application State
   let config = null;
@@ -9,24 +12,13 @@
   let selectedCertId = '';
   let certs = [];
 
-  // ==================== 协议判定 ====================
+  // ==================== 协议过滤 ====================
   //
-  // 后端把 GatewayProfile.protocol 的零值定义为 V5VPN：缺字段、空串、
-  // 任何不认识的值都按 V5VPN 处理。前端必须用同一套规则，
-  // 否则老配置文件（没有 protocol 字段）会被误判成 aTrust。
-  function findGateway(gwId) {
-    if (!config || !config.gateways || !gwId) return null;
-    return config.gateways.find(g => g.id === gwId || g.name === gwId) || null;
-  }
-
-  function isATrustGateway(gwOrId) {
-    const gw = typeof gwOrId === 'string' ? findGateway(gwOrId) : gwOrId;
-    return !!(gw && gw.protocol === 'atrust');
-  }
-
-  // protocolLabel 用于下拉选项与设置表格的协议徽章。
-  function protocolLabel(gw) {
-    return isATrustGateway(gw) ? 'aTrust' : 'V5VPN';
+  // 界面按协议完全分开：这一套只列出 V5VPN 网关，aTrust 网关在另一套
+  // 界面里管理。Protocol 零值（缺字段、空串、任何不认识的值）都按 V5VPN
+  // 处理——后端就是这套规则，老配置文件里没有 protocol 字段。
+  function isV5VPNGateway(gw) {
+    return !!(gw && gw.protocol !== 'atrust');
   }
 
   // DOM Elements - Views
@@ -102,10 +94,8 @@
 
   // Backend Bridge API (HTTP API or IPC)
   //
-  // 两个协议后端在这里分叉，且**只在这里**分叉。上层业务函数（handleLogin、
-  // disconnect 等）不感知协议，它们只调用 api.login() / api.logout()。
-  // 把协议判断散到各个 handler 里，是最容易出现"界面以为在连 aTrust、
-  // 实际打到了 V5VPN"的地方。
+  // 只打 V5VPN 的端点。aTrust 的 /api/atrust/* 由 /atrust/ 那套界面负责，
+  // 两套界面之间没有共享的 api 层，改一边不会波及另一边。
   const api = {
     async getConfig() {
       if (window.VPNService && window.VPNService.getConfig) {
@@ -115,12 +105,6 @@
       return await res.json();
     },
     async login(gwId, username, password, verifycode, remember, auto) {
-      // aTrust 没有图形验证码这一步（它是 authConfig → psw → authCheck），
-      // 也不支持口令过期改密。因此走自己的一条链。
-      if (isATrustGateway(gwId)) {
-        return await this.atrustLogin(gwId, username, password, remember, auto);
-      }
-
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 12000); // 12s timeout safeguard
 
@@ -147,49 +131,7 @@
         throw err;
       }
     },
-    // atrustLogin 是 aTrust 后端的登录入口。
-    //
-    // 超时上限比 V5VPN 宽：aTrust 的认证链是四个往返
-    // （authConfig → psw → authCheck → onlineInfo），冷启动网关上前两个
-    // 就可能各花几秒。资源拉取是异步的，不在这条链上。
-    async atrustLogin(gwId, username, password, remember, auto) {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 40000);
-
-      try {
-        const res = await fetch('/api/atrust/login', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ gwId, username, password, remember, auto }),
-          signal: controller.signal
-        });
-        clearTimeout(timeoutId);
-        const data = await res.json();
-        if (!res.ok) {
-          const error = new Error(data.error || 'aTrust 登录失败');
-          error.code = data.code || '';
-          throw error;
-        }
-        return data;
-      } catch (err) {
-        clearTimeout(timeoutId);
-        if (err.name === 'AbortError') {
-          throw new Error('aTrust 网关响应超时(40s)，请检查网络与网关地址');
-        }
-        throw err;
-      }
-    },
     async logout() {
-      // IPC 路径必须按协议分叉：VPNService.logout() 只会登出 V5VPN，
-      // aTrust 会话时调用它等于什么都没做。HTTP 路径不需要分叉——
-      // /api/logout 在后端按"谁在活动"判断。
-      if (isATrustGateway(currentGateway)) {
-        if (window.ATrustService && window.ATrustService.logout) {
-          return await window.ATrustService.logout();
-        }
-        const res = await fetch('/api/atrust/logout', { method: 'POST' });
-        return await res.json();
-      }
       if (window.VPNService && window.VPNService.logout) {
         return await window.VPNService.logout();
       }
@@ -197,15 +139,6 @@
       return await res.json();
     },
     async getStatus() {
-      // aTrust 会话的状态必须问 aTrust 后端。走 VPNService.getStatus()
-      // 会拿到 V5VPN 的 "Disconnected"，界面会立刻弹回登录页。
-      if (isATrustGateway(currentGateway)) {
-        if (window.ATrustService && window.ATrustService.getStatus) {
-          return await window.ATrustService.getStatus();
-        }
-        const res = await fetch('/api/atrust/status');
-        return await res.json();
-      }
       if (window.VPNService && window.VPNService.getStatus) {
         return await window.VPNService.getStatus();
       }
@@ -300,14 +233,6 @@
       return await res.json();
     },
     async refreshResources() {
-      // aTrust 的资源刷新走自己的端点：两个后端的资源树形状不同，
-      // 用同一个端点会让后端不得不在运行时判断"当前是哪个协议"。
-      if (isATrustGateway(currentGateway)) {
-        const res = await fetch('/api/atrust/resources/refresh', { method: 'POST' });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.error || '重新拉取应用列表失败');
-        return data;
-      }
       if (window.VPNService && window.VPNService.refreshResources) {
         return await window.VPNService.refreshResources();
       }
@@ -473,20 +398,24 @@
   });
 
   // Gateway Selection & Population
+  //
+  // 只填充本协议的网关：aTrust 网关在这一套界面里不出现，也选不中。
   function populateGateways(gateways, lastUsed) {
     gatewaySelect.innerHTML = '';
-    if (!gateways || gateways.length === 0) {
-      gatewaySelect.innerHTML = '<option value="">(暂无网关配置，请在设置中添加)</option>';
+    const own = (gateways || []).filter(isV5VPNGateway);
+    if (own.length === 0) {
+      gatewaySelect.innerHTML = '<option value="">(暂无 V5VPN 网关配置，请在设置中添加)</option>';
       gwIpPort.textContent = '--';
       gwAlgoTag.textContent = '--';
+      currentGateway = null;
       return;
     }
 
-    gateways.forEach(gw => {
+    own.forEach(gw => {
       const opt = document.createElement('option');
       opt.value = gw.id || gw.name;
-      // 协议标签直接写进选项文本：下拉是原生控件，塞不进 HTML 徽章。
-      opt.textContent = `${gw.name} (${gw.ip}:${gw.port}) · ${protocolLabel(gw)}`;
+      // 下拉是原生控件，塞不进 HTML 徽章，所以只写名称与地址。
+      opt.textContent = `${gw.name} (${gw.ip}:${gw.port})`;
       if (gw.name === lastUsed || gw.id === lastUsed) {
         opt.selected = true;
       }
@@ -500,9 +429,10 @@
     if (passwordChangePanel) hidePasswordChangePanel();
     const selectedVal = gatewaySelect.value;
     if (!config || !config.gateways) return;
-    currentGateway = config.gateways.find(g => (g.id === selectedVal || g.name === selectedVal));
-    if (!currentGateway && config.gateways.length > 0) {
-      currentGateway = config.gateways[0];
+    const own = config.gateways.filter(isV5VPNGateway);
+    currentGateway = own.find(g => (g.id === selectedVal || g.name === selectedVal));
+    if (!currentGateway && own.length > 0) {
+      currentGateway = own[0];
     }
 
     if (currentGateway) {
@@ -522,47 +452,7 @@
         passwordInput.value = '';
       }
 
-      applyProtocolUI();
       restoreAuthPreferences();
-    }
-  }
-
-  // applyProtocolUI 按当前网关的协议裁剪登录界面。
-  //
-  // aTrust 的能力集与 V5VPN 不同，把不适用的控件留在界面上会造成
-  // 两类问题：用户填了验证码却发现没人用它；点"修改密码"走到一个
-  // aTrust 后端根本没有的端点。
-  function applyProtocolUI() {
-    const at = isATrustGateway(currentGateway);
-
-    // 验证码：aTrust 的认证链里没有图形验证码这一步
-    // （authConfig 有 graphCheckCodeEnable，但口令登录链本身不用它）。
-    // 当前 UI 从不主动显示这一组（只在网关要求时由错误分支解锁），
-    // 所以这里只需保证 aTrust 下它一定是收起的且无残留值。
-    if (at) {
-      verifycodeGroup.style.display = 'none';
-      verifycodeInput.value = '';
-    }
-
-    // 修改密码：aTrust 的口令过期走 pwdchange，本版本未实现。
-    if (voluntaryChangePwdLink) {
-      voluntaryChangePwdLink.style.display = at ? 'none' : '';
-    }
-    if (at && passwordChangePanel && passwordChangePanel.style.display === 'block') {
-      hidePasswordChangePanel();
-    }
-
-    // 证书登录：aTrust 后端目前只实现了口令单步，证书分支未接。
-    // 留一个能点但必然失败的按钮比直接隐藏更糟。
-    authTabs.forEach(tab => {
-      if (tab.dataset.mode === 'cert') {
-        tab.style.display = at ? 'none' : '';
-      }
-    });
-    // 按钮文案由 updateConnectButtonLabel 统一负责，这里不重复设置，
-    // 否则两处会在状态切换时互相覆盖。
-    if (at && authMode === 'cert') {
-      setAuthMode('password');
     }
   }
 
@@ -580,20 +470,23 @@
   }
 
   // Render Gateways Table in Settings Modal
+  //
+  // 只显示 V5VPN 网关：aTrust 网关在另一套界面里管理，混在一张表里
+  // 会让「加密模式」这类只对本协议有意义的列出现在它身上。
   function renderGatewayManagerTable() {
     if (!config || !config.gateways) return;
     gatewaysTbody.innerHTML = '';
-    if (config.gateways.length === 0) {
+    const own = config.gateways.filter(isV5VPNGateway);
+    if (own.length === 0) {
       const tr = document.createElement('tr');
-      tr.innerHTML = `<td colspan="6" class="empty-state" style="padding:24px; text-align:center; color:var(--text-dim);">暂无网关配置，请在下方添加</td>`;
+      tr.innerHTML = `<td colspan="5" class="empty-state" style="padding:24px; text-align:center; color:var(--text-dim);">暂无 V5VPN 网关配置，请在下方添加</td>`;
       gatewaysTbody.appendChild(tr);
       return;
     }
-    config.gateways.forEach(gw => {
+    own.forEach(gw => {
       const tr = document.createElement('tr');
       const users = (gw.savedAccounts || []).map(a => a.username).join(', ') || '-';
       const isSelected = currentGateway && (currentGateway.id === gw.id || currentGateway.name === gw.name);
-      const at = isATrustGateway(gw);
 
       tr.className = isSelected ? 'gw-row is-selected-row' : 'gw-row';
       tr.innerHTML = `
@@ -606,13 +499,17 @@
         <td class="gw-ip-cell" title="${escapeHtml(gw.ip)}:${gw.port}">
           <code class="gw-code">${escapeHtml(gw.ip)}:${gw.port}</code>
         </td>
-        <td><span class="algo-pill ${at ? 'proto-atrust' : 'proto-v5vpn'}">${at ? 'aTrust' : 'V5VPN'}</span></td>
-        <td><span class="algo-pill ${gw.algo === 1 ? 'algo-gm' : 'algo-tls'}">${gw.algo === 1 ? '国密 GM' : '国际标准'}</span></td>
+        <td>
+          <div class="gw-proto-cell">
+            <span class="algo-pill proto-v5vpn">V5VPN</span>
+            <span class="algo-pill ${gw.algo === 1 ? 'algo-gm' : 'algo-tls'}">${gw.algo === 1 ? '国密 GM' : '国际标准'}</span>
+          </div>
+        </td>
         <td class="gw-users-cell" title="${escapeHtml(users)}">${escapeHtml(users)}</td>
         <td>
           <div class="action-btn-cell">
-            ${isSelected 
-              ? '<span class="badge-current-gw">✓ 当前选中</span>' 
+            ${isSelected
+              ? '<span class="badge-current-gw">✓ 当前选中</span>'
               : `<button class="btn btn-select btn-sm select-gw-btn" data-id="${gw.id || gw.name}">切换</button>`}
             <button class="btn btn-delete btn-sm delete-gw-btn" data-id="${gw.id || gw.name}" title="删除此网关配置">删除</button>
           </div>
@@ -644,15 +541,13 @@
   }
 
   // Add Gateway
+  //
+  // 这里面只加 V5VPN 网关：协议由所在界面决定，表单里不再有协议下拉。
   addGwBtn.addEventListener('click', async () => {
     const name = document.getElementById('new-gw-name').value.trim();
     const ip = document.getElementById('new-gw-ip').value.trim();
     const port = parseInt(document.getElementById('new-gw-port').value, 10) || 443;
     const algo = parseInt(document.getElementById('new-gw-algo').value, 10) || 0;
-    // 协议是网关的属性，决定由哪个后端登录。默认 v5vpn，与后端
-    // 「Protocol 零值 = V5VPN」的约定一致——但这里显式写出来，
-    // 因为下拉框本身就有默认选中项，用户能看到自己选了哪个。
-    const protocol = document.getElementById('new-gw-protocol').value || 'v5vpn';
 
     if (!name || !ip) {
       alert('请填写网关名称和 IP 地址');
@@ -663,7 +558,7 @@
       return;
     }
 
-    await api.saveGateway({ name, ip, port, algo, protocol });
+    await api.saveGateway({ name, ip, port, algo, protocol: 'v5vpn' });
     document.getElementById('new-gw-name').value = '';
     document.getElementById('new-gw-ip').value = '';
     await reloadGatewaysData();
@@ -1089,7 +984,7 @@
       sessionIdVal.textContent = info.sessionId || '-';
       sessionIpVal.textContent = info.loginAddress || (currentGateway ? `${currentGateway.ip}:${currentGateway.port}` : '-');
       renderResources(info.resources || []);
-      // Certificate sessions have no password to change; hide the shortcut.
+      // 证书会话没有可改的口令；口令会话才有改密入口。
       if (connectedChangePwdBtn) {
         connectedChangePwdBtn.style.display = info.authType === 'certificate' ? 'none' : '';
       }
