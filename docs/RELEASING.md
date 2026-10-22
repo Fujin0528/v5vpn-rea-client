@@ -59,6 +59,14 @@ on:
 如果 CHANGELOG 里找不到对应版本段落，workflow 会回退到
 `gh release create --generate-notes`（英文自动生成），因此务必先写好段落。
 
+### 弹窗短摘要：UPDATES.md
+
+更新弹窗是原生对话框，**不渲染 Markdown**，且不适合长文。因此 manifest 的
+`notes` 不取自 CHANGELOG，而是取自根目录 `UPDATES.md`（`mygo.json` 里
+`updates.changelog` 指定）：每个版本一段导语 + 若干条一句话要点，**10 行以内**，
+不用 `###` 小标题、表格、代码块。发版时与 CHANGELOG 同步新增 `## <版本号>`
+段落；详细内容只写进 CHANGELOG。
+
 ---
 
 ## 4. 发版步骤
@@ -70,9 +78,10 @@ git pull
 git status
 
 # 2) 版本号同步（见第 2 节）：mygo.json / main.go / 两套 index.html
-#    CHANGELOG.md 的 ## Unreleased 改为 ## <版本号>
+#    CHANGELOG.md 的 ## Unreleased 改为 ## <版本号>（完整发布说明）
+#    UPDATES.md 新增 ## <版本号> 短摘要（弹窗用，10 行以内）
 #    提交
-git add mygo.json internal/cmd/main.go CHANGELOG.md \
+git add mygo.json internal/cmd/main.go CHANGELOG.md UPDATES.md \
         internal/cmd/ui/v5vpn/index.html internal/cmd/ui/atrust/index.html
 git commit -m "chore(release): bump to v0.2.1"
 git push origin master

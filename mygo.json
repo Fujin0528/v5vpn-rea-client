@@ -9,7 +9,8 @@
     "publicKey": "v5XetXmz4jCAgqdZ83E8ygOZsv2bEDO0PRf0rRYyXcA=",
     "github": "hygkui/v5vpn-rea-client",
     "tagPrefix": "v",
-    "deltas": 3
+    "deltas": 3,
+    "changelog": "UPDATES.md"
   },
   "linux": {
     "maintainer": "hygkui <hygkui@users.noreply.github.com>",
