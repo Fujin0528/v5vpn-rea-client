@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -159,6 +160,38 @@ func TestChangePasswordSubmitsPwdChangeEndpoint(t *testing.T) {
 	}
 	if strings.Contains(gotBody, "encode=") {
 		t.Fatalf("pwdchange must not carry an encode parameter: %s", gotBody)
+	}
+}
+
+// TestChangePasswordPercentEncodesPasswords guards the form encoding: the body
+// is application/x-www-form-urlencoded, so a password containing '&', '+' or '%'
+// must survive a round trip through url.ParseQuery unchanged.
+func TestChangePasswordPercentEncodesPasswords(t *testing.T) {
+	var gotBody string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/vpn/user/auth/pwdchange", func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		_, _ = io.WriteString(w, `<RESPONSE><RESULT code="0" msg="密码修改成功"/></RESPONSE>`)
+	})
+
+	srv := httptest.NewTLSServer(mux)
+	defer srv.Close()
+
+	client := testClient(t, srv)
+	if err := client.ChangePassword("alice", "a&b=c", "100%+ok", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	values, err := url.ParseQuery(gotBody)
+	if err != nil {
+		t.Fatalf("gateway could not parse the body %q: %v", gotBody, err)
+	}
+	if values.Get("old_pwd") != "a&b=c" {
+		t.Fatalf("old_pwd = %q, want %q (body: %s)", values.Get("old_pwd"), "a&b=c", gotBody)
+	}
+	if values.Get("new_pwd") != "100%+ok" {
+		t.Fatalf("new_pwd = %q, want %q (body: %s)", values.Get("new_pwd"), "100%+ok", gotBody)
 	}
 }
 

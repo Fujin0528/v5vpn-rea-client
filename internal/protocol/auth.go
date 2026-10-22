@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"net/url"
 	"strconv"
 	"strings"
 )
@@ -306,7 +307,13 @@ func base64AuthParam(s string) string {
 // passwordChangeBody formats the request body for /vpn/user/auth/pwdchange.
 // The original client posts both passwords as UTF-8 plaintext: its format
 // string is "old_pwd=%s&new_pwd=%s", no encode parameter is sent, and the
-// function never calls the base64 helper.
+// function never calls the base64 helper. The values still have to be
+// percent-encoded: the request is sent as application/x-www-form-urlencoded,
+// so a raw '&', '+' or '%' in a password is parsed as form syntax and the
+// gateway stores a truncated or empty password.
 func passwordChangeBody(oldPassword, newPassword string) string {
-	return fmt.Sprintf("old_pwd=%s&new_pwd=%s", oldPassword, newPassword)
+	return url.Values{
+		"old_pwd": {oldPassword},
+		"new_pwd": {newPassword},
+	}.Encode()
 }
