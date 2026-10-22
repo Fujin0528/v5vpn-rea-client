@@ -304,6 +304,11 @@ func (c *Client) AuthOnly(username, password, verifycode string) (*AuthResponse,
 // certificate on /vpn/user/auth/cert, reusing the session cookie from the
 // password step. The certificate request carries no body — the certificate
 // itself travels in the TLS handshake.
+//
+// On success the response's CertFactorUsed reports whether the gateway
+// actually asked for the certificate. A gateway that accepts the password
+// alone leaves it false, so the caller must not record the session as
+// two-factor.
 func (c *Client) AuthPasswordWithCert(cert *tls.Certificate, username, password, verifycode string) (*AuthResponse, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -335,6 +340,7 @@ func (c *Client) AuthPasswordWithCert(cert *tls.Certificate, username, password,
 	if err != nil {
 		return resp, err
 	}
+	certResp.CertFactorUsed = true
 	c.markLoggedInLocked()
 	return certResp, nil
 }
@@ -583,13 +589,23 @@ func (c *Client) SetTLSClientCertificate(cert *tls.Certificate) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.tlsClientCert = cert
-	if tr, ok := c.HTTPClient.Transport.(*http.Transport); ok && tr.TLSClientConfig != nil {
-		tr.TLSClientConfig.Certificates = []tls.Certificate{*cert}
-		tr.TLSClientConfig.GetClientCertificate = func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
-			return cert, nil
-		}
+	c.installClientCertLocked(cert)
+}
+
+// ClearTLSClientCertificate removes a previously installed client certificate.
+// A login that installed one and then failed must call it: the same client is
+// reused for the captcha session, and the next password attempt would otherwise
+// present the certificate on a step that must not carry one.
+func (c *Client) ClearTLSClientCertificate() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.tlsClientCert = nil
+	tr, ok := c.HTTPClient.Transport.(*http.Transport)
+	if !ok || tr.TLSClientConfig == nil {
+		return
 	}
+	tr.TLSClientConfig.Certificates = nil
+	tr.TLSClientConfig.GetClientCertificate = nil
 }
 
 // LoginWithCert authenticates with a client certificate at

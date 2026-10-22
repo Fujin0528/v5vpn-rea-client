@@ -332,6 +332,9 @@ func TestAuthPasswordWithCertTwoStepFlow(t *testing.T) {
 	if client.SessionID != "two-factor-session" {
 		t.Fatalf("expected session id from Set-Cookie, got %q", client.SessionID)
 	}
+	if !resp.CertFactorUsed {
+		t.Fatal("CertFactorUsed must be set once the certificate step succeeds")
+	}
 	if client.ClientCertificate() == nil {
 		t.Fatal("client certificate was not retained for tunnel reuse")
 	}
@@ -363,6 +366,9 @@ func TestAuthPasswordWithCertSkipsCertificateWhenNotAsked(t *testing.T) {
 	}
 	if client.ClientCertificate() == nil {
 		t.Fatal("client certificate was not retained for tunnel reuse")
+	}
+	if resp.CertFactorUsed {
+		t.Fatal("CertFactorUsed must stay false when the gateway accepted the password alone")
 	}
 	_ = client.Logout()
 }
@@ -396,6 +402,29 @@ func TestAuthPasswordWithCertCertificateStepRejection(t *testing.T) {
 	}
 	if !probe.sawCertStep || !probe.certStepHasCert {
 		t.Fatal("certificate step did not run with the certificate")
+	}
+}
+
+// TestClearTLSClientCertificateRemovesInstalledCert guards the failed-login
+// path: a certificate installed for a login that then fails must not stay on
+// the client, because the same client is reused for the captcha session and
+// the next password attempt would present it.
+func TestClearTLSClientCertificateRemovesInstalledCert(t *testing.T) {
+	client := NewClient("127.0.0.1", 1, 0, nil)
+	cert := newTestClientCert(t)
+
+	client.SetTLSClientCertificate(cert)
+	if client.ClientCertificate() == nil {
+		t.Fatal("certificate was not installed")
+	}
+
+	client.ClearTLSClientCertificate()
+	if client.ClientCertificate() != nil {
+		t.Fatal("certificate survived ClearTLSClientCertificate")
+	}
+	tr := client.HTTPClient.Transport.(*http.Transport)
+	if len(tr.TLSClientConfig.Certificates) != 0 || tr.TLSClientConfig.GetClientCertificate != nil {
+		t.Fatal("TLS transport still offers the client certificate")
 	}
 }
 

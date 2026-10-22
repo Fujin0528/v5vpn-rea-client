@@ -13,6 +13,12 @@ type VersionResponse struct {
 type AuthResponse struct {
 	XMLName xml.Name  `xml:"RESPONSE"`
 	Result  ResultTag `xml:"RESULT"`
+
+	// CertFactorUsed is not part of the gateway XML. AuthPasswordWithCert sets
+	// it when the gateway's result code asked for the certificate factor and the
+	// certificate step succeeded, so the caller can tell a real two-factor
+	// session from one the gateway accepted on the password alone.
+	CertFactorUsed bool `xml:"-"`
 }
 
 type ResultTag struct {
