@@ -103,3 +103,75 @@ func TestCertificateIDOmittedWhenUnset(t *testing.T) {
 		t.Fatalf("authtype default not written:\n%s", data)
 	}
 }
+
+// TestCertWithPasswordRoundTrip covers the third login method: authtype stays
+// 0 (password) so the original client keeps reading the entry as it wrote it,
+// and certwithpwd="1" marks the extra certificate factor.
+func TestCertWithPasswordRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "setting.xml")
+
+	input := `<?xml version="1.0" encoding="UTF-8"?>
+<SETTING_INFO>
+  <COMMON remember="1" autologin="0"/>
+  <GATEWAY LastUseGateway="prod">
+    <Gateway0 Name="prod" Ip="203.0.113.10" Port="443" algo="0">
+      <USER LastUserName="YWxpY2U=" authtype="0" certtype="0" certwithpwd="1" certid="A1B2C3D4E5F60718293A4B5C6D7E8F90">
+        <User0 Name="YWxpY2U=" Pwd="" rpwd="1" auto="0"></User0>
+      </USER>
+    </Gateway0>
+  </GATEWAY>
+</SETTING_INFO>`
+	if err := os.WriteFile(path, []byte(input), 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+
+	cfg, err := LoadSettingXML(path)
+	if err != nil {
+		t.Fatalf("LoadSettingXML: %v", err)
+	}
+	gw := cfg.Gateways[0]
+	if !gw.CertWithPassword {
+		t.Fatalf("certwithpwd was lost on load: %+v", gw)
+	}
+	if gw.AuthType != 0 {
+		t.Fatalf("authtype must stay 0 for two-factor entries, got %d", gw.AuthType)
+	}
+
+	outPath := filepath.Join(dir, "setting.out.xml")
+	if err := cfg.SaveSettingXML(outPath); err != nil {
+		t.Fatalf("SaveSettingXML: %v", err)
+	}
+	saved, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatalf("read saved file: %v", err)
+	}
+	if !strings.Contains(string(saved), `certwithpwd="1"`) {
+		t.Fatalf("saved XML is missing certwithpwd:\n%s", saved)
+	}
+
+	reloaded, err := LoadSettingXML(outPath)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if !reloaded.Gateways[0].CertWithPassword || reloaded.Gateways[0].SelectedCertID != gw.SelectedCertID {
+		t.Fatalf("round trip mismatch: before=%+v after=%+v", gw, reloaded.Gateways[0])
+	}
+}
+
+// A plain password gateway must not gain a certwithpwd attribute.
+func TestCertWithPasswordOmittedWhenUnset(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "setting.xml")
+	cfg := &AppConfig{Gateways: []GatewayProfile{{Name: "gw", IP: "203.0.113.10", Port: 443}}}
+	if err := cfg.SaveSettingXML(path); err != nil {
+		t.Fatalf("SaveSettingXML: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if strings.Contains(string(data), "certwithpwd=") {
+		t.Fatalf("unexpected certwithpwd attribute for a password-only gateway:\n%s", data)
+	}
+}
