@@ -6,12 +6,10 @@
   let isConnected = false;
   let logPollTimer = null;
   let authMode = 'password';       // 'password' | 'cert' | 'pwd-cert'
-  let certSource = 0;              // 0 file, 1 system store
   let selectedCertId = '';
   let certs = [];
   // The two-factor panel keeps its own selection: a gateway can require a
   // specific certificate while the certificate-only tab remembers another.
-  let pwdCertSource = 0;
   let pwdCertId = '';
 
   // ==================== 协议过滤 ====================
@@ -58,7 +56,6 @@
   const passwordPanel = document.getElementById('password-panel');
   const certPanel = document.getElementById('cert-panel');
   const authTabs = Array.from(document.querySelectorAll('.auth-tab'));
-  const certSourceButtons = Array.from(document.querySelectorAll('.cert-source'));
   const certList = document.getElementById('cert-list');
   const certRefreshBtn = document.getElementById('cert-refresh-btn');
   const importCertBtn = document.getElementById('import-cert-btn');
@@ -73,7 +70,6 @@
 
   // DOM Elements - Password + Certificate (two-factor) Panel
   const pwdCertGroup = document.getElementById('pwd-cert-group');
-  const pwdCertSourceSelect = document.getElementById('pwd-cert-source');
   const pwdCertSelect = document.getElementById('pwd-cert-select');
   const pwdCertRefreshBtn = document.getElementById('pwd-cert-refresh-btn');
 
@@ -314,14 +310,14 @@
     },
     // Two-factor login: password first; the certificate follows on
     // /vpn/user/auth/cert once the gateway asks for the certificate factor.
-    async loginWithPasswordAndCert(gwId, username, password, source, certId, verifycode, remember, auto) {
+    async loginWithPasswordAndCert(gwId, username, password, certId, verifycode, remember, auto) {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 20000);
       try {
         const res = await fetch('/api/login-pwd-cert', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ gwId, username, password, source, certId, verifycode, remember, auto }),
+          body: JSON.stringify({ gwId, username, password, source: 0, certId, verifycode, remember, auto }),
           signal: controller.signal
         });
         clearTimeout(timeoutId);
@@ -817,16 +813,13 @@
     pwdCertSelect.innerHTML = '<option value="">正在检测证书...</option>';
     let list = [];
     try {
-      list = await api.listCerts(pwdCertSource);
+      list = await api.listCerts(0);
     } catch (err) {
       pwdCertSelect.innerHTML = `<option value="">${escapeHtml(err.message || '读取证书列表失败')}</option>`;
       return;
     }
     if (!Array.isArray(list) || list.length === 0) {
-      const hint = pwdCertSource === 0
-        ? '未找到已导入的证书，请先在「证书登录」中导入'
-        : '未在系统证书库中找到带私钥的个人证书';
-      pwdCertSelect.innerHTML = `<option value="">${hint}</option>`;
+      pwdCertSelect.innerHTML = '<option value="">未找到已导入的证书，请先在「证书登录」中导入</option>';
       pwdCertId = '';
       return;
     }
@@ -847,11 +840,6 @@
     pwdCertId = pwdCertSelect.value;
   });
 
-  pwdCertSourceSelect?.addEventListener('change', () => {
-    pwdCertSource = parseInt(pwdCertSourceSelect.value, 10) || 0;
-    pwdCertId = '';
-    loadPwdCertificates();
-  });
 
   pwdCertRefreshBtn?.addEventListener('click', () => loadPwdCertificates());
 
@@ -875,7 +863,7 @@
     hideLoginAlert();
     setConnectingState(true);
     try {
-      const res = await api.loginWithPasswordAndCert(gwId, username, password, pwdCertSource, pwdCertId, verifycode, remember, auto);
+      const res = await api.loginWithPasswordAndCert(gwId, username, password, pwdCertId, verifycode, remember, auto);
       showConnectedView(res);
     } catch (err) {
       const msg = friendlyLoginError(err);
@@ -894,27 +882,10 @@
     tab.addEventListener('click', () => setAuthMode(tab.dataset.mode));
   });
 
-  certSourceButtons.forEach(btn => {
-    btn.addEventListener('click', () => {
-      if (btn.disabled) return;
-      certSource = parseInt(btn.dataset.source, 10) || 0;
-      certSourceButtons.forEach(b => b.classList.toggle('is-active', b === btn));
-      selectedCertId = '';
-      // Importing only applies to file certificates; the system store is
-      // managed by the operating system.
-      importCertBtn.style.display = certSource === 0 ? '' : 'none';
-      if (certSource !== 0) {
-        importCertPanel.style.display = 'none';
-        certList.style.display = '';
-      }
-      loadCertificates();
-    });
-  });
-
   async function loadCertificates() {
     certList.innerHTML = '<p class="cert-empty">正在检测证书...</p>';
     try {
-      const list = await api.listCerts(certSource);
+      const list = await api.listCerts(0);
       certs = Array.isArray(list) ? list : [];
     } catch (err) {
       certs = [];
@@ -923,10 +894,7 @@
     }
 
     if (certs.length === 0) {
-      const hint = certSource === 0
-        ? '未找到已导入的证书。点击「导入证书」添加 .p12/.pfx 文件。'
-        : '未在系统证书库中找到带私钥的个人证书。';
-      certList.innerHTML = `<p class="cert-empty">${hint}</p>`;
+      certList.innerHTML = '<p class="cert-empty">未找到已导入的证书。点击「导入证书」添加 .p12/.pfx 文件。</p>';
       return;
     }
 
@@ -1009,7 +977,7 @@
     hideLoginAlert();
     setConnectingState(true);
     try {
-      const res = await api.loginWithCert(gwId, certSource, selectedCertId, verifycode, auto);
+      const res = await api.loginWithCert(gwId, 0, selectedCertId, verifycode, auto);
       showConnectedView(res);
     } catch (err) {
       showLoginAlert(friendlyLoginError(err), 'error');
@@ -1078,22 +1046,11 @@
       return;
     }
     if (currentGateway.certWithPassword === true) {
-      // Two-factor: the password fields are reused, plus the remembered
-      // certificate. certtype/selectedcertid come from the same login.
-      pwdCertSource = currentGateway.certType === 1 ? 1 : 0;
-      if (pwdCertSourceSelect) pwdCertSourceSelect.value = String(pwdCertSource);
       pwdCertId = currentGateway.selectedCertId || '';
       setAuthMode('pwd-cert');
       return;
     }
     if (currentGateway.authType === 1) {
-      certSource = currentGateway.certType === 1 ? 1 : 0;
-      certSourceButtons.forEach(b => {
-        b.classList.toggle('is-active', parseInt(b.dataset.source, 10) === certSource);
-      });
-      if (importCertBtn) {
-        importCertBtn.style.display = certSource === 0 ? '' : 'none';
-      }
       selectedCertId = currentGateway.selectedCertId || '';
       certAutoLoginCheckbox.checked = currentGateway.certAutoLogin === true;
       setAuthMode('cert');

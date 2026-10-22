@@ -48,7 +48,7 @@ func TestConnectWithOptionalPasswordChange(t *testing.T) {
 
 	t.Run("no new password only logs in", func(t *testing.T) {
 		f := &fakeCLIConnector{loginRes: connected}
-		res, changed, err := connectWithOptionalPasswordChange(f, "gw", "alice", "old-secret", "", false)
+		res, changed, err := connectWithOptionalPasswordChange(f, "gw", "alice", "old-secret", "", "", false)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -68,7 +68,7 @@ func TestConnectWithOptionalPasswordChange(t *testing.T) {
 
 	t.Run("valid old password skips change without force", func(t *testing.T) {
 		f := &fakeCLIConnector{loginRes: connected}
-		res, changed, err := connectWithOptionalPasswordChange(f, "gw", "alice", "old-secret", "new-secret", false)
+		res, changed, err := connectWithOptionalPasswordChange(f, "gw", "alice", "old-secret", "new-secret", "", false)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -88,7 +88,7 @@ func TestConnectWithOptionalPasswordChange(t *testing.T) {
 
 	t.Run("force directly changes password", func(t *testing.T) {
 		f := &fakeCLIConnector{changeRes: connected}
-		res, changed, err := connectWithOptionalPasswordChange(f, "gw", "alice", "old-secret", "new-secret", true)
+		res, changed, err := connectWithOptionalPasswordChange(f, "gw", "alice", "old-secret", "new-secret", "", true)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -105,7 +105,7 @@ func TestConnectWithOptionalPasswordChange(t *testing.T) {
 
 	t.Run("expired password changes after login", func(t *testing.T) {
 		f := &fakeCLIConnector{loginErr: expired, changeRes: connected}
-		res, changed, err := connectWithOptionalPasswordChange(f, "gw", "alice", "old-secret", "new-secret", false)
+		res, changed, err := connectWithOptionalPasswordChange(f, "gw", "alice", "old-secret", "new-secret", "", false)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -132,7 +132,7 @@ func TestConnectWithOptionalPasswordChange(t *testing.T) {
 
 	t.Run("bad credentials do not change", func(t *testing.T) {
 		f := &fakeCLIConnector{loginErr: badCredentials}
-		_, changed, err := connectWithOptionalPasswordChange(f, "gw", "alice", "wrong", "new-secret", false)
+		_, changed, err := connectWithOptionalPasswordChange(f, "gw", "alice", "wrong", "new-secret", "", false)
 		if !errors.Is(err, badCredentials) {
 			t.Fatalf("expected bad credentials, got %v", err)
 		}
@@ -150,7 +150,7 @@ func TestConnectWithOptionalPasswordChange(t *testing.T) {
 	t.Run("failed change reports error", func(t *testing.T) {
 		changeErr := errors.New("gateway rejected change")
 		f := &fakeCLIConnector{loginErr: expired, changeErr: changeErr}
-		_, changed, err := connectWithOptionalPasswordChange(f, "gw", "alice", "old-secret", "new-secret", false)
+		_, changed, err := connectWithOptionalPasswordChange(f, "gw", "alice", "old-secret", "new-secret", "", false)
 		if !errors.Is(err, changeErr) {
 			t.Fatalf("expected change error, got %v", err)
 		}

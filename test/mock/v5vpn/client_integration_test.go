@@ -1,16 +1,9 @@
-//go:build v5twofactor
-
-// 这份集成测试从分支 hygkui/7 搬来，依赖该分支独有的 protocol API：
-//   - Client.AuthPasswordWithCert（口令 → code 2 → 证书 的双因素握手）
-//   - 客户端按 encode=1 提交 base64 凭据
-//
-// 当前分支（零信任aTrust）的 protocol 尚未落地这条双因素路径，且按 v2.0 网关
-// 标准固定提交 encode=2（AES-128-CBC）。直接参与编译会让 go vet / go test ./...
-// 失败。这里用 v5twofactor 构建标签隔离，等双因素在主干对齐后再摘掉标签。
-//
-// 想跑它（且主干补齐了上述 API 时）：go test -tags v5twofactor ./test/mock/v5vpn/
-
 package mockserver
+
+// 这份集成测试验证 V5VPN protocol 客户端与本地 MockServer 的完整双因素认证与门户资源拉取流程：
+//   - Client.AuthPasswordWithCert（口令 -> code 2 -> 证书 串行双因素握手）
+//   - Client.FetchIntegration（获取内网资源）
+//   - Client.Logout（安全退出会话）
 
 import (
 	"crypto/tls"
@@ -21,12 +14,15 @@ import (
 	"github.com/hygkui/v5vpn-rea-client/internal/protocol"
 )
 
-func TestMockServerIntegrationWithProtocolClient(t *testing.T) {
+// startTestGateway starts a mock gateway on a random loopback port and returns
+// the server plus the host/port a protocol.Client needs.
+func startTestGateway(t *testing.T, mode Mode) (*Server, string, int) {
+	t.Helper()
+
 	srv, err := New(Config{
-		Addr:        "127.0.0.1:0",
-		Mode:        ModePwdCert,
-		RequireCert: false,
-		Verbose:     true,
+		Addr:    "127.0.0.1:0",
+		Mode:    mode,
+		Verbose: false,
 	})
 	if err != nil {
 		t.Fatalf("New failed: %v", err)
@@ -36,20 +32,32 @@ func TestMockServerIntegrationWithProtocolClient(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Listen failed: %v", err)
 	}
-	defer l.Close()
+	go func() { _ = srv.httpSrv.Serve(l) }()
+	t.Cleanup(func() {
+		_ = l.Close()
+		_ = srv.Close()
+	})
 
-	go srv.httpSrv.Serve(l)
-	defer srv.Close()
+	host, portText, err := net.SplitHostPort(l.Addr().String())
+	if err != nil {
+		t.Fatalf("split host/port: %v", err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		t.Fatalf("bad port %q: %v", portText, err)
+	}
+	return srv, host, port
+}
 
-	host, portStr, _ := net.SplitHostPort(l.Addr().String())
-	port, _ := strconv.Atoi(portStr)
+func TestMockServerIntegrationWithProtocolClient(t *testing.T) {
+	_, host, port := startTestGateway(t, ModePwdCert)
 
 	client := protocol.NewClient(host, port, 0, func(level, format string, args ...any) {
 		t.Logf("["+level+"] "+format, args...)
 	})
 
 	// 1. Handshake
-	_, err = client.Handshake()
+	_, err := client.Handshake()
 	if err != nil {
 		t.Fatalf("Handshake failed: %v", err)
 	}
@@ -89,5 +97,36 @@ func TestMockServerIntegrationWithProtocolClient(t *testing.T) {
 	err = client.Logout()
 	if err != nil {
 		t.Fatalf("Logout failed: %v", err)
+	}
+}
+
+// TestVerifyCodeRequiresSameSession proves the mock enforces the real
+// gateway's binding: a captcha code is valid only on the cookie jar that
+// fetched the image. A client that submits the same code from another session
+// must be rejected; otherwise this suite cannot catch a client that loses the
+// captcha cookies between "fetch image" and "submit login".
+func TestVerifyCodeRequiresSameSession(t *testing.T) {
+	srv, host, port := startTestGateway(t, ModeVerifyCode)
+
+	imageClient := protocol.NewClient(host, port, 0, nil)
+	if _, _, err := imageClient.FetchVerifyCode(); err != nil {
+		t.Fatalf("FetchVerifyCode failed: %v", err)
+	}
+	defer func() { _ = imageClient.Logout() }()
+
+	srv.mu.RLock()
+	code := srv.currentVerifyCode
+	srv.mu.RUnlock()
+	if code == "" {
+		t.Fatal("mock did not generate a captcha code")
+	}
+
+	if _, err := imageClient.AuthOnly("admin", "admin123", code); err != nil {
+		t.Fatalf("login on the captcha session failed: %v", err)
+	}
+
+	otherClient := protocol.NewClient(host, port, 0, nil)
+	if _, err := otherClient.AuthOnly("admin", "admin123", code); err == nil {
+		t.Fatal("a client without the captcha session was accepted")
 	}
 }

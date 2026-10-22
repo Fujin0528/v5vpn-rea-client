@@ -276,11 +276,18 @@ mygo 内建了 ed25519 签名的自更新机制。`mygo.json` 的 `updates.publi
 仓库内置了针对网御星云 / 启明星辰 V5VPN 网关的独立 HTTPS 模拟测试服务，方便在无真实网关环境下做双因素、改密等全流程断网调试：
 
 ```bash
-# 启动模拟服务端（默认 127.0.0.1:8443，模式为口令+证书双因素）
-go run ./cmd/mockserver
+# 启动 V5VPN 模拟服务端（默认 127.0.0.1:8443，模式为口令+证书双因素）
+go run ./cmd/mock-v5vpn
 
 # 可选模式：pwd-cert (双因素), pwd-only (单口令), pwd-change (改密挑战), err-auth (认证失败), token (令牌), sms (短信)
-go run ./cmd/mockserver -mode pwd-only
+go run ./cmd/mock-v5vpn -mode pwd-only
+
+# 启动 aTrust 模拟服务端
+go run ./cmd/mock-atrust -addr 127.0.0.1:8443
+
+# 客户端协议级端到端测试工具（对撞模拟服务端）
+go run ./cmd/e2e-v5vpn -gw 127.0.0.1 -port 8443 -user admin -pwd admin123
+go run ./cmd/e2e-atrust -gw https://127.0.0.1:8443 -user user1@local -pass any
 ```
 
 启动后可在浏览器打开 `https://127.0.0.1:8443/` 仪表盘实时观察请求流量或动态切换模式。

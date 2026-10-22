@@ -1,5 +1,8 @@
 package main
 
+// cmd/mockserver — 保持历史命令兼容的 V5VPN mockserver 入口。
+// 建议使用对齐命名的 cmd/mock-v5vpn。
+
 import (
 	"flag"
 	"fmt"
@@ -8,7 +11,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/hygkui/v5vpn-rea-client/test/mock/v5vpn"
+	mockserver "github.com/hygkui/v5vpn-rea-client/test/mock/v5vpn"
 )
 
 func main() {
@@ -56,7 +59,7 @@ func main() {
 	fmt.Printf(" Dashboard    : https://%s/ (open in browser to toggle modes)\n", *addr)
 	fmt.Println("----------------------------------------------------------------")
 	fmt.Println(" Example CLI Test Command:")
-	fmt.Printf("   go run ./internal/cmd -cli -connect %s -pwd-cert -cert <id> -user %s -pwd %s\n", *addr, *user, *pwd)
+	fmt.Printf("   go run ./cmd/e2e-v5vpn -gw 127.0.0.1 -port 8443 -user %s -pwd %s\n", *user, *pwd)
 	fmt.Println("================================================================")
 	fmt.Println()
 

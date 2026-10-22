@@ -40,9 +40,9 @@ const (
 	// fields (for example a value was not valid Base64, or an encode mode the
 	// gateway does not expect). The original client still reports it as a
 	// credential error.
-	codeDecryptFailed = 0x8000001A
-	codeVerifyCode    = 0x66600011
-	codeVerifyCodeAlt = 0x80
+	codeDecryptFailed      = 0x8000001A
+	codeVerifyCode         = 0x66600011
+	codeVerifyCodeAlt      = 0x80
 	codeVerifyCodeMismatch = 0x80000021
 
 	// Certificate authentication results.

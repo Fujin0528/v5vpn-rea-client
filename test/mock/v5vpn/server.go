@@ -2,18 +2,18 @@ package mockserver
 
 import (
 	"bytes"
-	"image"
-	"image/color"
-	"image/png"
-	"math"
-	"math/rand"
 	"crypto/sha1"
 	"crypto/tls"
 	"encoding/base64"
 	"fmt"
 	"html"
+	"image"
+	"image/color"
+	"image/png"
 	"io"
 	"log"
+	"math"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"strings"
@@ -25,15 +25,15 @@ import (
 type Mode string
 
 const (
-	ModePwdCert    Mode = "pwd-cert"    // Two-factor: Password -> code 2 -> Cert -> code 0
-	ModePwdOnly    Mode = "pwd-only"    // Single-factor: Password -> code 0
-	ModeCertOnly   Mode = "cert-only"   // Standalone mTLS Certificate -> code 0
-	ModePwdChange  Mode = "pwd-change"  // Password expired: Password -> code 256 -> PwdChange -> code 0
-	ModeVerifyCode Mode = "verifycode"  // Captcha required: Password -> code 0x80 -> Captcha -> code 0
-	ModeToken      Mode = "token"       // Password -> code 4 -> Token -> code 0
-	ModeSMS        Mode = "sms"         // Password -> code 8 -> SMS -> code 0
-	ModeErrAuth    Mode = "err-auth"    // Invalid credentials -> code 0x8000001a
-	ModeErrCert    Mode = "err-cert"    // Expired/Invalid certificate -> code 0x106
+	ModePwdCert    Mode = "pwd-cert"   // Two-factor: Password -> code 2 -> Cert -> code 0
+	ModePwdOnly    Mode = "pwd-only"   // Single-factor: Password -> code 0
+	ModeCertOnly   Mode = "cert-only"  // Standalone mTLS Certificate -> code 0
+	ModePwdChange  Mode = "pwd-change" // Password expired: Password -> code 256 -> PwdChange -> code 0
+	ModeVerifyCode Mode = "verifycode" // Captcha required: Password -> code 0x80 -> Captcha -> code 0
+	ModeToken      Mode = "token"      // Password -> code 4 -> Token -> code 0
+	ModeSMS        Mode = "sms"        // Password -> code 8 -> SMS -> code 0
+	ModeErrAuth    Mode = "err-auth"   // Invalid credentials -> code 0x8000001a
+	ModeErrCert    Mode = "err-cert"   // Expired/Invalid certificate -> code 0x106
 )
 
 // Config holds options for the mock server.
@@ -99,8 +99,8 @@ func New(cfg Config) (*Server, error) {
 	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{tlsCert},
 		// RequestClientCert requests client certificate if presented, without dropping TLS connection if absent
-		ClientAuth:   tls.RequestClientCert,
-		MinVersion:   tls.VersionTLS10,
+		ClientAuth: tls.RequestClientCert,
+		MinVersion: tls.VersionTLS10,
 	}
 
 	mux := http.NewServeMux()
@@ -272,7 +272,14 @@ func (s *Server) handlePassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sessionID := fmt.Sprintf("mock-vsg-%x", time.Now().UnixNano())
+	// Reuse the session created by the captcha image (or an earlier auth
+	// step). The real gateway binds the captcha code to this cookie; minting
+	// a new session here would make every captcha look valid.
+	sessionID := ""
+	if c, err := r.Cookie("VSG_SESSIONID"); err == nil {
+		sessionID = c.Value
+	}
+
 	authMethod := "口令认证"
 	s.mu.RLock()
 	justChanged := time.Since(s.lastChangedTime) < 15*time.Second
@@ -288,22 +295,28 @@ func (s *Server) handlePassword(w http.ResponseWriter, r *http.Request) {
 		authMethod = "口令认证"
 	}
 
+	newSession := false
 	s.mu.Lock()
-	s.sessions[sessionID] = &Session{
-		ID:         sessionID,
-		Username:   rawUser,
-		PassedPwd:  true,
-		AuthMethod: authMethod,
-		CreatedAt:  time.Now(),
+	sess, exists := s.sessions[sessionID]
+	if !exists || sess == nil {
+		sessionID = fmt.Sprintf("mock-vsg-%x", time.Now().UnixNano())
+		sess = &Session{ID: sessionID, CreatedAt: time.Now()}
+		s.sessions[sessionID] = sess
+		newSession = true
 	}
+	sess.Username = rawUser
+	sess.PassedPwd = true
+	sess.AuthMethod = authMethod
 	s.mu.Unlock()
 
-	http.SetCookie(w, &http.Cookie{
-		Name:     "VSG_SESSIONID",
-		Value:    sessionID,
-		Path:     "/",
-		HttpOnly: true,
-	})
+	if newSession {
+		http.SetCookie(w, &http.Cookie{
+			Name:     "VSG_SESSIONID",
+			Value:    sessionID,
+			Path:     "/",
+			HttpOnly: true,
+		})
+	}
 
 	w.Header().Set("Content-Type", "text/xml; charset=utf-8")
 
@@ -329,7 +342,7 @@ func (s *Server) handlePassword(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		expected := s.getExpectedVerifyCode(sessionID)
-		if expected != "" && !strings.EqualFold(strings.TrimSpace(verifycode), expected) {
+		if expected == "" || !strings.EqualFold(strings.TrimSpace(verifycode), expected) {
 			log.Printf("[MockServer] <- Verifycode MISMATCH for %q: received %q, expected %q (code: 0x80000021)", rawUser, verifycode, expected)
 			s.generateNewVerifyCode(sessionID)
 			w.Write([]byte(fmt.Sprintf(`<?xml version="1.0" encoding="utf-8"?>
@@ -528,17 +541,20 @@ func (s *Server) handleIntegration(w http.ResponseWriter, r *http.Request) {
   <SESSION sid_name="VSG_SESSIONID" id="%s" detect_interval="60" login-addr="127.0.0.1" login-time="2026-10-22 11:00:00"/>
   <GATEWAY version="5.3.3.32"/>
   <RESOURCE_LIST>
-    <TCPUDP_RESOURCE name="[%s] 企业协同办公平台 (OA)" protocol="tcp" mapid="1" port="8080" status="1" istcp="1">
+    <TCPUDP_RESOURCE name="内网OA协同办公" protocol="tcp" mapid="1" port="8080" status="1" istcp="1">
       <TCPUDP_IP addr="10.8.0.10-10.8.0.10"/>
     </TCPUDP_RESOURCE>
-    <TCPUDP_RESOURCE name="[%s] 核心代码托管平台 (GitLab)" protocol="tcp" mapid="2" port="443" status="1" istcp="1">
+    <TCPUDP_RESOURCE name="研发代码仓库 (GitLab)" protocol="tcp" mapid="2" port="443" status="1" istcp="1">
       <TCPUDP_IP addr="10.8.0.20-10.8.0.20"/>
+    </TCPUDP_RESOURCE>
+    <TCPUDP_RESOURCE name="核心运维堡垒机 (SSH/RDP)" protocol="tcp" mapid="3" port="22" status="1" istcp="1">
+      <TCPUDP_IP addr="10.8.0.30-10.8.0.30"/>
     </TCPUDP_RESOURCE>
   </RESOURCE_LIST>
   <DNS_INFO>
     <DOMAIN_HOST dnssrv="10.8.0.2;10.8.0.3" dnssrv_v6=""/>
   </DNS_INFO>
-</INTERGRATION_INFO>`, html.EscapeString(username), sid, authMethod, authMethod)
+</INTERGRATION_INFO>`, html.EscapeString(username), sid)
 }
 
 func (s *Server) handleRuleXML(w http.ResponseWriter, r *http.Request) {
@@ -620,16 +636,19 @@ var font5x7 = map[rune][7]uint8{
 	'Z': {0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F},
 }
 
+// getExpectedVerifyCode returns the code issued to one session. There is no
+// global fallback: a code fetched by another client must never validate here,
+// otherwise the mock cannot catch a client that drops the captcha cookie jar.
 func (s *Server) getExpectedVerifyCode(sessionID string) string {
+	if sessionID == "" {
+		return ""
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if sess, ok := s.sessions[sessionID]; ok && sess != nil && sess.VerifyCode != "" {
+	if sess, ok := s.sessions[sessionID]; ok && sess != nil {
 		return sess.VerifyCode
 	}
-	if s.currentVerifyCode != "" {
-		return s.currentVerifyCode
-	}
-	return "1234"
+	return ""
 }
 
 func (s *Server) generateNewVerifyCode(sessionID string) string {
@@ -674,11 +693,11 @@ func (s *Server) generateCaptchaImageBytes(code string) ([]byte, error) {
 
 	// Draw characters
 	charColors := []color.RGBA{
-		{26, 82, 118, 255},  // Blue
-		{146, 43, 33, 255},  // Red
-		{20, 90, 50, 255},   // Green
-		{110, 44, 0, 255},   // Brown
-		{74, 35, 90, 255},   // Purple
+		{26, 82, 118, 255}, // Blue
+		{146, 43, 33, 255}, // Red
+		{20, 90, 50, 255},  // Green
+		{110, 44, 0, 255},  // Brown
+		{74, 35, 90, 255},  // Purple
 	}
 
 	scale := 3
@@ -757,21 +776,29 @@ func (s *Server) handleVerifyCode(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if r.Method == http.MethodGet {
-		// Ensure session exists
+		// Ensure the session exists, even when the caller presents a stale
+		// cookie; the code is stored on this session and checked on login.
+		newSession := false
+		s.mu.Lock()
 		if sessionID == "" {
 			sessionID = fmt.Sprintf("mock-vc-sess-%d", time.Now().UnixNano())
+			newSession = true
+		}
+		if sess, ok := s.sessions[sessionID]; !ok || sess == nil {
+			s.sessions[sessionID] = &Session{
+				ID:        sessionID,
+				CreatedAt: time.Now(),
+			}
+			newSession = true
+		}
+		s.mu.Unlock()
+		if newSession {
 			http.SetCookie(w, &http.Cookie{
 				Name:     "VSG_SESSIONID",
 				Value:    sessionID,
 				Path:     "/",
 				HttpOnly: true,
 			})
-			s.mu.Lock()
-			s.sessions[sessionID] = &Session{
-				ID:        sessionID,
-				CreatedAt: time.Now(),
-			}
-			s.mu.Unlock()
 		}
 
 		code := s.generateNewVerifyCode(sessionID)
@@ -794,7 +821,7 @@ func (s *Server) handleVerifyCode(w http.ResponseWriter, r *http.Request) {
 	expected := s.getExpectedVerifyCode(sessionID)
 
 	w.Header().Set("Content-Type", "text/xml; charset=utf-8")
-	if expected != "" && !strings.EqualFold(strings.TrimSpace(vc), expected) {
+	if expected == "" || !strings.EqualFold(strings.TrimSpace(vc), expected) {
 		log.Printf("[MockServer] POST /vpn/user/auth/verifycode MISMATCH: got %q, expected %q", vc, expected)
 		s.generateNewVerifyCode(sessionID)
 		w.Write([]byte(`<?xml version="1.0" encoding="utf-8"?>

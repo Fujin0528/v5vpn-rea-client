@@ -7,10 +7,15 @@
 ## 目录结构
 
 ```
+cmd/
+  mock-v5vpn/   V5VPN 网关模拟服务入口
+  mock-atrust/  aTrust 网关模拟服务入口
+  e2e-v5vpn/    V5VPN 客户端协议对撞工具
+  e2e-atrust/   aTrust 客户端协议对撞工具
 test/
   mock/
-    atrust/     aTrust 零信任网关 mock（package main，独立可执行）
-    v5vpn/      V5VPN / 网御网关 mock（package mockserver，可被测试 import）
+    atrust/     aTrust 零信任网关 mock 实现
+    v5vpn/      V5VPN / 网御网关 mock 实现（package mockserver，可被测试 import）
   e2e_ui_test.js  浏览器端到端测试（puppeteer-core + 本机 Edge）
   run.sh          总入口：go 集成测试 + UI 端到端
   results/        运行期产物（报告、截图、日志），已 gitignore
@@ -87,9 +92,7 @@ ATRUST_MOCK_URL=https://127.0.0.1:8443 go test ./internal/atrust/ -run TestE2EAg
 哪一边对，要靠真实网关仲裁（见 `.backup/atrust/ATRUST_PROTOCOL_ANALYSIS.md` 与
 项目记忆里的 encode 记录）。在仲裁之前保持 mock 原样，失败就是**有用的信号**。
 
-同样因为这条分叉，`mock/v5vpn/client_integration_test.go`（依赖分支 7 独有的
-`AuthPasswordWithCert` 双因素 API）用 `//go:build v5twofactor` 标签隔离，
-不参与默认编译。
+在双分支合并后，`mock/v5vpn/client_integration_test.go` 已正式纳入日常测试执行，默认验证两步串行双因素认证与内网资源拉取。
 
 ## 写新测试时的位置约定
 

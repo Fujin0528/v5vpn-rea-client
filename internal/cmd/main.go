@@ -68,6 +68,7 @@ func main() {
 	// -pwd-cert switches -cert from certificate-only to the two-factor
 	// "password + certificate" login, which also needs -user and -pwd.
 	pwdCertFlag := flag.Bool("pwd-cert", false, "Combine -cert with -user/-pwd: gateway requires both factors")
+	verifyCodeFlag := flag.String("code", "", "Verification code / captcha (if requested by gateway)")
 	listCertsFlag := flag.Bool("list-certs", false, "List installed certificates and exit")
 	importCertFlag := flag.String("import-cert", "", "Import a .p12/.pfx file into the local certificate store and exit")
 	certAliasFlag := flag.String("cert-alias", "", "Display alias used with -import-cert")
@@ -123,10 +124,10 @@ func main() {
 	// CLI Connect Mode
 	if *cliMode && *connectGW != "" {
 		if *certFlag != "" {
-			runCLIConnectWithCert(vpnService, *connectGW, *certFlag, *certPwdFlag, *certTypeFlag, *userFlag, *pwdFlag, *pwdCertFlag)
+			runCLIConnectWithCert(vpnService, *connectGW, *certFlag, *certPwdFlag, *certTypeFlag, *userFlag, *pwdFlag, *verifyCodeFlag, *pwdCertFlag)
 			return
 		}
-		runCLIConnect(vpnService, *connectGW, *userFlag, *pwdFlag, *newPwdFlag, *forceFlag)
+		runCLIConnect(vpnService, *connectGW, *userFlag, *pwdFlag, *newPwdFlag, *verifyCodeFlag, *forceFlag)
 		return
 	}
 
@@ -1034,20 +1035,20 @@ type cliConnector interface {
 // connectWithOptionalPasswordChange handles password expiry checks and optional password changes.
 // If force is true, it proceeds to change password directly.
 // If force is false and the current password is valid (unexpired), it prompts for confirmation.
-func connectWithOptionalPasswordChange(c cliConnector, gwName, user, pwd, newPwd string, force bool) (map[string]any, bool, error) {
+func connectWithOptionalPasswordChange(c cliConnector, gwName, user, pwd, newPwd, verifyCode string, force bool) (map[string]any, bool, error) {
 	if newPwd == "" {
-		res, err := c.Login(gwName, user, pwd, "", true, false)
+		res, err := c.Login(gwName, user, pwd, verifyCode, true, false)
 		return res, false, err
 	}
 
 	if force {
-		res, err := c.ChangePassword(gwName, user, pwd, newPwd, "", true, false)
+		res, err := c.ChangePassword(gwName, user, pwd, newPwd, verifyCode, true, false)
 		return res, err == nil, err
 	}
 
 	// Probe with remember disabled: the old password may be wrong, and only the
 	// post-change login should persist a password.
-	res, err := c.Login(gwName, user, pwd, "", false, false)
+	res, err := c.Login(gwName, user, pwd, verifyCode, false, false)
 	if err == nil {
 		fmt.Print("\n网关检测提示: 当前密码有效（未过期）。\n是否确认修改密码？[y/N]: ")
 		var answer string
@@ -1056,7 +1057,7 @@ func connectWithOptionalPasswordChange(c cliConnector, gwName, user, pwd, newPwd
 		if answer == "y" || answer == "yes" {
 			fmt.Println("用户确认修改密码，正在更新密码...")
 			_, _ = c.Logout()
-			res, err = c.ChangePassword(gwName, user, pwd, newPwd, "", true, false)
+			res, err = c.ChangePassword(gwName, user, pwd, newPwd, verifyCode, true, false)
 			return res, err == nil, err
 		}
 		fmt.Println("已取消修改密码，使用当前密码继续连接。")
@@ -1066,11 +1067,11 @@ func connectWithOptionalPasswordChange(c cliConnector, gwName, user, pwd, newPwd
 		return nil, false, err
 	}
 
-	res, err = c.ChangePassword(gwName, user, pwd, newPwd, "", true, false)
+	res, err = c.ChangePassword(gwName, user, pwd, newPwd, verifyCode, true, false)
 	return res, err == nil, err
 }
 
-func runCLIConnect(svc *service.VPNService, gwName, user, pwd, newPwd string, force bool) {
+func runCLIConnect(svc *service.VPNService, gwName, user, pwd, newPwd, verifyCode string, force bool) {
 	gw := svc.Config.FindGateway(gwName)
 	if gw == nil {
 		fmt.Fprintf(os.Stderr, "未找到网关: %s\n", gwName)
@@ -1090,7 +1091,7 @@ func runCLIConnect(svc *service.VPNService, gwName, user, pwd, newPwd string, fo
 	}
 
 	fmt.Printf("正在连接网关 %s (%s:%d), 用户: %s...\n", gw.Name, gw.IP, gw.Port, user)
-	res, passwordChanged, err := connectWithOptionalPasswordChange(svc, gw.Name, user, pwd, newPwd, force)
+	res, passwordChanged, err := connectWithOptionalPasswordChange(svc, gw.Name, user, pwd, newPwd, verifyCode, force)
 	if err == nil && newPwd != "" && !passwordChanged && force {
 		fmt.Fprintln(os.Stderr, "网关未提示口令过期，-new-pwd 未生效；已使用当前密码连接。")
 	}
@@ -1150,7 +1151,7 @@ func runImportCertificate(svc *service.VPNService, path, alias, password string)
 // runCLIConnectWithCert authenticates with a certificate. -cert either names an
 // imported certificate (ID or alias) or points at a .p12/.pfx file; the latter
 // is loaded in place and never copied into the store.
-func runCLIConnectWithCert(svc *service.VPNService, gwName, certRef, certPwd string, certType int, user, pwd string, withPassword bool) {
+func runCLIConnectWithCert(svc *service.VPNService, gwName, certRef, certPwd string, certType int, user, pwd, verifyCode string, withPassword bool) {
 	gw := svc.Config.FindGateway(gwName)
 	if gw == nil {
 		fmt.Fprintf(os.Stderr, "未找到网关: %s\n", gwName)
@@ -1184,7 +1185,7 @@ func runCLIConnectWithCert(svc *service.VPNService, gwName, certRef, certPwd str
 
 	if withPassword {
 		fmt.Printf("正在连接网关 %s (%s:%d), 证书: %s, 用户: %s...\n", gw.Name, gw.IP, gw.Port, name, user)
-		res, err := svc.LoginWithPasswordAndCert(gw.Name, user, pwd, "", certType, certID, false, false)
+		res, err := svc.LoginWithPasswordAndCert(gw.Name, user, pwd, verifyCode, certType, certID, false, false)
 		finishCLIConnect(res, err)
 		return
 	}
@@ -1192,7 +1193,7 @@ func runCLIConnectWithCert(svc *service.VPNService, gwName, certRef, certPwd str
 	if user != "" || pwd != "" {
 		fmt.Fprintln(os.Stderr, "提示: 已指定证书登录，-user/-pwd 将被忽略。需口令+证书双因子时请加 -pwd-cert。")
 	}
-	res, err := svc.LoginWithCert(gw.Name, certType, certID, "", false)
+	res, err := svc.LoginWithCert(gw.Name, certType, certID, verifyCode, false)
 	finishCLIConnect(res, err)
 }
 

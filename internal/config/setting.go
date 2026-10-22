@@ -88,20 +88,20 @@ type UserAccount struct {
 
 // GatewayProfile represents a VPN Gateway configuration
 type GatewayProfile struct {
-	ID             string        `json:"id"`
-	Name           string        `json:"name"`
-	IP             string        `json:"ip"`
-	Port           int           `json:"port"`
-	Algo           int           `json:"algo"` // 0: Standard, 1: 国密
-	LastUserName   string        `json:"lastUserName"`
-	AuthType       int           `json:"authType"`      // 0: password, 1: certificate, 2: anonymous
-	CertType       int           `json:"certType"`      // 0: file, 2: USB key (1 was the system store, removed)
-	CertAutoLogin  bool          `json:"certAutoLogin"` // remember the certificate login
+	ID            string `json:"id"`
+	Name          string `json:"name"`
+	IP            string `json:"ip"`
+	Port          int    `json:"port"`
+	Algo          int    `json:"algo"` // 0: Standard, 1: 国密
+	LastUserName  string `json:"lastUserName"`
+	AuthType      int    `json:"authType"`      // 0: password, 1: certificate, 2: anonymous
+	CertType      int    `json:"certType"`      // 0: file, 2: USB key (1 was the system store, removed)
+	CertAutoLogin bool   `json:"certAutoLogin"` // remember the certificate login
 	// CertWithPassword selects the third login method: the gateway demands a
 	// password and a client certificate at the same time.
 	CertWithPassword bool          `json:"certWithPassword"`
-	SelectedCertID string        `json:"selectedCertId"`
-	SavedAccounts  []UserAccount `json:"savedAccounts"`
+	SelectedCertID   string        `json:"selectedCertId"`
+	SavedAccounts    []UserAccount `json:"savedAccounts"`
 
 	// Protocol selects which backend serves this gateway.
 	//
@@ -254,19 +254,19 @@ func LoadSettingXML(path string) (*AppConfig, error) {
 		}
 
 		profile := GatewayProfile{
-			ID:             id,
-			Name:           name,
-			IP:             gw.IP,
-			Port:           gw.Port,
-			Algo:           gw.Algo,
-			Protocol:       gw.Protocol,
-			LastUserName:   gw.User.LastUserName,
-			AuthType:       gw.User.AuthType,
-			CertType:       gw.User.CertType,
-			CertAutoLogin:  gw.User.CertAutoLogin == 1,
+			ID:               id,
+			Name:             name,
+			IP:               gw.IP,
+			Port:             gw.Port,
+			Algo:             gw.Algo,
+			Protocol:         gw.Protocol,
+			LastUserName:     gw.User.LastUserName,
+			AuthType:         gw.User.AuthType,
+			CertType:         gw.User.CertType,
+			CertAutoLogin:    gw.User.CertAutoLogin == 1,
 			CertWithPassword: gw.User.CertWithPassword == 1,
-			SelectedCertID: gw.User.CertID,
-			SavedAccounts:  make([]UserAccount, 0, len(gw.User.Users)),
+			SelectedCertID:   gw.User.CertID,
+			SavedAccounts:    make([]UserAccount, 0, len(gw.User.Users)),
 		}
 
 		for _, u := range gw.User.Users {
@@ -330,13 +330,13 @@ func (cfg *AppConfig) saveToPath(targetPath string) error {
 			Algo:     gw.Algo,
 			Protocol: gw.Protocol,
 			User: UserList{
-				LastUserName:  gw.LastUserName,
-				AuthType:      gw.AuthType,
-				CertType:      gw.CertType,
-				CertAutoLogin: boolToInt(gw.CertAutoLogin),
+				LastUserName:     gw.LastUserName,
+				AuthType:         gw.AuthType,
+				CertType:         gw.CertType,
+				CertAutoLogin:    boolToInt(gw.CertAutoLogin),
 				CertWithPassword: boolToInt(gw.CertWithPassword),
-				CertID:        gw.SelectedCertID,
-				Users:         make([]UserXML, 0, len(gw.SavedAccounts)),
+				CertID:           gw.SelectedCertID,
+				Users:            make([]UserXML, 0, len(gw.SavedAccounts)),
 			},
 		}
 

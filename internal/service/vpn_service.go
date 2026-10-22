@@ -32,6 +32,36 @@ type passwordChallenge struct {
 	cert     *tls.Certificate
 }
 
+// PasswordChangedError reports that the gateway accepted the new password but
+// the automatic sign-in that follows failed. The UI must move the form back to
+// the login state (with the new password) instead of asking the user to retry
+// the change with the now-invalid old password.
+type PasswordChangedError struct {
+	Err error
+}
+
+func (e *PasswordChangedError) Error() string { return e.Err.Error() }
+
+func (e *PasswordChangedError) Unwrap() error { return e.Err }
+
+// PasswordChanged reports whether err means the password was already updated.
+func PasswordChanged(err error) bool {
+	var changed *PasswordChangedError
+	return errors.As(err, &changed)
+}
+
+// preAuthClient is the HTTP client that fetched a captcha image. The gateway
+// binds the code to the VSG_SESSIONID cookie issued by that response, so the
+// login that submits the code must reuse this exact client. It is deliberately
+// kept out of Client, which is the session-of-record for the connected tunnel.
+type preAuthClient struct {
+	client    *protocol.Client
+	createdAt time.Time
+}
+
+// pendingClientTTL bounds how long a fetched captcha session may be reused.
+const pendingClientTTL = 10 * time.Minute
+
 // VPNService is the backend service exposed to the MyGo frontend
 type VPNService struct {
 	Config            *config.AppConfig
@@ -48,6 +78,7 @@ type VPNService struct {
 	appVersion        string
 	authType          string
 	passwordChallenge *passwordChallenge
+	pendingClients    map[string]*preAuthClient
 	mu                sync.Mutex
 	logMu             sync.Mutex
 	onLog             func(string)
@@ -343,6 +374,7 @@ func (s *VPNService) DeleteGateway(id string) error {
 
 // Login performs authentication and establishes VPN tunnel
 func (s *VPNService) Login(gwIdentifier, username, password, verifycode string, remember, auto bool) (map[string]any, error) {
+	var preAuth *protocol.Client
 	s.mu.Lock()
 	if s.Status == "Connecting" || s.Status == "Connected" {
 		s.cleanupStaleSessionLocked()
@@ -360,6 +392,9 @@ func (s *VPNService) Login(gwIdentifier, username, password, verifycode string, 
 	s.Config.LastUseGateway = gw.Name
 	// A fresh authentication attempt supersedes any previous challenge.
 	s.passwordChallenge = nil
+	// The captcha code is bound to the cookie jar of the client that fetched
+	// the image; reuse it so the VSG_SESSIONID travels with this login.
+	preAuth = s.pendingClientLocked(gw)
 
 	if remember {
 		s.storeAccountLocked(gw, username, password, remember, auto)
@@ -370,7 +405,10 @@ func (s *VPNService) Login(gwIdentifier, username, password, verifycode string, 
 	s.setStatus("Connecting", fmt.Sprintf("Connecting to %s (%s:%d)...", gwName, gwIP, gwPort))
 	s.Log("INFO", "Initiating login sequence to %s (%s:%d)...", gwName, gwIP, gwPort)
 
-	client := protocol.NewClient(gwIP, gwPort, gwAlgo, s.Log)
+	client := preAuth
+	if client == nil {
+		client = protocol.NewClient(gwIP, gwPort, gwAlgo, s.Log)
+	}
 
 	// Step 1: Handshake
 	_, err := client.Handshake()
@@ -450,6 +488,7 @@ func (s *VPNService) LoginWithPasswordAndCertExternal(gwIdentifier, username, pa
 // when non-nil, receives the resolved gateway ID after a successful
 // authentication.
 func (s *VPNService) loginWithPasswordCert(gwIdentifier, username, password, verifycode string, cert *tls.Certificate, afterAuth func(gwID string), remember, auto bool) (map[string]any, error) {
+	var preAuth *protocol.Client
 	s.mu.Lock()
 	if s.Status == "Connecting" || s.Status == "Connected" {
 		s.cleanupStaleSessionLocked()
@@ -462,6 +501,7 @@ func (s *VPNService) loginWithPasswordCert(gwIdentifier, username, password, ver
 	gwID, gwName, gwIP, gwPort, gwAlgo := gw.ID, gw.Name, gw.IP, gw.Port, gw.Algo
 	s.Config.LastUseGateway = gw.Name
 	s.passwordChallenge = nil
+	preAuth = s.pendingClientLocked(gw)
 	if remember {
 		s.storeAccountLocked(gw, username, password, remember, auto)
 		_ = s.Config.SaveSettingXML("")
@@ -472,7 +512,10 @@ func (s *VPNService) loginWithPasswordCert(gwIdentifier, username, password, ver
 	s.Log("INFO", "Initiating password + certificate login to %s (%s:%d), user=%s, cert=%s",
 		gwName, gwIP, gwPort, username, certDisplayName(cert, "certificate"))
 
-	client := protocol.NewClient(gwIP, gwPort, gwAlgo, s.Log)
+	client := preAuth
+	if client == nil {
+		client = protocol.NewClient(gwIP, gwPort, gwAlgo, s.Log)
+	}
 
 	// No certificate is attached up front: the original client submits the
 	// password over a plain TLS connection first and only presents the
@@ -517,6 +560,9 @@ const (
 func (s *VPNService) enterConnected(client *protocol.Client, username string, cert *tls.Certificate, authType string) map[string]any {
 	s.mu.Lock()
 	s.Client = client
+	// The pre-auth client has become the session of record; drop the pending
+	// reference so it cannot be picked up by another login.
+	s.clearPendingClientLocked(client)
 	s.Resources = nil
 	s.resourceState = ResourceLoading
 	s.resourceError = ""
@@ -766,6 +812,7 @@ func (s *VPNService) LoginWithCertExternal(gwIdentifier, certPath, certPassword 
 // an already loaded certificate. afterAuth, when non-nil, receives the resolved
 // gateway ID after a successful authentication.
 func (s *VPNService) loginWithLoadedCert(gwIdentifier string, cert *tls.Certificate, verifycode string, afterAuth func(gwID string)) (map[string]any, error) {
+	var preAuth *protocol.Client
 	s.mu.Lock()
 	if s.Status == "Connecting" || s.Status == "Connected" {
 		s.cleanupStaleSessionLocked()
@@ -778,13 +825,17 @@ func (s *VPNService) loginWithLoadedCert(gwIdentifier string, cert *tls.Certific
 	gwID, gwName, gwIP, gwPort, gwAlgo := gw.ID, gw.Name, gw.IP, gw.Port, gw.Algo
 	s.Config.LastUseGateway = gw.Name
 	s.passwordChallenge = nil
+	preAuth = s.pendingClientLocked(gw)
 	s.mu.Unlock()
 
 	name := certDisplayName(cert, "certificate")
 	s.setStatus("Connecting", fmt.Sprintf("Certificate login to %s (%s:%d)...", gwName, gwIP, gwPort))
 	s.Log("INFO", "Initiating certificate login to %s (%s:%d), cert=%s", gwName, gwIP, gwPort, name)
 
-	client := protocol.NewClient(gwIP, gwPort, gwAlgo, s.Log)
+	client := preAuth
+	if client == nil {
+		client = protocol.NewClient(gwIP, gwPort, gwAlgo, s.Log)
+	}
 	client.SetTLSClientCertificate(cert)
 
 	if _, err := client.Handshake(); err != nil {
@@ -975,7 +1026,12 @@ func (s *VPNService) ChangePassword(gwIdentifier, username, password, newPasswor
 	// follow-up sign-in runs the full password + certificate flow again; a
 	// plain password login would be rejected right after the change.
 	if challengeCert != nil {
-		return s.loginWithPasswordCert(gwIdentifier, username, newPassword, verifycode, challengeCert, nil, remember, auto)
+		res, loginErr := s.loginWithPasswordCert(gwIdentifier, username, newPassword, verifycode, challengeCert, nil, remember, auto)
+		if loginErr != nil {
+			s.Log("WARN", "Password changed, but the follow-up two-factor login failed: %v", loginErr)
+			return nil, &PasswordChangedError{Err: loginErr}
+		}
+		return res, nil
 	}
 	s.mu.Lock()
 	gwProfile := s.Config.FindGateway(gwIdentifier)
@@ -984,7 +1040,12 @@ func (s *VPNService) ChangePassword(gwIdentifier, username, password, newPasswor
 	if twoFactor {
 		s.Log("WARN", "网关要求口令 + 证书双因子，但未找到上次使用的证书，将以纯口令方式登录")
 	}
-	return s.Login(gwIdentifier, username, newPassword, verifycode, remember, auto)
+	res, loginErr := s.Login(gwIdentifier, username, newPassword, verifycode, remember, auto)
+	if loginErr != nil {
+		s.Log("WARN", "Password changed, but the follow-up login failed: %v", loginErr)
+		return nil, &PasswordChangedError{Err: loginErr}
+	}
+	return res, nil
 }
 
 // AuthErrorCode returns the stable machine-readable code for a gateway
@@ -1078,6 +1139,7 @@ func (s *VPNService) Logout() (bool, error) {
 	s.ProxyMgr = nil
 	s.Client = nil
 	s.passwordChallenge = nil
+	s.pendingClients = nil
 	s.Status = "Disconnected"
 	s.StatusDetail = "Disconnected"
 	s.Resources = nil
@@ -1150,8 +1212,61 @@ func (s *VPNService) ClearLogs() bool {
 	return true
 }
 
+// pendingClientKey identifies one gateway endpoint. Editing the profile changes
+// the key, so an image fetched before the edit can never be used for the new
+// target.
+func pendingClientKey(gw *config.GatewayProfile) string {
+	return fmt.Sprintf("%s|%s|%d|%d", gw.ID, gw.IP, gw.Port, gw.Algo)
+}
+
+// pendingClientLocked returns the pre-auth client for gw without consuming it,
+// so a failed password/captcha attempt can reuse the same captcha session.
+// Caller holds s.mu.
+func (s *VPNService) pendingClientLocked(gw *config.GatewayProfile) *protocol.Client {
+	key := pendingClientKey(gw)
+	entry := s.pendingClients[key]
+	if entry == nil {
+		return nil
+	}
+	if time.Since(entry.createdAt) > pendingClientTTL {
+		delete(s.pendingClients, key)
+		return nil
+	}
+	return entry.client
+}
+
+// storePendingClientLocked records the client that fetched the captcha image.
+// Caller holds s.mu.
+func (s *VPNService) storePendingClientLocked(gw *config.GatewayProfile, client *protocol.Client) {
+	if s.pendingClients == nil {
+		s.pendingClients = make(map[string]*preAuthClient)
+	}
+	now := time.Now()
+	for key, entry := range s.pendingClients {
+		if now.Sub(entry.createdAt) > pendingClientTTL {
+			delete(s.pendingClients, key)
+		}
+	}
+	s.pendingClients[pendingClientKey(gw)] = &preAuthClient{client: client, createdAt: now}
+}
+
+// clearPendingClientLocked drops the pre-auth client once a login succeeds.
+// Caller holds s.mu.
+func (s *VPNService) clearPendingClientLocked(client *protocol.Client) {
+	for key, entry := range s.pendingClients {
+		if entry.client == client {
+			delete(s.pendingClients, key)
+		}
+	}
+}
+
 // GetVerifyCodeImage fetches the graphical captcha image from the target gateway
 // and returns a data URL format string (e.g. data:image/png;base64,...).
+//
+// The client that fetched the image is kept as a pre-auth client: the code is
+// bound to the VSG_SESSIONID cookie issued by this response, and the login that
+// submits it must use the same cookie jar. It is never stored in s.Client,
+// which belongs to the connected session.
 func (s *VPNService) GetVerifyCodeImage(gwIdentifier string) (string, error) {
 	s.mu.Lock()
 	gw := s.Config.FindGateway(gwIdentifier)
@@ -1159,11 +1274,10 @@ func (s *VPNService) GetVerifyCodeImage(gwIdentifier string) (string, error) {
 		s.mu.Unlock()
 		return "", fmt.Errorf("未找到网关配置: %s", gwIdentifier)
 	}
-
-	client := s.Client
-	if client == nil || client.GatewayIP != gw.IP || client.GatewayPort != gw.Port {
-		client = protocol.NewClient(gw.IP, gw.Port, gw.Algo, s.Log)
-		s.Client = client
+	gwCopy := *gw
+	client := s.pendingClientLocked(&gwCopy)
+	if client == nil {
+		client = protocol.NewClient(gwCopy.IP, gwCopy.Port, gwCopy.Algo, s.Log)
 	}
 	s.mu.Unlock()
 
@@ -1171,6 +1285,10 @@ func (s *VPNService) GetVerifyCodeImage(gwIdentifier string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+
+	s.mu.Lock()
+	s.storePendingClientLocked(&gwCopy, client)
+	s.mu.Unlock()
 
 	b64 := base64.StdEncoding.EncodeToString(data)
 	return fmt.Sprintf("data:%s;base64,%s", contentType, b64), nil
