@@ -22,6 +22,7 @@ import (
 	"math/big"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -31,11 +32,15 @@ type fakeStreamGateway struct {
 	ln     net.Listener
 	target string // 期望收到的目标 host:port
 
-	// 收到的东西，供断言
+	// serve() 在独立 goroutine 里跑，以下字段全部经 mu 读写。
+	mu          sync.Mutex
 	gotAuthJSON string
 	gotTarget   []byte
 	gotAppData  [][]byte
 	closedWrite bool
+
+	frameCh chan struct{} // 每收到一个数据帧发一次信号
+	closeCh chan struct{} // 读到关闭帧后 close
 }
 
 // startFakeStreamGateway 起一个 TLS 监听，返回地址。
@@ -48,13 +53,71 @@ func startFakeStreamGateway(t *testing.T, target string) *fakeStreamGateway {
 		t.Fatalf("启动假网关失败: %v", err)
 	}
 
-	g := &fakeStreamGateway{ln: ln, target: target}
+	g := &fakeStreamGateway{
+		ln:      ln,
+		target:  target,
+		frameCh: make(chan struct{}, 32),
+		closeCh: make(chan struct{}),
+	}
 	go g.serve()
 	t.Cleanup(func() { _ = ln.Close() })
 	return g
 }
 
 func (g *fakeStreamGateway) addr() string { return g.ln.Addr().String() }
+
+// authJSON 返回收到的认证 JSON（加锁拷贝）。
+func (g *fakeStreamGateway) authJSON() string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.gotAuthJSON
+}
+
+// targetFrame 返回收到的目标地址帧（加锁拷贝）。
+func (g *fakeStreamGateway) targetFrame() []byte {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return append([]byte(nil), g.gotTarget...)
+}
+
+// appFrames 返回已收到的应用数据帧（加锁深拷贝）。
+func (g *fakeStreamGateway) appFrames() [][]byte {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	out := make([][]byte, len(g.gotAppData))
+	for i, f := range g.gotAppData {
+		out[i] = append([]byte(nil), f...)
+	}
+	return out
+}
+
+// waitFrames 等到累计收到 n 个数据帧或超时。
+func (g *fakeStreamGateway) waitFrames(n int, timeout time.Duration) bool {
+	deadline := time.After(timeout)
+	for {
+		g.mu.Lock()
+		got := len(g.gotAppData)
+		g.mu.Unlock()
+		if got >= n {
+			return true
+		}
+		select {
+		case <-g.frameCh:
+		case <-deadline:
+			return false
+		}
+	}
+}
+
+// waitClosed 等到假网关读到关闭帧或超时。
+func (g *fakeStreamGateway) waitClosed(timeout time.Duration) bool {
+	select {
+	case <-g.closeCh:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
+}
 
 func (g *fakeStreamGateway) serve() {
 	conn, err := g.ln.Accept()
@@ -82,7 +145,9 @@ func (g *fakeStreamGateway) serve() {
 	if _, err := io.ReadFull(conn, auth); err != nil {
 		return
 	}
+	g.mu.Lock()
 	g.gotAuthJSON = string(auth)
+	g.mu.Unlock()
 
 	// 目标地址帧：05 01 01 <ATYP> ...
 	var tHead [4]byte
@@ -120,7 +185,9 @@ func (g *fakeStreamGateway) serve() {
 		return
 	}
 	target = append(target, portBuf[:]...)
+	g.mu.Lock()
 	g.gotTarget = target
+	g.mu.Unlock()
 
 	// 回应：05 81 53 00 <BE16> <json>
 	okJSON := []byte(`{"code":0,"data":{"deviceID":"FAKE"},"message":"OK"}`)
@@ -154,7 +221,10 @@ func (g *fakeStreamGateway) serve() {
 			if _, err := io.ReadFull(conn, tail[:]); err != nil {
 				return
 			}
+			g.mu.Lock()
 			g.closedWrite = true
+			g.mu.Unlock()
+			close(g.closeCh)
 			return
 		}
 		if hdr != [2]byte{0x01, 0x00} {
@@ -169,7 +239,13 @@ func (g *fakeStreamGateway) serve() {
 		if _, err := io.ReadFull(conn, payload); err != nil {
 			return
 		}
+		g.mu.Lock()
 		g.gotAppData = append(g.gotAppData, payload)
+		g.mu.Unlock()
+		select {
+		case g.frameCh <- struct{}{}:
+		default:
+		}
 
 		// 回显
 		echo := []byte{0x01, 0x00}
@@ -249,19 +325,20 @@ func TestDialTCPHandshake(t *testing.T) {
 		`"destAddr":"10.15.45.163:443"`,
 		`"process_trusted":"TRUSTED"`,
 	} {
-		if !strings.Contains(g.gotAuthJSON, want) {
-			t.Errorf("认证 JSON 缺少 %s\n实际: %s", want, g.gotAuthJSON)
+		if !strings.Contains(g.authJSON(), want) {
+			t.Errorf("认证 JSON 缺少 %s\n实际: %s", want, g.authJSON())
 		}
 	}
 
 	// 目标地址帧：05 01 01 01 0A 0F 2D A3 01 BB
 	wantTarget := []byte{0x05, 0x01, 0x01, 0x01, 10, 15, 45, 163, 0x01, 0xBB}
-	if len(g.gotTarget) != len(wantTarget) {
-		t.Fatalf("目标帧 = % X, want % X", g.gotTarget, wantTarget)
+	gotTarget := g.targetFrame()
+	if len(gotTarget) != len(wantTarget) {
+		t.Fatalf("目标帧 = % X, want % X", gotTarget, wantTarget)
 	}
 	for i := range wantTarget {
-		if g.gotTarget[i] != wantTarget[i] {
-			t.Fatalf("目标帧 = % X, want % X", g.gotTarget, wantTarget)
+		if gotTarget[i] != wantTarget[i] {
+			t.Fatalf("目标帧 = % X, want % X", gotTarget, wantTarget)
 		}
 	}
 
@@ -284,9 +361,7 @@ func TestDialTCPHandshake(t *testing.T) {
 	if err := conn.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	// 给假网关一点时间读到关闭帧
-	time.Sleep(100 * time.Millisecond)
-	if !g.closedWrite {
+	if !g.waitClosed(5 * time.Second) {
 		t.Error("关闭时没有发送 01 01 00 00 帧")
 	}
 }
@@ -379,17 +454,20 @@ func TestTCPConnWriteChunking(t *testing.T) {
 		t.Fatalf("写入失败: %v", err)
 	}
 
-	time.Sleep(200 * time.Millisecond)
+	if !g.waitFrames(2, 5*time.Second) {
+		t.Fatalf("等待 2 个数据帧超时（当前 %d 帧）", len(g.appFrames()))
+	}
 
-	if len(g.gotAppData) != 2 {
+	gotAppData := g.appFrames()
+	if len(gotAppData) != 2 {
 		t.Fatalf("收到 %d 个数据帧, want 2（长度分别为 %v）",
-			len(g.gotAppData), frameLens(g.gotAppData))
+			len(gotAppData), frameLens(gotAppData))
 	}
-	if len(g.gotAppData[0]) != 65535 {
-		t.Errorf("第一帧 = %d 字节, want 65535", len(g.gotAppData[0]))
+	if len(gotAppData[0]) != 65535 {
+		t.Errorf("第一帧 = %d 字节, want 65535", len(gotAppData[0]))
 	}
-	if len(g.gotAppData[1]) != 70000-65535 {
-		t.Errorf("第二帧 = %d 字节, want %d", len(g.gotAppData[1]), 70000-65535)
+	if len(gotAppData[1]) != 70000-65535 {
+		t.Errorf("第二帧 = %d 字节, want %d", len(gotAppData[1]), 70000-65535)
 	}
 }
 
