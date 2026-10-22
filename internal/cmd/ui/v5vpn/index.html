@@ -73,19 +73,6 @@
             </div>
           </div>
 
-          <!-- 验证码（网关需要时出现） -->
-          <div class="form-group" id="verifycode-group" style="display: none;">
-            <label for="verifycode-input">图形验证码：</label>
-            <div class="verifycode-container">
-              <input type="text" id="verifycode-input" class="form-control" placeholder="请输入验证码" maxlength="6" autocomplete="off">
-              <div class="verifycode-img-wrapper" id="verifycode-img-wrapper" title="看不清？点击换一张">
-                <img id="verifycode-img" src="" alt="验证码" style="display: none;">
-                <span id="verifycode-loading" class="verifycode-loading" style="display: none;">加载中...</span>
-              </div>
-              <button type="button" id="refresh-verifycode-btn" class="btn btn-secondary btn-sm refresh-vc-btn" title="点击刷新验证码">🔄</button>
-            </div>
-          </div>
-
           <!-- 口令 + 证书：先提交口令，网关要求后再经 /vpn/user/auth/cert 呈递证书（两步串行） -->
           <div class="form-group" id="pwd-cert-group" style="display: none;">
             <div class="label-row">
@@ -112,6 +99,19 @@
             <a href="javascript:void(0)" id="voluntary-change-pwd-link" class="voluntary-change-pwd-link" style="margin-left: auto; font-size: 13px; color: #3b82f6; text-decoration: none; cursor: pointer;">修改密码</a>
           </div>
           </div><!-- /password-panel -->
+
+          <!-- 验证码（网关需要时出现）。放在口令面板外面：证书登录会把整个口令面板隐藏，验证码仍要可见。 -->
+          <div class="form-group" id="verifycode-group" style="display: none;">
+            <label for="verifycode-input">图形验证码：</label>
+            <div class="verifycode-container">
+              <input type="text" id="verifycode-input" class="form-control" placeholder="请输入验证码" maxlength="6" autocomplete="off">
+              <div class="verifycode-img-wrapper" id="verifycode-img-wrapper" title="看不清？点击换一张">
+                <img id="verifycode-img" src="" alt="验证码" style="display: none;">
+                <span id="verifycode-loading" class="verifycode-loading" style="display: none;">加载中...</span>
+              </div>
+              <button type="button" id="refresh-verifycode-btn" class="btn btn-secondary btn-sm refresh-vc-btn" title="点击刷新验证码">🔄</button>
+            </div>
+          </div>
 
           <!-- 证书登录面板 -->
           <div id="cert-panel" style="display: none;">

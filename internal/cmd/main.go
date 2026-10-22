@@ -653,6 +653,12 @@ func newAPIRouter(uiFS fs.FS, vpnService *service.VPNService, atrustSvc *service
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+		// Same protocol guard as /api/login and /api/login-pwd-cert: without it a
+		// certificate login speaks V5VPN mutual TLS to an aTrust gateway.
+		if gw := vpnService.GetConfig().FindGateway(req.GWID); gw != nil && gw.IsATrust() {
+			writeATrustRoutingError(w, gw.Name, config.ProtocolATrust)
+			return
+		}
 		res, err := vpnService.LoginWithCert(req.GWID, req.Source, req.CertID, req.VerifyCode, req.Auto)
 		writeLoginResult(w, res, err)
 	})
@@ -1171,12 +1177,12 @@ func runCLIConnectWithCert(svc *service.VPNService, gwName, certRef, certPwd str
 	if info, err := os.Stat(certRef); err == nil && !info.IsDir() {
 		if withPassword {
 			fmt.Printf("正在连接网关 %s (%s:%d), 证书: %s, 用户: %s...\n", gw.Name, gw.IP, gw.Port, certRef, user)
-			res, err := svc.LoginWithPasswordAndCertExternal(gw.Name, user, pwd, certRef, certPwd)
+			res, err := svc.LoginWithPasswordAndCertExternal(gw.Name, user, pwd, certRef, certPwd, verifyCode)
 			finishCLIConnect(res, err)
 			return
 		}
 		fmt.Printf("正在连接网关 %s (%s:%d), 证书: %s...\n", gw.Name, gw.IP, gw.Port, certRef)
-		res, err := svc.LoginWithCertExternal(gw.Name, certRef, certPwd)
+		res, err := svc.LoginWithCertExternal(gw.Name, certRef, certPwd, verifyCode)
 		finishCLIConnect(res, err)
 		return
 	}

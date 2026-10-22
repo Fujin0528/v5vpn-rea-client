@@ -687,7 +687,13 @@
       if (certMsg) return certMsg;
     }
     const clean = cleanErrorMessage((err && err.message) || '未知错误');
-    return clean.startsWith('网关提示') ? clean : ('网关提示：' + clean);
+    // Only a gateway result code earns the 网关提示 prefix. A local failure
+    // (missing certificate directory, the request timing out) never reached the
+    // gateway, and labelling it as one sends the user looking in the wrong place.
+    if (err && err.code) {
+      return clean.startsWith('网关提示') ? clean : ('网关提示：' + clean);
+    }
+    return clean;
   }
 
   // friendlyCertError maps the backend's stable certificate codes to text.
@@ -1083,6 +1089,13 @@
     if (!currentGateway) {
       setAuthMode('password');
       return;
+    }
+    // certType 1 is the system certificate store, which this client no longer
+    // supports. Both login paths submit source 0, so leaving the selection in
+    // place would fail later as a plain "certificate not found".
+    if (currentGateway.certType === 1 && currentGateway.selectedCertId) {
+      showLoginAlert('此网关上次使用的是系统证书库中的证书，当前版本已不再支持系统证书库。请在「证书登录」中导入 .p12/.pfx 文件后重新选择。', 'info');
+      currentGateway.selectedCertId = '';
     }
     if (currentGateway.certWithPassword === true) {
       pwdCertId = currentGateway.selectedCertId || '';
