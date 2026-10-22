@@ -16,9 +16,10 @@ test/
   mock/
     atrust/     aTrust 零信任网关 mock 实现
     v5vpn/      V5VPN / 网御网关 mock 实现（package mockserver，可被测试 import）
-  e2e_ui_test.js  浏览器端到端测试（puppeteer-core + 本机 Edge）
-  run.sh          总入口：go 集成测试 + UI 端到端
-  results/        运行期产物（报告、截图、日志），已 gitignore
+  e2e_ui_test.js          自拉起生命周期的轻量 UI E2E（支持 atrust 与 v5vpn 场景）
+  e2e_v5vpn_multi_test.js V5VPN 7合1多重认证与异常流深度自动化测试（含2FA/单口令/证书/改密/图形验证码等）
+  run.sh                  总入口：go 集成测试 + UI 端到端
+  results/                运行期产物（报告、逐步截图、日志），已 gitignore
 ```
 
 两套 mock 的形态不同是有原因的，不是收拾不干净：
@@ -33,12 +34,20 @@ test/
 ## 跑测试
 
 ```bash
-./test/run.sh            # go 集成测试 + aTrust UI 端到端
-./test/run.sh go         # 只跑 Go（快，CI 用这个）
-./test/run.sh ui         # 只跑 aTrust UI
-./test/run.sh ui v5vpn   # 跑 v5vpn UI（见"已知问题"）
-./test/run.sh all        # 全部
+./test/run.sh                 # go 集成测试 + aTrust UI 端到端
+./test/run.sh go              # 只跑 Go（快，CI 用这个）
+./test/run.sh ui              # 只跑 aTrust UI
+./test/run.sh ui v5vpn        # 跑 v5vpn 基础 UI
+./test/run.sh v5vpn-multi     # 跑 V5VPN 7合1 全场景双因素/图形验证码/在线改密 E2E
+./test/run.sh all             # 全部
 ```
+
+`v5vpn-multi` 会自动生成并导入两张客户端测试证书，界面上按名字区分：
+
+- `单因素证书登录`：用于「证书登录」Tab 的纯证书免密认证；
+- `双因素证书`：用于「口令 + 证书」Tab 的双因素认证。
+
+证书文件生成在 `test/results/`（已 gitignore），口令均为 `123456`。
 
 UI 端到端**不需要提前启动任何进程**：脚本自己构建 mock 与客户端、分配随机端口、
 跑完即清理。它还需要本机装有 Edge 或 Chrome（可用 `EDGE_PATH` 环境变量指定）。
