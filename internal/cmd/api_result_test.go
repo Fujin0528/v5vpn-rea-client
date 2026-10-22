@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/hygkui/v5vpn-rea-client/internal/protocol"
+	"github.com/hygkui/v5vpn-rea-client/internal/service"
 )
 
 func TestWriteLoginResultAuthCodes(t *testing.T) {
@@ -63,5 +64,26 @@ func TestWriteLoginResultAuthCodes(t *testing.T) {
 				t.Fatal("missing error message")
 			}
 		})
+	}
+}
+
+func TestWriteLoginResultMarksPasswordChanged(t *testing.T) {
+	inner := &protocol.AuthError{Kind: protocol.AuthKindVerifyCode, Code: "0x80", Msg: "需要图形验证码"}
+	rec := httptest.NewRecorder()
+	writeLoginResult(rec, nil, &service.PasswordChangedError{Err: inner})
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusBadRequest)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("invalid JSON response: %v", err)
+	}
+	if payload["passwordChanged"] != true {
+		t.Fatalf("passwordChanged = %v, want true", payload["passwordChanged"])
+	}
+	if payload["code"] != "verify_code" {
+		t.Fatalf("code = %v, want verify_code", payload["code"])
 	}
 }

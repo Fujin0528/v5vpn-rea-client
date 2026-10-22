@@ -218,6 +218,7 @@
         if (!res.ok) {
           const error = new Error(data.error || '修改密码失败');
           error.code = data.code || '';
+          error.passwordChanged = data.passwordChanged === true;
           throw error;
         }
         return data;
@@ -762,7 +763,22 @@
       hidePasswordChangePanel();
       showConnectedView(res);
     } catch (err) {
-      showLoginAlert(err.message || '修改密码失败', 'error');
+      const baseMsg = friendlyLoginError(err);
+      if (err && err.passwordChanged) {
+        // The gateway accepted the new password; only the automatic sign-in
+        // failed. Move the form back to the login state with the new password
+        // so a captcha (or a plain retry) can finish the connection.
+        passwordInput.value = newPassword;
+        hidePasswordChangePanel();
+        if (err.code === 'verify_code') {
+          verifycodeInput.value = '';
+          showLoginAlert('密码已修改，但自动登录需要图形验证码：请重新输入验证码后点击连接。', 'error');
+        } else {
+          showLoginAlert('密码已修改，但自动登录未完成：' + baseMsg + ' 请使用新密码重新连接。', 'error');
+        }
+      } else {
+        showLoginAlert(baseMsg, 'error');
+      }
     } finally {
       changePasswordBtn.disabled = false;
       changePasswordBtn.textContent = '修改密码并连接';
@@ -806,6 +822,12 @@
   }
 
   // ==================== 口令 + 证书（双因子） ====================
+  // rememberedCertId returns the selection to restore: the in-memory choice
+  // first, then the gateway's last successful choice.
+  function rememberedCertId(preferred) {
+    return preferred || (currentGateway && currentGateway.selectedCertId) || '';
+  }
+
   // The two-factor panel lists certificates in a plain select: the gateway
   // needs one exact certificate, and unlike the certificate-only tab there is
   // no per-certificate metadata to show here.
@@ -823,10 +845,20 @@
       pwdCertId = '';
       return;
     }
-    if (!list.some(c => c.id === pwdCertId)) {
-      pwdCertId = list[0].id;
-    }
+    // A remembered certificate that is no longer in the store must not silently
+    // become another identity: clear the selection and ask the user to choose.
+    const remembered = rememberedCertId(pwdCertId);
+    const missing = remembered && !list.some(c => c.id === remembered);
+    pwdCertId = missing ? '' : (remembered || list[0].id);
+
     pwdCertSelect.innerHTML = '';
+    if (missing) {
+      const opt = document.createElement('option');
+      opt.value = '';
+      opt.textContent = '上次使用的证书不可用，请重新选择';
+      opt.selected = true;
+      pwdCertSelect.appendChild(opt);
+    }
     list.forEach(cert => {
       const opt = document.createElement('option');
       opt.value = cert.id;
@@ -898,12 +930,19 @@
       return;
     }
 
-    // Keep the selection stable across refreshes, else preselect the first.
-    if (!certs.some(c => c.id === selectedCertId)) {
-      selectedCertId = certs[0].id;
-    }
+    // A remembered certificate that is no longer in the store must not silently
+    // become another identity: clear the selection and let the user choose again.
+    const remembered = rememberedCertId(selectedCertId);
+    const missing = remembered && !certs.some(c => c.id === remembered);
+    selectedCertId = missing ? '' : (remembered || certs[0].id);
 
     certList.innerHTML = '';
+    if (missing) {
+      const notice = document.createElement('p');
+      notice.className = 'cert-empty';
+      notice.textContent = '上次使用的证书不可用，请重新选择';
+      certList.appendChild(notice);
+    }
     certs.forEach(cert => {
       const item = document.createElement('div');
       item.className = 'cert-item' + (cert.isExpired ? ' cert-item-expired' : '') +

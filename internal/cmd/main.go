@@ -981,9 +981,14 @@ func writeLoginResult(w http.ResponseWriter, res map[string]any, err error) {
 		if code == "password_expired" {
 			status = http.StatusConflict
 		}
-		payload := map[string]string{"error": err.Error()}
+		payload := map[string]any{"error": err.Error()}
 		if code != "" {
 			payload["code"] = code
+		}
+		// The password was accepted but the automatic sign-in failed; the UI
+		// must switch to the login state instead of retrying with the old one.
+		if service.PasswordChanged(err) {
+			payload["passwordChanged"] = true
 		}
 		w.WriteHeader(status)
 		_ = json.NewEncoder(w).Encode(payload)
