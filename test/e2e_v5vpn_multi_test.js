@@ -2,8 +2,8 @@ const puppeteer = require('puppeteer-core');
 const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
+const { findBrowser } = require('./lib/find-browser');
 
-const EDGE_PATH = 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe';
 const TARGET_URL = 'http://127.0.0.1:45678/v5vpn/';
 const MOCK_GATEWAY = {
   name: '网御星云测试网关(多场景)',
@@ -37,7 +37,8 @@ const TEST_CERTS = {
   }
 };
 
-const ARTIFACT_SCREENSHOTS_DIR = 'C:\\Users\\Administrator\\.gemini\\antigravity-cli\\brain\\0082d507-aeda-4641-9b43-2c96290f5b61\\screenshots';
+// 可选的额外截图归档目录（默认关闭；另一台机器用 ARTIFACT_SCREENSHOTS_DIR 指定）
+const ARTIFACT_SCREENSHOTS_DIR = process.env.ARTIFACT_SCREENSHOTS_DIR || SCREENSHOTS_DIR;
 
 // Ensure directories
 [RESULTS_DIR, SCREENSHOTS_DIR, ARTIFACT_SCREENSHOTS_DIR].forEach(dir => {
@@ -51,6 +52,14 @@ function log(msg) {
   const line = `[${ts}] ${msg}`;
   console.log(line);
   fs.appendFileSync(LOG_FILE, line + '\n');
+}
+
+// 可移植的清空并输入：Ctrl+A 只在 Windows 是全选，macOS 上光标留在末尾，
+// Backspace 会误删末字符、输入变成追加。直接用 evaluate 清值避开平台差异。
+async function clearAndType(page, selector, value) {
+  await page.focus(selector);
+  await page.$eval(selector, el => { el.value = ''; });
+  await page.type(selector, value);
 }
 
 async function setMockMode(mode) {
@@ -256,7 +265,8 @@ async function safeDisconnect(page) {
     return v && v.style.display !== 'none';
   });
   if (isConnected) {
-    await page.click('#disconnect-btn');
+    // 直接在元素上派发 click：头部轮询刷新会引起布局抖动，坐标点击可能落空。
+    await page.$eval('#disconnect-btn', el => el.click());
     await page.waitForFunction(() => {
       const v = document.getElementById('view-login');
       return v && v.style.display !== 'none';
@@ -265,9 +275,11 @@ async function safeDisconnect(page) {
 }
 
 async function run() {
-  log(`Launching Microsoft Edge: ${EDGE_PATH}`);
+  const browserPath = findBrowser();
+  if (!browserPath) throw new Error('未找到 Edge/Chrome；可用 EDGE_PATH 环境变量指定');
+  log(`使用浏览器: ${browserPath}`);
   const browser = await puppeteer.launch({
-    executablePath: EDGE_PATH,
+    executablePath: browserPath,
     headless: 'new',
     defaultViewport: { width: 1280, height: 880 },
     args: [
@@ -311,15 +323,9 @@ async function run() {
           await page.click('.auth-tab[data-mode="pwd-cert"]');
           await page.waitForSelector('#pwd-cert-group', { visible: true });
 
-          await page.focus('#username-input');
-          await page.keyboard.down('Control'); await page.keyboard.press('KeyA'); await page.keyboard.up('Control');
-          await page.keyboard.press('Backspace');
-          await page.type('#username-input', 'admin');
+          await clearAndType(page, '#username-input', 'admin');
 
-          await page.focus('#password-input');
-          await page.keyboard.down('Control'); await page.keyboard.press('KeyA'); await page.keyboard.up('Control');
-          await page.keyboard.press('Backspace');
-          await page.type('#password-input', 'admin123');
+          await clearAndType(page, '#password-input', 'admin123');
 
           await page.click('#pwd-cert-refresh-btn');
           await page.evaluate(() => new Promise(r => setTimeout(r, 400)));
@@ -391,15 +397,9 @@ async function run() {
         screenshotName: 'sc2_step1_password_panel.png',
         action: async () => {
           await page.click('.auth-tab[data-mode="password"]');
-          await page.focus('#username-input');
-          await page.keyboard.down('Control'); await page.keyboard.press('KeyA'); await page.keyboard.up('Control');
-          await page.keyboard.press('Backspace');
-          await page.type('#username-input', 'admin');
+          await clearAndType(page, '#username-input', 'admin');
 
-          await page.focus('#password-input');
-          await page.keyboard.down('Control'); await page.keyboard.press('KeyA'); await page.keyboard.up('Control');
-          await page.keyboard.press('Backspace');
-          await page.type('#password-input', 'admin123');
+          await clearAndType(page, '#password-input', 'admin123');
 
           const btnText = await page.$eval('#connect-btn-text', el => el.textContent.trim());
           return `口令面板就绪。连接按钮文字: "${btnText}"`;
@@ -516,15 +516,9 @@ async function run() {
         screenshotName: 'sc4_step1_bad_credentials_alert.png',
         action: async () => {
           await page.click('.auth-tab[data-mode="password"]');
-          await page.focus('#username-input');
-          await page.keyboard.down('Control'); await page.keyboard.press('KeyA'); await page.keyboard.up('Control');
-          await page.keyboard.press('Backspace');
-          await page.type('#username-input', 'admin');
+          await clearAndType(page, '#username-input', 'admin');
 
-          await page.focus('#password-input');
-          await page.keyboard.down('Control'); await page.keyboard.press('KeyA'); await page.keyboard.up('Control');
-          await page.keyboard.press('Backspace');
-          await page.type('#password-input', 'WrongPassword999');
+          await clearAndType(page, '#password-input', 'WrongPassword999');
 
           await page.click('#connect-btn');
           await page.waitForSelector('#login-alert', { visible: true, timeout: 8000 });
@@ -556,15 +550,9 @@ async function run() {
         screenshotName: 'sc5_step1_pwd_expired_challenge.png',
         action: async () => {
           await page.click('.auth-tab[data-mode="password"]');
-          await page.focus('#username-input');
-          await page.keyboard.down('Control'); await page.keyboard.press('KeyA'); await page.keyboard.up('Control');
-          await page.keyboard.press('Backspace');
-          await page.type('#username-input', 'admin');
+          await clearAndType(page, '#username-input', 'admin');
 
-          await page.focus('#password-input');
-          await page.keyboard.down('Control'); await page.keyboard.press('KeyA'); await page.keyboard.up('Control');
-          await page.keyboard.press('Backspace');
-          await page.type('#password-input', 'admin123');
+          await clearAndType(page, '#password-input', 'admin123');
 
           await page.click('#connect-btn');
           await page.waitForSelector('#password-change-panel', { visible: true, timeout: 8000 });
@@ -630,15 +618,9 @@ async function run() {
         screenshotName: 'sc6_step1_verifycode_prompt.png',
         action: async () => {
           await page.click('.auth-tab[data-mode="password"]');
-          await page.focus('#username-input');
-          await page.keyboard.down('Control'); await page.keyboard.press('KeyA'); await page.keyboard.up('Control');
-          await page.keyboard.press('Backspace');
-          await page.type('#username-input', 'admin');
+          await clearAndType(page, '#username-input', 'admin');
 
-          await page.focus('#password-input');
-          await page.keyboard.down('Control'); await page.keyboard.press('KeyA'); await page.keyboard.up('Control');
-          await page.keyboard.press('Backspace');
-          await page.type('#password-input', 'admin456'); // updated password
+          await clearAndType(page, '#password-input', 'admin456'); // updated password
 
           await page.click('#connect-btn');
           await page.waitForSelector('#verifycode-group', { visible: true, timeout: 8000 });
@@ -689,10 +671,7 @@ async function run() {
           }
 
           log(`  >> Entering active random verifycode: ${expectedCode}`);
-          await page.focus('#verifycode-input');
-          await page.keyboard.down('Control'); await page.keyboard.press('KeyA'); await page.keyboard.up('Control');
-          await page.keyboard.press('Backspace');
-          await page.type('#verifycode-input', expectedCode);
+          await clearAndType(page, '#verifycode-input', expectedCode);
 
           await page.click('#connect-btn');
           await page.waitForFunction(() => {

@@ -28,6 +28,7 @@ const fs = require('fs');
 const net = require('net');
 const os = require('os');
 const path = require('path');
+const { findBrowser } = require('./lib/find-browser');
 
 const REPO_ROOT = path.resolve(__dirname, '..');
 const TEST_DIR = __dirname;
@@ -316,20 +317,7 @@ function generateHtmlReport(meta) {
 // ---------------------------------------------------------------------------
 // 主流程
 // ---------------------------------------------------------------------------
-
-function findBrowser() {
-  const candidates = [
-    process.env.EDGE_PATH,
-    'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
-    'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
-    'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
-    'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
-    '/usr/bin/google-chrome',
-    '/usr/bin/chromium',
-  ].filter(Boolean);
-  for (const c of candidates) if (fs.existsSync(c)) return c;
-  return null;
-}
+// 浏览器探测在 lib/find-browser.js：跨平台候选列表，EDGE_PATH 优先。
 
 async function main() {
   const workDir = fs.mkdtempSync(path.join(os.tmpdir(), `e2e-${ARGS.scenario}-`));
@@ -649,7 +637,9 @@ async function runScenario(page) {
     desc: '点击断开，确认后端登出且界面平滑退回登录页。',
     screenshotName: '06-disconnected.png',
     action: async () => {
-      await page.click('#disconnect-btn');
+      // 直接在元素上派发 click：头部每秒轮询刷新会引起布局抖动，
+      // 坐标点击可能落空（偶发 Step 6 超时的根因）。
+      await page.$eval('#disconnect-btn', el => el.click());
       await page.waitForFunction(() => {
         const v = document.getElementById('view-login');
         return v && v.style.display !== 'none';
