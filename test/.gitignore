@@ -1,0 +1,7 @@
+# Ignore test execution results and generated artifacts
+results/
+node_modules/
+package-lock.json
+*.p12
+*.pfx
+*.log
