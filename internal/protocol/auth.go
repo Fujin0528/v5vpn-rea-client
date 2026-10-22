@@ -36,11 +36,14 @@ const (
 	codePasswordExpired = 0x100
 	// codeBadCredentials is a real username/password mismatch.
 	codeBadCredentials = 0x101
-	// codeDecryptFailed means the gateway could not parse the encrypted
-	// credentials (for example encode=1 was sent instead of encode=2). The
-	// original client still reports it as a credential error.
+	// codeDecryptFailed means the gateway could not decode the credential
+	// fields (for example a value was not valid Base64, or an encode mode the
+	// gateway does not expect). The original client still reports it as a
+	// credential error.
 	codeDecryptFailed = 0x8000001A
 	codeVerifyCode    = 0x66600011
+	codeVerifyCodeAlt = 0x80
+	codeVerifyCodeMismatch = 0x80000021
 
 	// Certificate authentication results.
 	codeCertVerifyFailed = 0x103 // TAG 259 证书验证失败
@@ -147,7 +150,7 @@ func classifyAuth(code, _ string) AuthKind {
 		return AuthKindPasswordExpired
 	case codeBadCredentials, codeDecryptFailed:
 		return AuthKindBadCredentials
-	case codeVerifyCode:
+	case codeVerifyCode, codeVerifyCodeAlt, codeVerifyCodeMismatch:
 		return AuthKindVerifyCode
 	case codeCertVerifyFailed, codeCertFailed:
 		return AuthKindCertInvalid
@@ -161,6 +164,57 @@ func classifyAuth(code, _ string) AuthKind {
 		return AuthKindCertBadSignature
 	default:
 		return AuthKindOther
+	}
+}
+
+// authStep is the factor a gateway asks for next. The masks mirror the portal
+// driver (jquery.sslvpn.js), which dispatches on the bits of each auth RESULT
+// code: the lowest set factor bit names the step the client must submit next.
+type authStep int
+
+const (
+	authStepUnknown authStep = iota
+	authStepFailure
+	authStepChallenge
+	authStepPassword
+	authStepCertificate
+	authStepToken
+	authStepSMC
+	authStepPasswordChange
+	authStepMachineInfo
+	authStepRule
+	authStepDone
+)
+
+// nextAuthStep decodes the next-factor mask of an auth result code. The
+// precedence follows the portal driver exactly, because the masks overlap:
+// 0x102, for instance, means "certificate" because 0x2 is tested before 0x180.
+func nextAuthStep(code string) authStep {
+	n, ok := parseResultCode(code)
+	if !ok {
+		return authStepUnknown
+	}
+	switch {
+	case n&0x80000000 != 0:
+		return authStepFailure
+	case n == 0x00010001:
+		return authStepChallenge
+	case n&0x1 != 0:
+		return authStepPassword
+	case n&0x2 != 0:
+		return authStepCertificate
+	case n&0x4 != 0:
+		return authStepToken
+	case n&0x8 != 0:
+		return authStepSMC
+	case n&0x180 != 0:
+		return authStepPasswordChange
+	case n&0x270 != 0:
+		return authStepMachineInfo
+	case n&0x30000000 != 0:
+		return authStepRule
+	default:
+		return authStepDone
 	}
 }
 
@@ -214,16 +268,45 @@ func isSuccessCode(code string) bool {
 }
 
 // passwordAuthBody is the v2.0 password login form. Values are already
-// AES-128-CBC base64 and must not be URL-escaped: escaping '=' in the
-// base64 tail makes the gateway decrypt garbage and return 0x8000001A.
+// standard Base64 (see base64AuthParam) and must not be URL-escaped: escaping
+// '=' in the base64 tail makes the gateway decode garbage and return
+// 0x8000001A.
 func passwordAuthBody(encUser, encPwd, verifycode string) string {
-	return fmt.Sprintf("username=%s&password=%s&encode=2&verifycode=%s", encUser, encPwd, verifycode)
+	return fmt.Sprintf("username=%s&password=%s&encode=1&verifycode=%s", encUser, encPwd, verifycode)
+}
+
+// base64AuthParam encodes one login field the way SecLogin.dll does for
+// encode=1. Its base64 routine (0x100240a0) is called with the CRLF wrap flag
+// on for both the username and the password: standard alphabet with '='
+// padding, a CRLF after every 76 output columns, and the final CRLF stripped
+// again — except that when the full 3-byte-group part is a nonzero multiple of
+// 76 columns (input length divisible by 57), the CRLF removed is the extra one
+// the original loop wrote past the end, so one stray trailing CRLF survives.
+// The gateway tolerates CRLF either way (the official client feeds it the same
+// bytes for longer inputs), but we reproduce the original exactly.
+func base64AuthParam(s string) string {
+	b64 := base64.StdEncoding.EncodeToString([]byte(s))
+	groups := len(s) / 3 * 4 // columns covering the full 3-byte groups
+	if groups < 76 {
+		return b64
+	}
+	var out strings.Builder
+	out.Grow(len(b64) + len(b64)/76*2 + 2)
+	for i := 0; i+76 <= groups; i += 76 {
+		out.WriteString(b64[i : i+76])
+		out.WriteString("\r\n")
+	}
+	if rest := groups % 76; rest != 0 || len(b64) > groups {
+		// The tail line: remaining group columns and/or the '=' padding.
+		out.WriteString(b64[groups-rest:])
+	}
+	return out.String()
 }
 
 // passwordChangeBody formats the request body for /vpn/user/auth/pwdchange.
-// Both passwords are standard Base64-encoded, and encode=1 indicates Base64 encoding.
+// The original client posts both passwords as UTF-8 plaintext: its format
+// string is "old_pwd=%s&new_pwd=%s", no encode parameter is sent, and the
+// function never calls the base64 helper.
 func passwordChangeBody(oldPassword, newPassword string) string {
-	b64Old := base64.StdEncoding.EncodeToString([]byte(oldPassword))
-	b64New := base64.StdEncoding.EncodeToString([]byte(newPassword))
-	return fmt.Sprintf("old_pwd=%s&new_pwd=%s&encode=1", b64Old, b64New)
+	return fmt.Sprintf("old_pwd=%s&new_pwd=%s", oldPassword, newPassword)
 }

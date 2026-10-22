@@ -31,6 +31,12 @@ REDACT_LOCAL.txt
 mygo-update.key
 mygo-update.pub
 
+# Test execution results
+/test/results/
+/test/node_modules/
+/.tmp-rea/
+/.tmp-search/
+
 # Test binary
 *.test
 

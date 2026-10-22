@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"os/exec"
@@ -21,9 +22,14 @@ import (
 // passwordChallenge retains the HTTP client that received a 0x100 login
 // challenge. /vpn/user/auth/pwdchange must reuse it so the VSG_SESSIONID
 // cookie issued by that response is sent with the change request.
+//
+// cert, when set, marks a two-factor login: the challenged client already has
+// the client certificate installed, and the sign-in that follows the password
+// change must present the same certificate again.
 type passwordChallenge struct {
 	client   *protocol.Client
 	username string
+	cert     *tls.Certificate
 }
 
 // VPNService is the backend service exposed to the MyGo frontend
@@ -40,6 +46,7 @@ type VPNService struct {
 	Logs              []string
 	OnStatusChange    func(string)
 	appVersion        string
+	authType          string
 	passwordChallenge *passwordChallenge
 	mu                sync.Mutex
 	logMu             sync.Mutex
@@ -282,10 +289,11 @@ func (s *VPNService) SaveGateway(gw config.GatewayProfile) error {
 			// The gateway editor only submits name/IP/port/algo, so an empty
 			// authentication block means "unchanged" and must not erase the
 			// certificate selection saved by a certificate login.
-			if gw.AuthType == 0 && gw.SelectedCertID == "" && gw.CertType == 0 && !gw.CertAutoLogin {
+			if gw.AuthType == 0 && gw.SelectedCertID == "" && gw.CertType == 0 && !gw.CertAutoLogin && !gw.CertWithPassword {
 				gw.AuthType = existing.AuthType
 				gw.CertType = existing.CertType
 				gw.CertAutoLogin = existing.CertAutoLogin
+				gw.CertWithPassword = existing.CertWithPassword
 				gw.SelectedCertID = existing.SelectedCertID
 			}
 			*existing = gw
@@ -359,10 +367,6 @@ func (s *VPNService) Login(gwIdentifier, username, password, verifycode string, 
 	}
 	s.mu.Unlock()
 
-	// Password login is now the gateway's mode of record; the certificate
-	// selection is kept for a one-click switch back.
-	s.rememberPasswordMode(gwName)
-
 	s.setStatus("Connecting", fmt.Sprintf("Connecting to %s (%s:%d)...", gwName, gwIP, gwPort))
 	s.Log("INFO", "Initiating login sequence to %s (%s:%d)...", gwName, gwIP, gwPort)
 
@@ -393,7 +397,109 @@ func (s *VPNService) Login(gwIdentifier, username, password, verifycode string, 
 		return nil, err
 	}
 
-	return s.enterConnected(client, username, nil), nil
+	// Password login is now the gateway's mode of record; the certificate
+	// selection is kept for a one-click switch back. Only a successful login
+	// flips the mode: a rejected attempt must not erase a two-factor setting.
+	s.rememberPasswordMode(gwName)
+
+	return s.enterConnected(client, username, nil, authTypePassword), nil
+}
+
+// authTypePassword / authTypeCertificate / authTypePasswordCertificate are the
+// values reported to the frontend in the login result.
+const (
+	authTypePassword            = "password"
+	authTypeCertificate         = "certificate"
+	authTypePasswordCertificate = "password+certificate"
+)
+
+// LoginWithPasswordAndCert performs the two-factor "password + certificate"
+// login: the password is posted to /vpn/user/auth/password, and when the
+// gateway's result code asks for the certificate factor, the certificate is
+// presented on /vpn/user/auth/cert over the same session — the two-step
+// order the original client uses. It mirrors Login, with the certificate
+// loaded from the store first.
+func (s *VPNService) LoginWithPasswordAndCert(gwIdentifier, username, password, verifycode string, source int, certID string, remember, auto bool) (map[string]any, error) {
+	store := s.certStore()
+	if store == nil {
+		return nil, fmt.Errorf("证书目录不可用")
+	}
+	cert, err := store.LoadTLS(certID, certstore.Source(source))
+	if err != nil {
+		s.setStatus("Error", fmt.Sprintf("加载证书失败: %v", err))
+		return nil, err
+	}
+	return s.loginWithPasswordCert(gwIdentifier, username, password, verifycode, cert, func(gwID string) {
+		s.persistPasswordCertSelection(gwID, source, certID)
+	}, remember, auto)
+}
+
+// LoginWithPasswordAndCertExternal is LoginWithPasswordAndCert for a
+// certificate file that lives outside the store (the CLI form). The file is
+// loaded in place and never copied; the two-factor choice is not persisted
+// because there is no store id to remember.
+func (s *VPNService) LoginWithPasswordAndCertExternal(gwIdentifier, username, password, certPath, certPassword string) (map[string]any, error) {
+	cert, err := certstore.LoadTLSFile(certPath, certPassword)
+	if err != nil {
+		return nil, err
+	}
+	return s.loginWithPasswordCert(gwIdentifier, username, password, "", cert, nil, false, false)
+}
+
+// loginWithPasswordCert runs the shared two-factor login sequence. afterAuth,
+// when non-nil, receives the resolved gateway ID after a successful
+// authentication.
+func (s *VPNService) loginWithPasswordCert(gwIdentifier, username, password, verifycode string, cert *tls.Certificate, afterAuth func(gwID string), remember, auto bool) (map[string]any, error) {
+	s.mu.Lock()
+	if s.Status == "Connecting" || s.Status == "Connected" {
+		s.cleanupStaleSessionLocked()
+	}
+	gw := s.Config.FindGateway(gwIdentifier)
+	if gw == nil {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("gateway %q not found", gwIdentifier)
+	}
+	gwID, gwName, gwIP, gwPort, gwAlgo := gw.ID, gw.Name, gw.IP, gw.Port, gw.Algo
+	s.Config.LastUseGateway = gw.Name
+	s.passwordChallenge = nil
+	if remember {
+		s.storeAccountLocked(gw, username, password, remember, auto)
+		_ = s.Config.SaveSettingXML("")
+	}
+	s.mu.Unlock()
+
+	s.setStatus("Connecting", fmt.Sprintf("Password + certificate login to %s (%s:%d)...", gwName, gwIP, gwPort))
+	s.Log("INFO", "Initiating password + certificate login to %s (%s:%d), user=%s, cert=%s",
+		gwName, gwIP, gwPort, username, certDisplayName(cert, "certificate"))
+
+	client := protocol.NewClient(gwIP, gwPort, gwAlgo, s.Log)
+
+	// No certificate is attached up front: the original client submits the
+	// password over a plain TLS connection first and only presents the
+	// certificate when the gateway asks for it (AuthPasswordWithCert installs
+	// it for the certificate step and keeps it for the tunnel).
+	if _, err := client.Handshake(); err != nil {
+		s.setStatus("Error", fmt.Sprintf("Handshake failed: %v", err))
+		return nil, err
+	}
+
+	if _, err := client.AuthPasswordWithCert(cert, username, password, verifycode); err != nil {
+		if protocol.IsPasswordExpired(err) {
+			// Keep the certificate with the challenge — the re-login that
+			// follows the password change runs the same two-step flow and
+			// needs it again.
+			s.mu.Lock()
+			s.passwordChallenge = &passwordChallenge{client: client, username: username, cert: cert}
+			s.mu.Unlock()
+		}
+		s.setStatus("Error", fmt.Sprintf("认证失败: %v", err))
+		return nil, err
+	}
+
+	if afterAuth != nil {
+		afterAuth(gwID)
+	}
+	return s.enterConnected(client, username, cert, authTypePasswordCertificate), nil
 }
 
 // ResourceLoadState is exposed to the UI while the portal resource list loads.
@@ -406,8 +512,9 @@ const (
 )
 
 // enterConnected publishes the connected state immediately after a successful
-// authentication and loads the resource list in the background.
-func (s *VPNService) enterConnected(client *protocol.Client, username string, cert *tls.Certificate) map[string]any {
+// authentication and loads the resource list in the background. authType names
+// the method that produced the session and is reported to the frontend.
+func (s *VPNService) enterConnected(client *protocol.Client, username string, cert *tls.Certificate, authType string) map[string]any {
 	s.mu.Lock()
 	s.Client = client
 	s.Resources = nil
@@ -415,6 +522,7 @@ func (s *VPNService) enterConnected(client *protocol.Client, username string, ce
 	s.resourceError = ""
 	s.Status = "Connected"
 	s.StatusDetail = "已连接，正在拉取内网资源..."
+	s.authType = authType
 	fn := s.OnStatusChange
 	s.mu.Unlock()
 	if fn != nil {
@@ -427,7 +535,7 @@ func (s *VPNService) enterConnected(client *protocol.Client, username string, ce
 	return map[string]any{
 		"status":        "Connected",
 		"username":      username,
-		"authType":      authTypeFor(cert),
+		"authType":      authType,
 		"sessionId":     client.SessionID,
 		"resourceState": string(ResourceLoading),
 		"resourceCount": 0,
@@ -691,7 +799,7 @@ func (s *VPNService) loginWithLoadedCert(gwIdentifier string, cert *tls.Certific
 	if afterAuth != nil {
 		afterAuth(gwID)
 	}
-	return s.enterConnected(client, name, cert), nil
+	return s.enterConnected(client, name, cert, authTypeCertificate), nil
 }
 
 // persistCertSelection records the certificate login mode on the gateway.
@@ -705,11 +813,36 @@ func (s *VPNService) persistCertSelection(gwID string, source int, certID string
 		s.Config.Gateways[idx].AuthType = 1 // certificate
 		s.Config.Gateways[idx].CertType = source
 		s.Config.Gateways[idx].CertAutoLogin = auto
+		s.Config.Gateways[idx].CertWithPassword = false
 		s.Config.Gateways[idx].SelectedCertID = certID
 		break
 	}
 	if err := s.Config.SaveSettingXML(""); err != nil {
 		s.Log("WARN", "Failed to save certificate selection: %v", err)
+	}
+}
+
+// persistPasswordCertSelection records the two-factor "password + certificate"
+// mode. authtype is kept at 0 so the gateway entry still reads as a password
+// login for the original client; certwithpwd="1" is what marks the extra
+// factor for this client. certautologin stays 0: a certificate alone cannot
+// complete a two-factor login, so the password account's own auto flag governs.
+func (s *VPNService) persistPasswordCertSelection(gwID string, source int, certID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for idx := range s.Config.Gateways {
+		if s.Config.Gateways[idx].ID != gwID {
+			continue
+		}
+		s.Config.Gateways[idx].AuthType = 0 // password
+		s.Config.Gateways[idx].CertType = source
+		s.Config.Gateways[idx].CertAutoLogin = false
+		s.Config.Gateways[idx].CertWithPassword = true
+		s.Config.Gateways[idx].SelectedCertID = certID
+		break
+	}
+	if err := s.Config.SaveSettingXML(""); err != nil {
+		s.Log("WARN", "Failed to save password + certificate selection: %v", err)
 	}
 }
 
@@ -720,11 +853,12 @@ func (s *VPNService) rememberPasswordMode(gwIdentifier string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	gw := s.Config.FindGateway(gwIdentifier)
-	if gw == nil || gw.AuthType == 0 {
+	if gw == nil || (gw.AuthType == 0 && !gw.CertWithPassword) {
 		return
 	}
 	gw.AuthType = 0
 	gw.CertAutoLogin = false
+	gw.CertWithPassword = false
 	if err := s.Config.SaveSettingXML(""); err != nil {
 		s.Log("WARN", "Failed to save authentication mode: %v", err)
 	}
@@ -768,6 +902,9 @@ func (s *VPNService) ChangePassword(gwIdentifier, username, password, newPasswor
 	gwIP := gw.IP
 	gwPort := gw.Port
 	gwAlgo := gw.Algo
+	storedTwoFactor := gw.CertWithPassword
+	storedCertSource := gw.CertType
+	storedCertID := gw.SelectedCertID
 	s.Config.LastUseGateway = gw.Name
 	s.mu.Unlock()
 
@@ -779,14 +916,31 @@ func (s *VPNService) ChangePassword(gwIdentifier, username, password, newPasswor
 	challenge := s.passwordChallenge
 	s.mu.Unlock()
 
-	// Reuse the HTTP client that received the 0x100 challenge when it belongs
-	// to this gateway and user; its cookie jar carries VSG_SESSIONID.
-	if challenge != nil && challenge.username == username &&
-		challenge.client.GatewayIP == gwIP && challenge.client.GatewayPort == gwPort {
+	// The certificate that satisfied the mTLS side of a challenged two-factor
+	// login; the sign-in after the password change must present it again. The
+	// profile's stored selection covers a challenge that started on a client
+	// this process no longer holds (ChangePassword with no live challenge).
+	var challengeCert *tls.Certificate
+	challengeMatches := challenge != nil && challenge.username == username &&
+		challenge.client.GatewayIP == gwIP && challenge.client.GatewayPort == gwPort
+	if challengeMatches {
+		challengeCert = challenge.cert
+		// Reuse the HTTP client that received the 0x100 challenge; its cookie
+		// jar carries VSG_SESSIONID.
 		client = challenge.client
+	}
+	if challengeCert == nil && storedTwoFactor && storedCertID != "" && s.certStore() != nil {
+		if cert, loadErr := s.certStore().LoadTLS(storedCertID, certstore.Source(storedCertSource)); loadErr == nil {
+			challengeCert = cert
+		}
 	}
 	if client == nil || client.GatewayIP != gwIP || client.GatewayPort != gwPort {
 		client = protocol.NewClient(gwIP, gwPort, gwAlgo, s.Log)
+		if challengeCert != nil {
+			// A fresh client for a two-factor session must present the same
+			// certificate, or the gateway rejects the password check.
+			client.SetTLSClientCertificate(challengeCert)
+		}
 		if _, err := client.Handshake(); err != nil {
 			s.setStatus("Error", fmt.Sprintf("Handshake failed: %v", err))
 			return nil, err
@@ -816,6 +970,20 @@ func (s *VPNService) ChangePassword(gwIdentifier, username, password, newPasswor
 	s.StatusDetail = "密码已更新，正在登录"
 	s.mu.Unlock()
 	s.Log("SUCCESS", "Password changed for %s; signing in with the new password", username)
+
+	// A two-factor gateway needs the certificate on every login, so the
+	// follow-up sign-in runs the full password + certificate flow again; a
+	// plain password login would be rejected right after the change.
+	if challengeCert != nil {
+		return s.loginWithPasswordCert(gwIdentifier, username, newPassword, verifycode, challengeCert, nil, remember, auto)
+	}
+	s.mu.Lock()
+	gwProfile := s.Config.FindGateway(gwIdentifier)
+	twoFactor := gwProfile != nil && gwProfile.CertWithPassword
+	s.mu.Unlock()
+	if twoFactor {
+		s.Log("WARN", "网关要求口令 + 证书双因子，但未找到上次使用的证书，将以纯口令方式登录")
+	}
 	return s.Login(gwIdentifier, username, newPassword, verifycode, remember, auto)
 }
 
@@ -870,14 +1038,6 @@ func (s *VPNService) storeAccountLocked(gw *config.GatewayProfile, username, pas
 		Remember: remember,
 		Auto:     auto,
 	})
-}
-
-// authTypeFor reports which authentication produced the session.
-func authTypeFor(cert *tls.Certificate) string {
-	if cert != nil {
-		return "certificate"
-	}
-	return "password"
 }
 
 // cleanupStaleSessionLocked shuts down any active or connecting session before a
@@ -958,6 +1118,7 @@ func (s *VPNService) GetStatus() map[string]any {
 	return map[string]any{
 		"status":         s.Status,
 		"statusDetail":   s.StatusDetail,
+		"authType":       s.authType,
 		"resources":      s.Resources,
 		"resourceState":  string(s.resourceState),
 		"resourceError":  s.resourceError,
@@ -987,4 +1148,30 @@ func (s *VPNService) ClearLogs() bool {
 	defer s.logMu.Unlock()
 	s.Logs = make([]string, 0)
 	return true
+}
+
+// GetVerifyCodeImage fetches the graphical captcha image from the target gateway
+// and returns a data URL format string (e.g. data:image/png;base64,...).
+func (s *VPNService) GetVerifyCodeImage(gwIdentifier string) (string, error) {
+	s.mu.Lock()
+	gw := s.Config.FindGateway(gwIdentifier)
+	if gw == nil {
+		s.mu.Unlock()
+		return "", fmt.Errorf("未找到网关配置: %s", gwIdentifier)
+	}
+
+	client := s.Client
+	if client == nil || client.GatewayIP != gw.IP || client.GatewayPort != gw.Port {
+		client = protocol.NewClient(gw.IP, gw.Port, gw.Algo, s.Log)
+		s.Client = client
+	}
+	s.mu.Unlock()
+
+	data, contentType, err := client.FetchVerifyCode()
+	if err != nil {
+		return "", err
+	}
+
+	b64 := base64.StdEncoding.EncodeToString(data)
+	return fmt.Sprintf("data:%s;base64,%s", contentType, b64), nil
 }

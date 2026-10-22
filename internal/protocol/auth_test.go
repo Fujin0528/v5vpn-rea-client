@@ -1,6 +1,7 @@
 package protocol
 
 import (
+	"encoding/base64"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -128,9 +129,6 @@ func TestLoginBadCredentialsStayBadCredentials(t *testing.T) {
 }
 
 func TestChangePasswordSubmitsPwdChangeEndpoint(t *testing.T) {
-	b64Old := "b2xkLXNlY3JldA==" // base64("old-secret")
-	b64New := "bmV3LXNlY3JldA==" // base64("new-secret")
-
 	var gotPath, gotBody string
 	mux := http.NewServeMux()
 	mux.HandleFunc("/vpn/user/auth/pwdchange", func(w http.ResponseWriter, r *http.Request) {
@@ -151,14 +149,16 @@ func TestChangePasswordSubmitsPwdChangeEndpoint(t *testing.T) {
 	if gotPath != "/vpn/user/auth/pwdchange" {
 		t.Fatalf("expected /vpn/user/auth/pwdchange, got %q", gotPath)
 	}
-	if !strings.Contains(gotBody, "old_pwd="+b64Old) {
-		t.Fatalf("request body missing old_pwd=%s: %s", b64Old, gotBody)
+	// The original client posts both passwords as plain UTF-8 and sends no
+	// encode parameter at all (format "old_pwd=%s&new_pwd=%s").
+	if !strings.Contains(gotBody, "old_pwd=old-secret") {
+		t.Fatalf("request body missing raw old_pwd: %s", gotBody)
 	}
-	if !strings.Contains(gotBody, "new_pwd="+b64New) {
-		t.Fatalf("request body missing new_pwd=%s: %s", b64New, gotBody)
+	if !strings.Contains(gotBody, "new_pwd=new-secret") {
+		t.Fatalf("request body missing raw new_pwd: %s", gotBody)
 	}
-	if !strings.Contains(gotBody, "encode=1") {
-		t.Fatalf("request body missing encode=1: %s", gotBody)
+	if strings.Contains(gotBody, "encode=") {
+		t.Fatalf("pwdchange must not carry an encode parameter: %s", gotBody)
 	}
 }
 
@@ -208,6 +208,43 @@ func TestChangePasswordRequiresSuccessResultCode(t *testing.T) {
 			}
 			if !strings.Contains(err.Error(), tc.wantErr) {
 				t.Fatalf("expected error containing %q, got %v", tc.wantErr, err)
+			}
+		})
+	}
+}
+
+func TestPasswordAuthBodyUsesEncode1Base64(t *testing.T) {
+	body := passwordAuthBody(base64AuthParam("alice"), base64AuthParam("s3cret!"), "1234")
+	want := "username=YWxpY2U=&password=czNjcmV0IQ==&encode=1&verifycode=1234"
+	if body != want {
+		t.Fatalf("body = %q, want %q", body, want)
+	}
+}
+
+// TestBase64AuthParamMatchesOriginalWrapping pins the exact base64 layout of
+// SecLogin.dll (76-column CRLF wrapping, one trailing CRLF stripped, and the
+// stray trailing CRLF the original loop leaves when the group part is a
+// nonzero multiple of 76 columns).
+func TestBase64AuthParamMatchesOriginalWrapping(t *testing.T) {
+	std := func(s string) string { return base64.StdEncoding.EncodeToString([]byte(s)) }
+	rep := func(n int) string { return strings.Repeat("a", n) }
+
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"short input stays a single plain line", "alice", std("alice")},
+		{"57 bytes keeps the loop's stray trailing CRLF", rep(57), std(rep(57)) + "\r\n"},
+		{"58 bytes puts the padding on its own line", rep(58), std(rep(58))[:76] + "\r\n" + std(rep(58))[76:]},
+		{"100 bytes wraps before the partial tail", rep(100), std(rep(100))[:76] + "\r\n" + std(rep(100))[76:]},
+		{"114 bytes ends a double line with CRLF", rep(114), std(rep(114))[:76] + "\r\n" + std(rep(114))[76:] + "\r\n"},
+		{"120 bytes wraps two full lines", rep(120), std(rep(120))[:76] + "\r\n" + std(rep(120))[76:152] + "\r\n" + std(rep(120))[152:]},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := base64AuthParam(tc.in); got != tc.want {
+				t.Fatalf("base64AuthParam(%d bytes) =\n%q\nwant\n%q", len(tc.in), got, tc.want)
 			}
 		})
 	}

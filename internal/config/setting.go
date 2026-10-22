@@ -58,6 +58,11 @@ type UserList struct {
 	AuthType      int    `xml:"authtype,attr"`
 	CertType      int    `xml:"certtype,attr"`
 	CertAutoLogin int    `xml:"certautologin,attr"`
+	// CertWithPassword marks a "password + certificate" login: the gateway
+	// requires both factors. authtype stays 0 (password) so the original
+	// client still reads the entry the way it wrote it; this attribute is
+	// omitted when false.
+	CertWithPassword int `xml:"certwithpwd,attr,omitempty"`
 	// CertID records the certificate selected for certificate login. The
 	// original client has no such attribute; it is omitted when empty so the
 	// file stays readable by it.
@@ -92,6 +97,9 @@ type GatewayProfile struct {
 	AuthType       int           `json:"authType"`      // 0: password, 1: certificate, 2: anonymous
 	CertType       int           `json:"certType"`      // 0: file, 2: USB key (1 was the system store, removed)
 	CertAutoLogin  bool          `json:"certAutoLogin"` // remember the certificate login
+	// CertWithPassword selects the third login method: the gateway demands a
+	// password and a client certificate at the same time.
+	CertWithPassword bool          `json:"certWithPassword"`
 	SelectedCertID string        `json:"selectedCertId"`
 	SavedAccounts  []UserAccount `json:"savedAccounts"`
 
@@ -256,6 +264,7 @@ func LoadSettingXML(path string) (*AppConfig, error) {
 			AuthType:       gw.User.AuthType,
 			CertType:       gw.User.CertType,
 			CertAutoLogin:  gw.User.CertAutoLogin == 1,
+			CertWithPassword: gw.User.CertWithPassword == 1,
 			SelectedCertID: gw.User.CertID,
 			SavedAccounts:  make([]UserAccount, 0, len(gw.User.Users)),
 		}
@@ -325,6 +334,7 @@ func (cfg *AppConfig) saveToPath(targetPath string) error {
 				AuthType:      gw.AuthType,
 				CertType:      gw.CertType,
 				CertAutoLogin: boolToInt(gw.CertAutoLogin),
+				CertWithPassword: boolToInt(gw.CertWithPassword),
 				CertID:        gw.SelectedCertID,
 				Users:         make([]UserXML, 0, len(gw.SavedAccounts)),
 			},

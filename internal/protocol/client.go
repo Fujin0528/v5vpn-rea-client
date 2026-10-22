@@ -14,8 +14,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/hygkui/v5vpn-rea-client/internal/crypto"
 )
 
 const (
@@ -132,7 +130,7 @@ func (c *Client) Handshake() (*VersionResponse, error) {
 	return &v, nil
 }
 
-// Login authenticates user with gateway using AES-128-CBC encrypted credentials.
+// Login authenticates the user with the gateway (Base64 credentials, encode=1) and then loads the portal integration info.
 func (c *Client) Login(username, password, verifycode string) (*IntegrationInfo, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -140,7 +138,7 @@ func (c *Client) Login(username, password, verifycode string) (*IntegrationInfo,
 }
 
 // ChangePassword submits the old and new passwords to /vpn/user/auth/pwdchange.
-// Both passwords are base64-encoded with encode=1.
+// The original client posts both as UTF-8 plaintext with no encode parameter.
 func (c *Client) ChangePassword(username, oldPassword, newPassword, verifycode string) error {
 	if strings.TrimSpace(newPassword) == "" {
 		return fmt.Errorf("新密码不能为空")
@@ -229,19 +227,11 @@ func (c *Client) AuthPassword(username, password, verifycode string) (*AuthRespo
 func (c *Client) authPasswordLocked(username, password, verifycode string) (*AuthResponse, error) {
 	c.Logger("INFO", "Initiating password authentication for user: %s", username)
 
-	encUser, err := crypto.EncryptAuthParam(username)
-	if err != nil {
-		return nil, fmt.Errorf("failed to encrypt username: %w", err)
-	}
-	encPwd, err := crypto.EncryptAuthParam(password)
-	if err != nil {
-		return nil, fmt.Errorf("failed to encrypt password: %w", err)
-	}
-
-	// encode=2 tells a v2.0 gateway to AES-128-CBC decrypt. encode=1 is
-	// legacy base64 and makes the gateway answer 0x8000001A. The body is
-	// raw concatenation without URL-escaping.
-	authBody := passwordAuthBody(encUser, encPwd, verifycode)
+	// The shipped Windows client submits both fields standard-Base64 encoded
+	// with encode=1 (SecLogin.dll exposes no AES encrypt on this path and the
+	// string "encode=2" occurs nowhere in its binaries). The body is raw
+	// concatenation without URL-escaping.
+	authBody := passwordAuthBody(base64AuthParam(username), base64AuthParam(password), verifycode)
 
 	authResp, respBody, statusCode, err := c.postAuth(authBody)
 	if err != nil {
@@ -307,6 +297,48 @@ func (c *Client) AuthOnly(username, password, verifycode string) (*AuthResponse,
 	return resp, nil
 }
 
+// AuthPasswordWithCert performs the two-factor "password + certificate" login
+// the way the original client drives it. SecUI.exe submits the password first
+// on a connection that presents no client certificate; only when the
+// gateway's RESULT code asks for the certificate factor does it submit the
+// certificate on /vpn/user/auth/cert, reusing the session cookie from the
+// password step. The certificate request carries no body — the certificate
+// itself travels in the TLS handshake.
+func (c *Client) AuthPasswordWithCert(cert *tls.Certificate, username, password, verifycode string) (*AuthResponse, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Step 1: password only. The original password request sets no
+	// CURLOPT_SSLCERT, so no client certificate goes out here.
+	resp, err := c.authPasswordLocked(username, password, verifycode)
+	if err == nil {
+		// The gateway accepted the session without requesting a second
+		// factor; submit nothing further. Keep the certificate installed for
+		// the tunnel connections.
+		if cert != nil {
+			c.installClientCertLocked(cert)
+		}
+		c.markLoggedInLocked()
+		return resp, nil
+	}
+	var authErr *AuthError
+	if !errors.As(err, &authErr) || nextAuthStep(authErr.Code) != authStepCertificate {
+		return resp, err
+	}
+
+	// Step 2: the gateway asked for the certificate factor.
+	c.Logger("INFO", "Password step accepted; submitting the client certificate")
+	if cert != nil {
+		c.installClientCertLocked(cert)
+	}
+	certResp, err := c.certAuthLocked(verifycode)
+	if err != nil {
+		return resp, err
+	}
+	c.markLoggedInLocked()
+	return certResp, nil
+}
+
 // AuthCertOnly performs certificate authentication and marks the session as
 // logged in without waiting for the resource list.
 func (c *Client) AuthCertOnly(cert *tls.Certificate, verifycode string) error {
@@ -315,7 +347,11 @@ func (c *Client) AuthCertOnly(cert *tls.Certificate, verifycode string) error {
 	if cert != nil {
 		c.installClientCertLocked(cert)
 	}
-	return c.certAuthLocked(verifycode)
+	if _, err := c.certAuthLocked(verifycode); err != nil {
+		return err
+	}
+	c.markLoggedInLocked()
+	return nil
 }
 
 // installClientCertLocked wires the certificate into the HTTP transport.
@@ -410,6 +446,13 @@ func (c *Client) postAuth(authBody string) (AuthResponse, []byte, int, error) {
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
 		c.Logger("ERROR", "Auth request failed: %v", err)
+		// A gateway enforcing "password + certificate", or one that only
+		// accepts requests over mutual TLS, aborts the handshake when the
+		// request carries no client certificate; name that cause instead of
+		// leaving a bare TLS alert, which reads like a network outage.
+		if isCertificateHandshakeError(err) {
+			return AuthResponse{}, nil, 0, fmt.Errorf("auth request network error: %w (网关可能要求口令 + 证书双因子认证，请选择证书后重试)", err)
+		}
 		return AuthResponse{}, nil, 0, fmt.Errorf("auth request network error: %w", err)
 	}
 	defer resp.Body.Close()
@@ -423,6 +466,31 @@ func (c *Client) postAuth(authBody string) (AuthResponse, []byte, int, error) {
 		c.Logger("WARN", "Auth response was not XML: %s", string(respBody))
 	}
 	return authResp, respBody, resp.StatusCode, nil
+}
+
+// isCertificateHandshakeError reports whether a request failed because the TLS
+// handshake was rejected over client certificates. A gateway enforcing a
+// "password + certificate" policy answers without one by tearing the handshake
+// down, which surfaces as "tls: certificate required" (or a bad-certificate
+// alert) and would otherwise look like an unreachable gateway.
+func isCertificateHandshakeError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, marker := range []string{
+		"certificate required",
+		"bad certificate",
+		"unknown certificate",
+		"unsupported certificate",
+		"certificate expired",
+		"certificate revoked",
+	} {
+		if strings.Contains(msg, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Client) captureSession() {
@@ -538,7 +606,7 @@ func (c *Client) LoginWithCert(cert *tls.Certificate, verifycode string) (*Integ
 	if cert != nil {
 		c.installClientCertLocked(cert)
 	}
-	if err := c.certAuthLocked(verifycode); err != nil {
+	if _, err := c.certAuthLocked(verifycode); err != nil {
 		return nil, err
 	}
 
@@ -558,8 +626,9 @@ func (c *Client) LoginWithCert(cert *tls.Certificate, verifycode string) (*Integ
 }
 
 // certAuthLocked performs the certificate authentication request and captures
-// the session cookie. Caller holds c.mu.
-func (c *Client) certAuthLocked(verifycode string) error {
+// the session cookie. Caller holds c.mu. It returns the parsed gateway
+// response so a two-step login can report the final result of the sequence.
+func (c *Client) certAuthLocked(verifycode string) (*AuthResponse, error) {
 	c.Logger("INFO", "Initiating certificate authentication against %s", c.BaseURL)
 
 	authURL := fmt.Sprintf("%s/vpn/user/auth/cert", c.BaseURL)
@@ -569,7 +638,7 @@ func (c *Client) certAuthLocked(verifycode string) error {
 
 	req, err := http.NewRequest(http.MethodGet, authURL, nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	req.Header.Set("User-Agent", "LeadSec VPN Client")
 
@@ -578,13 +647,13 @@ func (c *Client) certAuthLocked(verifycode string) error {
 		// A TLS-level failure (unknown CA, no shared cipher, client certificate
 		// rejected) surfaces here rather than as a RESULT code.
 		c.Logger("ERROR", "Certificate auth request failed: %v", err)
-		return fmt.Errorf("证书认证握手失败: %w", err)
+		return nil, fmt.Errorf("证书认证握手失败: %w", err)
 	}
 	defer resp.Body.Close()
 
 	respBody, readErr := io.ReadAll(resp.Body)
 	if readErr != nil {
-		return fmt.Errorf("读取证书认证响应失败: %w", readErr)
+		return nil, fmt.Errorf("读取证书认证响应失败: %w", readErr)
 	}
 	respBody = prepareGatewayXML(respBody)
 	c.Logger("INFO", "Certificate auth response status: %s", resp.Status)
@@ -601,23 +670,23 @@ func (c *Client) certAuthLocked(verifycode string) error {
 		if resultCode != "" && !isSuccessCode(resultCode) {
 			authErr := newAuthError(resultCode, authResp.Result.Msg)
 			c.Logger("ERROR", "Gateway rejected certificate authentication: %s", authErr.Error())
-			return authErr
+			return nil, authErr
 		}
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("证书登录失败，HTTP 状态 %d: %s", resp.StatusCode, string(respBody))
+		return nil, fmt.Errorf("证书登录失败，HTTP 状态 %d: %s", resp.StatusCode, string(respBody))
 	}
 	if parseErr != nil {
-		return fmt.Errorf("证书登录响应无法解析: %w", parseErr)
+		return nil, fmt.Errorf("证书登录响应无法解析: %w", parseErr)
 	}
 
 	c.captureSession()
 	if c.SessionID == "" {
 		c.Logger("ERROR", "No valid Session ID received after certificate auth. Response: %s", string(respBody))
-		return fmt.Errorf("证书登录未下发有效会话ID")
+		return nil, fmt.Errorf("证书登录未下发有效会话ID")
 	}
-	return nil
+	return &authResp, nil
 }
 
 // ClientCertificate returns the certificate installed for mTLS, or nil.
@@ -657,4 +726,43 @@ func (c *Client) IsLoggedIn() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.isLoggedIn
+}
+
+// FetchVerifyCode fetches the graphic captcha image bytes and content type from the gateway.
+func (c *Client) FetchVerifyCode() ([]byte, string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	reqURL := fmt.Sprintf("%s/vpn/user/auth/verifycode?t=%d", c.BaseURL, time.Now().UnixNano())
+	req, err := http.NewRequest(http.MethodGet, reqURL, nil)
+	if err != nil {
+		return nil, "", err
+	}
+	req.Header.Set("User-Agent", "LeadSec VPN Client")
+
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		c.Logger("ERROR", "Fetch verifycode image request failed: %v", err)
+		return nil, "", fmt.Errorf("获取验证码请求失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	c.captureSession()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, "", fmt.Errorf("获取验证码失败，HTTP 状态码: %d", resp.StatusCode)
+	}
+
+	contentType := resp.Header.Get("Content-Type")
+	if contentType == "" {
+		contentType = "image/png"
+	}
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, "", fmt.Errorf("读取验证码数据失败: %w", err)
+	}
+
+	c.Logger("INFO", "Fetched verifycode image (%d bytes, %s)", len(data), contentType)
+	return data, contentType, nil
 }

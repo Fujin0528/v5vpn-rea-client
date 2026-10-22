@@ -65,6 +65,9 @@ func main() {
 	certFlag := flag.String("cert", "", "Certificate login: imported certificate ID/alias, or a .p12/.pfx path")
 	certPwdFlag := flag.String("cert-pwd", "", "Private key password for an external certificate file")
 	certTypeFlag := flag.Int("cert-type", 0, "Certificate source: 0 imported file (2 USB key, not yet supported)")
+	// -pwd-cert switches -cert from certificate-only to the two-factor
+	// "password + certificate" login, which also needs -user and -pwd.
+	pwdCertFlag := flag.Bool("pwd-cert", false, "Combine -cert with -user/-pwd: gateway requires both factors")
 	listCertsFlag := flag.Bool("list-certs", false, "List installed certificates and exit")
 	importCertFlag := flag.String("import-cert", "", "Import a .p12/.pfx file into the local certificate store and exit")
 	certAliasFlag := flag.String("cert-alias", "", "Display alias used with -import-cert")
@@ -120,7 +123,7 @@ func main() {
 	// CLI Connect Mode
 	if *cliMode && *connectGW != "" {
 		if *certFlag != "" {
-			runCLIConnectWithCert(vpnService, *connectGW, *certFlag, *certPwdFlag, *certTypeFlag, *userFlag, *pwdFlag)
+			runCLIConnectWithCert(vpnService, *connectGW, *certFlag, *certPwdFlag, *certTypeFlag, *userFlag, *pwdFlag, *pwdCertFlag)
 			return
 		}
 		runCLIConnect(vpnService, *connectGW, *userFlag, *pwdFlag, *newPwdFlag, *forceFlag)
@@ -655,6 +658,52 @@ func newAPIRouter(uiFS fs.FS, vpnService *service.VPNService, atrustSvc *service
 
 	// /api/cert/pick opens the native file picker for a .p12/.pfx file. The
 	// dialog needs the GUI process, so it lives in main rather than the service.
+	// /api/login-pwd-cert is the two-factor login: the password is submitted
+	// first and the client certificate follows on /vpn/user/auth/cert once the
+	// gateway asks for it (two-step serial flow).
+	mux.HandleFunc("/api/login-pwd-cert", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			GWID       string `json:"gwId"`
+			Username   string `json:"username"`
+			Password   string `json:"password"`
+			Source     int    `json:"source"`
+			CertID     string `json:"certId"`
+			VerifyCode string `json:"verifycode"`
+			Remember   bool   `json:"remember"`
+			Auto       bool   `json:"auto"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if gw := vpnService.GetConfig().FindGateway(req.GWID); gw != nil && gw.IsATrust() {
+			writeATrustRoutingError(w, gw.Name, config.ProtocolATrust)
+			return
+		}
+		res, err := vpnService.LoginWithPasswordAndCert(req.GWID, req.Username, req.Password, req.VerifyCode, req.Source, req.CertID, req.Remember, req.Auto)
+		writeLoginResult(w, res, err)
+	})
+
+	mux.HandleFunc("/api/verifycode-image", func(w http.ResponseWriter, r *http.Request) {
+		gwId := r.URL.Query().Get("gwId")
+		if gwId == "" {
+			http.Error(w, "missing gwId", http.StatusBadRequest)
+			return
+		}
+		dataURL, err := vpnService.GetVerifyCodeImage(gwId)
+		w.Header().Set("Content-Type", "application/json")
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]string{"dataUrl": dataURL})
+	})
+
 	mux.HandleFunc("/api/cert/pick", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if mainWindow == nil {
@@ -1101,18 +1150,25 @@ func runImportCertificate(svc *service.VPNService, path, alias, password string)
 // runCLIConnectWithCert authenticates with a certificate. -cert either names an
 // imported certificate (ID or alias) or points at a .p12/.pfx file; the latter
 // is loaded in place and never copied into the store.
-func runCLIConnectWithCert(svc *service.VPNService, gwName, certRef, certPwd string, certType int, user, pwd string) {
+func runCLIConnectWithCert(svc *service.VPNService, gwName, certRef, certPwd string, certType int, user, pwd string, withPassword bool) {
 	gw := svc.Config.FindGateway(gwName)
 	if gw == nil {
 		fmt.Fprintf(os.Stderr, "未找到网关: %s\n", gwName)
 		os.Exit(1)
 	}
-	if user != "" || pwd != "" {
-		fmt.Fprintln(os.Stderr, "提示: 已指定证书登录，-user/-pwd 将被忽略。")
+	if withPassword && (user == "" || pwd == "") {
+		fmt.Fprintln(os.Stderr, "口令 + 证书登录需要同时提供 -user 与 -pwd")
+		os.Exit(1)
 	}
 
 	certID := certRef
 	if info, err := os.Stat(certRef); err == nil && !info.IsDir() {
+		if withPassword {
+			fmt.Printf("正在连接网关 %s (%s:%d), 证书: %s, 用户: %s...\n", gw.Name, gw.IP, gw.Port, certRef, user)
+			res, err := svc.LoginWithPasswordAndCertExternal(gw.Name, user, pwd, certRef, certPwd)
+			finishCLIConnect(res, err)
+			return
+		}
 		fmt.Printf("正在连接网关 %s (%s:%d), 证书: %s...\n", gw.Name, gw.IP, gw.Port, certRef)
 		res, err := svc.LoginWithCertExternal(gw.Name, certRef, certPwd)
 		finishCLIConnect(res, err)
@@ -1125,8 +1181,17 @@ func runCLIConnectWithCert(svc *service.VPNService, gwName, certRef, certPwd str
 		os.Exit(1)
 	}
 	certID = resolvedID
-	fmt.Printf("正在连接网关 %s (%s:%d), 证书: %s...\n", gw.Name, gw.IP, gw.Port, name)
 
+	if withPassword {
+		fmt.Printf("正在连接网关 %s (%s:%d), 证书: %s, 用户: %s...\n", gw.Name, gw.IP, gw.Port, name, user)
+		res, err := svc.LoginWithPasswordAndCert(gw.Name, user, pwd, "", certType, certID, false, false)
+		finishCLIConnect(res, err)
+		return
+	}
+
+	if user != "" || pwd != "" {
+		fmt.Fprintln(os.Stderr, "提示: 已指定证书登录，-user/-pwd 将被忽略。需口令+证书双因子时请加 -pwd-cert。")
+	}
 	res, err := svc.LoginWithCert(gw.Name, certType, certID, "", false)
 	finishCLIConnect(res, err)
 }
