@@ -47,6 +47,10 @@ const atrustResourceTimeout = 30 * time.Second
 type ATrustHost interface {
 	GetConfig() *config.AppConfig
 	SaveGateway(gw config.GatewayProfile) error
+	// SetLastUseGateway 记录「上次使用的网关」。启动时 cmd 侧按这个
+	// 字段指向的网关协议决定先打开哪套界面（见 cmd.initialUIPath），
+	// 它与 V5VPN 的 Login 共写 setting.xml 里的同一个字段。
+	SetLastUseGateway(name string) error
 	GetLogs() []string
 	Log(level string, format string, args ...any)
 	// UserDataDir 是 setting.xml 所在的每用户目录。
@@ -209,6 +213,15 @@ func (s *ATrustService) Login(gwIdentifier, username, password string, remember,
 		err := fmt.Errorf("网关 %q 缺少地址", gw.Name)
 		s.setStatus("Error", err.Error())
 		return nil, err
+	}
+
+	// 「上次使用的网关」两侧共写一个字段：不写的话，aTrust 用户重启后
+	// 会落回 /v5vpn/，明明上次连的是零信任网关。V5VPN 的 Login 在
+	// 同样的位置写同一个字段，这里保持对称（认证失败也不回滚，与
+	// V5VPN 一致：它只表达"用户最近在跟哪台网关打交道"）。
+	// 写盘失败不阻断登录，留一条日志。
+	if err := s.host.SetLastUseGateway(gw.Name); err != nil {
+		s.host.Log("WARN", "aTrust: 记录最近使用网关失败: %v", err)
 	}
 
 	soc := *gw // 副本：SaveGateway 需要完整字段，这里只改账号部分

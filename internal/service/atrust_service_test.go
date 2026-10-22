@@ -35,6 +35,8 @@ type fakeHost struct {
 	// userDataDir 供 aTrust 后端存放设备标识。默认空串 = 不持久化，
 	// 这样测试不会在真实用户目录里写文件。
 	userDataDir string
+	// lastUseErr 让 SetLastUseGateway 模拟写盘失败（生产实现会落盘）。
+	lastUseErr error
 }
 
 func newFakeHost(gateways ...config.GatewayProfile) *fakeHost {
@@ -45,6 +47,18 @@ func (h *fakeHost) GetConfig() *config.AppConfig {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.cfg.Snapshot()
+}
+
+// SetLastUseGateway 与生产实现（VPNService.SetLastUseGateway）同语义：
+// 写内存里的 LastUseGateway 字段，让随后 GetConfig/GetStatus 能读到。
+func (h *fakeHost) SetLastUseGateway(name string) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.lastUseErr != nil {
+		return h.lastUseErr
+	}
+	h.cfg.LastUseGateway = name
+	return nil
 }
 
 // UserDataDir 返回测试指定的目录（默认为空 = 不落盘）。
@@ -275,6 +289,52 @@ func TestATrustLoginRejectsV5VPNGateway(t *testing.T) {
 	}
 	if svc.Client != nil {
 		t.Error("失败后仍持有 client")
+	}
+
+	// 协议校验失败发生在记 LastUseGateway 之前：不能把"上次用的网关"
+	// 写成一台 aTrust 后端根本没碰过的 V5VPN 网关。
+	if got := host.GetConfig().LastUseGateway; got != "" {
+		t.Errorf("拒绝路径不应写 LastUseGateway，实际 %q", got)
+	}
+}
+
+// TestATrustLoginRecordsLastUseGateway 验证 aTrust 登录会把「上次使用的
+// 网关」写回宿主的配置。
+//
+// 不写的话，启动路由（cmd.initialUIPath）永远落回 /v5vpn/：用户上次
+// 明明连的零信任网关，重启后却站在 V5VPN 界面上。
+func TestATrustLoginRecordsLastUseGateway(t *testing.T) {
+	g := newFakeGateway(t)
+	host := newFakeHost(g.profile())
+	svc := NewATrustService(host)
+
+	if _, err := svc.Login("gw-atrust-test", "alice", "secret-pass", false, false); err != nil {
+		t.Fatalf("Login 失败: %v", err)
+	}
+	if got := host.GetConfig().LastUseGateway; got != "测试 aTrust" {
+		t.Fatalf("LastUseGateway = %q，期望网关名", got)
+	}
+
+	// GetStatus 的 lastUseGateway 键与 VPNService.GetStatus 同源（共读
+	// 同一个字段），启动路由按它挑界面，这里顺带守护这条链路。
+	if got := svc.GetStatus()["lastUseGateway"]; got != "测试 aTrust" {
+		t.Errorf("GetStatus.lastUseGateway = %v", got)
+	}
+}
+
+// TestATrustLoginLastUseGatewayWriteFailureDoesNotBlock 验证写盘失败时
+// 登录继续 —— 它只是启动路由的提示信息，不该拦下会话。
+func TestATrustLoginLastUseGatewayWriteFailureDoesNotBlock(t *testing.T) {
+	g := newFakeGateway(t)
+	host := newFakeHost(g.profile())
+	host.lastUseErr = errors.New("磁盘只读（模拟）")
+	svc := NewATrustService(host)
+
+	if _, err := svc.Login("gw-atrust-test", "alice", "secret-pass", false, false); err != nil {
+		t.Fatalf("写盘失败不应阻断登录: %v", err)
+	}
+	if !host.logContains("记录最近使用网关失败") {
+		t.Errorf("写盘失败未被记录。日志: %v", host.GetLogs())
 	}
 }
 
