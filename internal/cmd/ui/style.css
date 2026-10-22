@@ -292,6 +292,56 @@ label {
   color: var(--text-main);
 }
 
+/* 图形验证码 */
+.verifycode-container {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.verifycode-container #verifycode-input {
+  flex: 1;
+  text-transform: uppercase;
+  font-weight: 600;
+  letter-spacing: 2px;
+}
+
+.verifycode-img-wrapper {
+  width: 124px;
+  height: 38px;
+  background: var(--bg-card);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  overflow: hidden;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  user-select: none;
+  transition: border-color var(--transition-fast);
+}
+
+.verifycode-img-wrapper:hover {
+  border-color: var(--primary);
+}
+
+.verifycode-img-wrapper img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.verifycode-loading {
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.refresh-vc-btn {
+  padding: 8px 10px;
+  font-size: 13px;
+  border-radius: 6px;
+}
+
 /* 复选框 */
 .form-options {
   display: flex;
@@ -1248,6 +1298,23 @@ button.github-link {
 .import-path-row .form-control {
   flex: 1;
   min-width: 0;
+}
+
+/* ==================== 口令 + 证书（双因子） ==================== */
+.pwd-cert-row {
+  display: flex;
+  gap: 8px;
+}
+
+.pwd-cert-row .form-control {
+  flex: 1;
+  min-width: 0;
+}
+
+/* The source selector is a short fixed label; the certificate list takes the
+   remaining width. */
+.pwd-cert-row .pwd-cert-source {
+  flex: 0 0 104px;
 }
 
 .password-change-actions {

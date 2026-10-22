@@ -42,6 +42,7 @@
           <div class="auth-tabs" role="tablist" aria-label="登录方式">
             <button type="button" class="auth-tab is-active" data-mode="password" role="tab" aria-selected="true">👤 口令登录</button>
             <button type="button" class="auth-tab" data-mode="cert" role="tab" aria-selected="false">🪪 证书登录</button>
+            <button type="button" class="auth-tab" data-mode="pwd-cert" role="tab" aria-selected="false" title="网关同时要求口令与客户端证书">🔐 口令+证书</button>
           </div>
 
           <!-- 口令登录面板 -->
@@ -68,7 +69,31 @@
           <!-- 验证码（网关需要时出现） -->
           <div class="form-group" id="verifycode-group" style="display: none;">
             <label for="verifycode-input">图形验证码：</label>
-            <input type="text" id="verifycode-input" class="form-control" placeholder="请输入验证码">
+            <div class="verifycode-container">
+              <input type="text" id="verifycode-input" class="form-control" placeholder="请输入验证码" maxlength="6" autocomplete="off">
+              <div class="verifycode-img-wrapper" id="verifycode-img-wrapper" title="看不清？点击换一张">
+                <img id="verifycode-img" src="" alt="验证码" style="display: none;">
+                <span id="verifycode-loading" class="verifycode-loading" style="display: none;">加载中...</span>
+              </div>
+              <button type="button" id="refresh-verifycode-btn" class="btn btn-secondary btn-sm refresh-vc-btn" title="点击刷新验证码">🔄</button>
+            </div>
+          </div>
+
+          <!-- 口令 + 证书：先提交口令，网关要求后再经 /vpn/user/auth/cert 呈递证书（两步串行） -->
+          <div class="form-group" id="pwd-cert-group" style="display: none;">
+            <div class="label-row">
+              <label for="pwd-cert-select">客户端证书：</label>
+              <button type="button" id="pwd-cert-refresh-btn" class="settings-trigger-btn" title="重新检测证书">🔄 重新检测</button>
+            </div>
+            <div class="pwd-cert-row">
+              <select id="pwd-cert-source" class="form-control pwd-cert-source">
+                <option value="0">文件证书</option>
+                <option value="1">系统证书库</option>
+              </select>
+              <select id="pwd-cert-select" class="form-control">
+                <option value="">正在检测证书...</option>
+              </select>
+            </div>
           </div>
 
           <!-- 选项 -->

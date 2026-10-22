@@ -5,10 +5,14 @@
   let currentGateway = null;
   let isConnected = false;
   let logPollTimer = null;
-  let authMode = 'password';       // 'password' | 'cert'
+  let authMode = 'password';       // 'password' | 'cert' | 'pwd-cert'
   let certSource = 0;              // 0 file, 1 system store
   let selectedCertId = '';
   let certs = [];
+  // The two-factor panel keeps its own selection: a gateway can require a
+  // specific certificate while the certificate-only tab remembers another.
+  let pwdCertSource = 0;
+  let pwdCertId = '';
 
   // DOM Elements - Views
   const viewLogin = document.getElementById('view-login');
@@ -26,6 +30,10 @@
   const togglePwdBtn = document.getElementById('toggle-pwd-btn');
   const verifycodeGroup = document.getElementById('verifycode-group');
   const verifycodeInput = document.getElementById('verifycode-input');
+  const verifycodeImg = document.getElementById('verifycode-img');
+  const verifycodeImgWrapper = document.getElementById('verifycode-img-wrapper');
+  const verifycodeLoading = document.getElementById('verifycode-loading');
+  const refreshVerifycodeBtn = document.getElementById('refresh-verifycode-btn');
   const rememberPwdCheckbox = document.getElementById('remember-pwd-checkbox');
   const autoLoginCheckbox = document.getElementById('auto-login-checkbox');
   const connectBtn = document.getElementById('connect-btn');
@@ -55,6 +63,12 @@
   const importCertCancelBtn = document.getElementById('import-cert-cancel-btn');
   const browseCertBtn = document.getElementById('browse-cert-btn');
   const certAutoLoginCheckbox = document.getElementById('cert-auto-login-checkbox');
+
+  // DOM Elements - Password + Certificate (two-factor) Panel
+  const pwdCertGroup = document.getElementById('pwd-cert-group');
+  const pwdCertSourceSelect = document.getElementById('pwd-cert-source');
+  const pwdCertSelect = document.getElementById('pwd-cert-select');
+  const pwdCertRefreshBtn = document.getElementById('pwd-cert-refresh-btn');
 
   // DOM Elements - Connected View
   const connectedGwName = document.getElementById('connected-gw-name');
@@ -279,6 +293,34 @@
         const data = await res.json();
         if (!res.ok) {
           const error = new Error(data.error || '证书登录失败');
+          error.code = data.code || '';
+          throw error;
+        }
+        return data;
+      } catch (err) {
+        clearTimeout(timeoutId);
+        if (err.name === 'AbortError') {
+          throw new Error('网关响应超时(20s)，请检查网络与网关端口连通性');
+        }
+        throw err;
+      }
+    },
+    // Two-factor login: password first; the certificate follows on
+    // /vpn/user/auth/cert once the gateway asks for the certificate factor.
+    async loginWithPasswordAndCert(gwId, username, password, source, certId, verifycode, remember, auto) {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 20000);
+      try {
+        const res = await fetch('/api/login-pwd-cert', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ gwId, username, password, source, certId, verifycode, remember, auto }),
+          signal: controller.signal
+        });
+        clearTimeout(timeoutId);
+        const data = await res.json();
+        if (!res.ok) {
+          const error = new Error(data.error || '口令 + 证书登录失败');
           error.code = data.code || '';
           throw error;
         }
@@ -540,6 +582,10 @@
       await handleCertLogin();
       return;
     }
+    if (authMode === 'pwd-cert') {
+      await handlePasswordCertLogin();
+      return;
+    }
     const gwId = gatewaySelect.value;
     const username = usernameInput.value.trim();
     const password = passwordInput.value;
@@ -573,6 +619,46 @@
     return !!(err && err.code === 'password_expired');
   }
 
+  async function loadVerifyCodeImage() {
+    const gwId = gatewaySelect.value;
+    if (!gwId) return;
+    if (verifycodeLoading) {
+      verifycodeLoading.style.display = 'inline';
+      verifycodeLoading.textContent = '加载中...';
+    }
+    if (verifycodeImg) verifycodeImg.style.display = 'none';
+    try {
+      const res = await fetch(`/api/verifycode-image?gwId=${encodeURIComponent(gwId)}`);
+      const data = await res.json();
+      if (data && data.dataUrl) {
+        verifycodeImg.src = data.dataUrl;
+        verifycodeImg.style.display = 'block';
+        if (verifycodeLoading) verifycodeLoading.style.display = 'none';
+      } else if (data && data.error) {
+        if (verifycodeLoading) verifycodeLoading.textContent = '加载失败';
+      }
+    } catch (err) {
+      console.error('Failed to load verifycode image:', err);
+      if (verifycodeLoading) verifycodeLoading.textContent = '加载失败';
+    }
+  }
+
+  verifycodeImgWrapper?.addEventListener('click', () => loadVerifyCodeImage());
+  refreshVerifycodeBtn?.addEventListener('click', () => loadVerifyCodeImage());
+
+  function cleanErrorMessage(msg) {
+    if (!msg) return '';
+    let text = String(msg)
+      .replace(/\s*[\(（](?:错误代码|错误码|code)[:：]?\s*[^）\)]*[\)）]/gi, '')
+      .trim();
+    if (text.startsWith('登录失败: ') && text.length > 5) {
+      text = text.substring(5).trim();
+    } else if (text.startsWith('登录失败：') && text.length > 5) {
+      text = text.substring(5).trim();
+    }
+    return text;
+  }
+
   function friendlyLoginError(err) {
     if (isPasswordExpired(err)) {
       return '网关提示：账号口令已过期，请在下方设置新密码。';
@@ -580,11 +666,23 @@
     if (err && err.code === 'bad_credentials') {
       return '网关提示：用户名或密码错误，请检查输入的账号或密码！';
     }
+    if (err && err.code === 'verify_code') {
+      if (verifycodeGroup) {
+        verifycodeGroup.style.display = 'block';
+        loadVerifyCodeImage();
+      }
+      const rawMsg = err && err.message ? cleanErrorMessage(err.message) : '';
+      if (rawMsg && !rawMsg.includes('需要图形验证码') && !rawMsg.includes('0x80')) {
+        return rawMsg.startsWith('网关提示') ? rawMsg : ('网关提示：' + rawMsg);
+      }
+      return '网关提示：需要输入图形验证码，请输入验证码后再次连接。';
+    }
     if (err && err.code) {
       const certMsg = friendlyCertError(err.code);
       if (certMsg) return certMsg;
     }
-    return (err && err.message) || '未知错误';
+    const clean = cleanErrorMessage((err && err.message) || '未知错误');
+    return clean.startsWith('网关提示') ? clean : ('网关提示：' + clean);
   }
 
   // friendlyCertError maps the backend's stable certificate codes to text.
@@ -669,25 +767,119 @@
 
   // ==================== 证书登录 ====================
   function setAuthMode(mode) {
-    authMode = mode === 'cert' ? 'cert' : 'password';
+    authMode = (mode === 'cert' || mode === 'pwd-cert') ? mode : 'password';
     authTabs.forEach(tab => {
       const active = tab.dataset.mode === authMode;
       tab.classList.toggle('is-active', active);
       tab.setAttribute('aria-selected', active ? 'true' : 'false');
     });
-    passwordPanel.style.display = authMode === 'password' ? '' : 'none';
+    // The two-factor tab reuses the password panel and adds one certificate
+    // row; verifycode and remember/auto options stay available.
+    const showPasswordFields = authMode === 'password' || authMode === 'pwd-cert';
+    passwordPanel.style.display = showPasswordFields ? '' : 'none';
     certPanel.style.display = authMode === 'cert' ? '' : 'none';
+    pwdCertGroup.style.display = authMode === 'pwd-cert' ? '' : 'none';
     hidePasswordChangePanel();
     hideLoginAlert();
     updateConnectButtonLabel();
     if (authMode === 'cert') {
       loadCertificates();
     }
+    if (authMode === 'pwd-cert') {
+      loadPwdCertificates();
+    }
   }
 
   function updateConnectButtonLabel() {
     if (connectBtn.disabled) return;
-    connectBtnText.textContent = authMode === 'cert' ? '证书安全连接' : '立即连接';
+    if (authMode === 'cert') {
+      connectBtnText.textContent = '证书安全连接';
+    } else if (authMode === 'pwd-cert') {
+      connectBtnText.textContent = '口令 + 证书连接';
+    } else {
+      connectBtnText.textContent = '立即连接';
+    }
+  }
+
+  // ==================== 口令 + 证书（双因子） ====================
+  // The two-factor panel lists certificates in a plain select: the gateway
+  // needs one exact certificate, and unlike the certificate-only tab there is
+  // no per-certificate metadata to show here.
+  async function loadPwdCertificates() {
+    pwdCertSelect.innerHTML = '<option value="">正在检测证书...</option>';
+    let list = [];
+    try {
+      list = await api.listCerts(pwdCertSource);
+    } catch (err) {
+      pwdCertSelect.innerHTML = `<option value="">${escapeHtml(err.message || '读取证书列表失败')}</option>`;
+      return;
+    }
+    if (!Array.isArray(list) || list.length === 0) {
+      const hint = pwdCertSource === 0
+        ? '未找到已导入的证书，请先在「证书登录」中导入'
+        : '未在系统证书库中找到带私钥的个人证书';
+      pwdCertSelect.innerHTML = `<option value="">${hint}</option>`;
+      pwdCertId = '';
+      return;
+    }
+    if (!list.some(c => c.id === pwdCertId)) {
+      pwdCertId = list[0].id;
+    }
+    pwdCertSelect.innerHTML = '';
+    list.forEach(cert => {
+      const opt = document.createElement('option');
+      opt.value = cert.id;
+      opt.textContent = (cert.name || cert.id) + (cert.isExpired ? '（已过期）' : '');
+      opt.selected = cert.id === pwdCertId;
+      pwdCertSelect.appendChild(opt);
+    });
+  }
+
+  pwdCertSelect?.addEventListener('change', () => {
+    pwdCertId = pwdCertSelect.value;
+  });
+
+  pwdCertSourceSelect?.addEventListener('change', () => {
+    pwdCertSource = parseInt(pwdCertSourceSelect.value, 10) || 0;
+    pwdCertId = '';
+    loadPwdCertificates();
+  });
+
+  pwdCertRefreshBtn?.addEventListener('click', () => loadPwdCertificates());
+
+  async function handlePasswordCertLogin() {
+    const gwId = gatewaySelect.value;
+    const username = usernameInput.value.trim();
+    const password = passwordInput.value;
+    const verifycode = verifycodeInput.value.trim();
+    const remember = rememberPwdCheckbox.checked;
+    const auto = autoLoginCheckbox.checked;
+
+    if (!gwId || !username || !password) {
+      showLoginAlert('请输入网关、用户名和登录密码', 'error');
+      return;
+    }
+    if (!pwdCertId) {
+      showLoginAlert('请先选择一张客户端证书（网关要求口令 + 证书同时认证）', 'error');
+      return;
+    }
+
+    hideLoginAlert();
+    setConnectingState(true);
+    try {
+      const res = await api.loginWithPasswordAndCert(gwId, username, password, pwdCertSource, pwdCertId, verifycode, remember, auto);
+      showConnectedView(res);
+    } catch (err) {
+      const msg = friendlyLoginError(err);
+      if (isPasswordExpired(err)) {
+        showPasswordChangePanel();
+      }
+      showLoginAlert(msg, 'error');
+      setConnectingState(false);
+      if (err && (err.code === 'cert_expired' || err.code === 'cert_invalid' || err.code === 'cert_revoked')) {
+        loadPwdCertificates();
+      }
+    }
   }
 
   authTabs.forEach(tab => {
@@ -877,6 +1069,15 @@
       setAuthMode('password');
       return;
     }
+    if (currentGateway.certWithPassword === true) {
+      // Two-factor: the password fields are reused, plus the remembered
+      // certificate. certtype/selectedcertid come from the same login.
+      pwdCertSource = currentGateway.certType === 1 ? 1 : 0;
+      if (pwdCertSourceSelect) pwdCertSourceSelect.value = String(pwdCertSource);
+      pwdCertId = currentGateway.selectedCertId || '';
+      setAuthMode('pwd-cert');
+      return;
+    }
     if (currentGateway.authType === 1) {
       certSource = currentGateway.certType === 1 ? 1 : 0;
       certSourceButtons.forEach(b => {
@@ -957,7 +1158,7 @@
   }
 
   function showLoginAlert(msg, type) {
-    loginAlert.textContent = msg;
+    loginAlert.textContent = cleanErrorMessage(msg);
     loginAlert.className = `alert-box alert-${type}`;
     loginAlert.style.display = 'block';
   }
