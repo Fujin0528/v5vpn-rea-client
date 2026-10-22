@@ -45,18 +45,16 @@
 
 ### 3.2 协议交互流程 (Network Protocol)
 1. **版本探针**：`GET /vpn/version.xml` $\rightarrow$ `<VERSION major="2" minor="0"/>`。
-2. **加密口令认证**：`POST /vpn/user/auth/password`
-   - 加密算法：AES-128-CBC，PKCS7 填充，Raw 字符串拼接（避免 URL 转义 Base64 尾部字符）
-   - **关键参数 `encode`**：
-     - `encode=2`：**2.0 网关标准**，指示网关使用 AES-128-CBC 解密。若误填 `encode=1`，网关会按 v1.0 纯 Base64 解码，导致解密密文为乱码并报 `0x8000001A (用户名或密码错误)`。
-     - `encode=1`：v1.0 旧版网关模式，仅对明文口令做 Base64 编码。
-   - 字段：`username={EncUser}&password={EncPwd}&encode=2&verifycode={code}`。
+2. **口令认证**：`POST /vpn/user/auth/password`
+   - 编码方式：标准 Base64（`SecLogin.dll` 的 base64 例程对用户名与口令各编码一次），Raw 字符串拼接（避免 URL 转义 Base64 尾部字符）
+   - **关键参数 `encode`**：`encode=1` 指示网关按 Base64 解码。原厂 5.3.3.x 客户端在整条口令路径上没有任何 AES 加密调用（`SecLogin.dll` 未导入 `CryptEncrypt`，全部件内无 `encode=2` 字样）。
+   - 字段：`username={Base64(User)}&password={Base64(Pwd)}&encode=1&verifycode={code}`。
    - 登录成功返回 Session Cookie：`VSG_SESSIONID`。
    - **口令过期识别**：仅以网关结果码 `0x00000100`（十进制 256）为准，与原厂 `SecUI.exe` 的 `cmp eax, 0x100` 分支一致。`0x101`（用户名或口令不匹配）和 `0x8000001A`（密文解析失败）都按账号密码错误处理，即使响应文案提到「口令过期」也不会进入改密流程。若响应为 GBK 编码，客户端会自动转换为 UTF-8 再解析。
 3. **口令修改**：`POST /vpn/user/auth/pwdchange`
    - 复用收到 `0x100` 登录响应的同一 HTTP 客户端，携带该响应下发的 `VSG_SESSIONID` Cookie。
-   - 字段：`old_pwd={Base64(OldPwd)}&new_pwd={Base64(NewPwd)}&encode=1`。
-   - 密码采用标准 Base64 编码，`encode=1` 指示网关使用 Base64 解码。只有解析到明确的成功结果码 `0` 才算修改成功；HTTP 200 但缺少结果码或 XML 无法解析均按失败处理。
+   - 字段：`old_pwd={OldPwd}&new_pwd={NewPwd}`，两个口令均按 UTF-8 明文提交，不携带 `encode` 参数（原厂客户端的拼装格式即 `old_pwd=%s&new_pwd=%s`）。
+   - 只有解析到明确的成功结果码 `0` 才算修改成功；HTTP 200 但缺少结果码或 XML 无法解析均按失败处理。
    - 修改成功后，客户端自动使用新密码完成登录并建立隧道。
 4. **获取授权资源**：`GET /vpn/user/portal/intergration.xml?version=2.0`
    - 获得 TCP/UDP 内网资源列表与端口、策略及 DNS。
@@ -74,7 +72,7 @@
 |:---|:---|
 | 已在其中完成端到端验证的原厂客户端 | 5.3.3.x 系列 |
 | 网关协议版本 | v2.0 (`/vpn/version.xml` 返回 `major=2 minor=0`) |
-| 支持的登录方式 | 口令登录 (`/vpn/user/auth/password`)、证书登录 (`/vpn/user/auth/cert`，支持本地 `.p12/.pfx` 文件证书及 Windows 系统证书库) |
+| 支持的登录方式 | 口令登录 (`/vpn/user/auth/password`)、证书登录 (`/vpn/user/auth/cert`，支持本地 `.p12/.pfx` 文件证书及 Windows 系统证书库)、口令 + 证书双因子登录（先提交口令，网关要求证书因子后再于同一会话呈递证书，两步串行） |
 | 未支持 | USB Key 智能卡硬件认证（开发中）、匿名登录、国密(SM2/SM3/SM4)套件、IPsec/NDIS 虚拟网卡模式 |
 
 本项目仅实现「SSL VPN 门户 + HTTP CONNECT 隧道透传」这条路径，
@@ -146,6 +144,22 @@ http://127.0.0.1:45678
 
 # 使用 Windows 系统证书库证书登录（-cert-type 1，-cert 传指纹或 CN）：
 .\v5vpn-rea.exe -cli -connect "<gateway-name>" -cert-type 1 -cert "<SHA1-fingerprint>"
+```
+
+#### 口令 + 证书双因子登录：
+
+网关同时要求口令与客户端证书时，加 `-pwd-cert`：口令先提交到
+`/vpn/user/auth/password`；网关在结果码中要求证书因子（`0x2`）后，
+再于同一会话上把客户端证书经 `/vpn/user/auth/cert` 呈递（两步串行，
+证书经 TLS 握手上送、请求无正文）。界面上对应「口令+证书」标签页，
+输入账号口令并选择证书即可。
+
+```bash
+# 已导入证书（ID 或别名）+ 账号口令：
+.\v5vpn-rea.exe -cli -connect "<gateway-name>" -pwd-cert -cert "<cert-id-or-alias>" -user "<username>" -pwd "<password>"
+
+# 外部 .p12 文件 + 账号口令：
+.\v5vpn-rea.exe -cli -connect "<gateway-name>" -pwd-cert -cert "path/to/cert.p12" -cert-pwd "<证书口令>" -user "<username>" -pwd "<password>"
 ```
 
 ---
@@ -259,7 +273,21 @@ mygo 内建了 ed25519 签名的自更新机制。`mygo.json` 的 `updates.publi
 3. 可执行文件目录
 4. `configs/`（源码树布局）
 
-## 11. 贡献
+## 11. 本地模拟服务端（Mock Server）
+
+仓库内置了针对网御星云 / 启明星辰 V5VPN 网关的独立 HTTPS 模拟测试服务，方便在无真实网关环境下做双因素、改密等全流程断网调试：
+
+```bash
+# 启动模拟服务端（默认 127.0.0.1:8443，模式为口令+证书双因素）
+go run ./cmd/mockserver
+
+# 可选模式：pwd-cert (双因素), pwd-only (单口令), pwd-change (改密挑战), err-auth (认证失败), token (令牌), sms (短信)
+go run ./cmd/mockserver -mode pwd-only
+```
+
+启动后可在浏览器打开 `https://127.0.0.1:8443/` 仪表盘实时观察请求流量或动态切换模式。
+
+## 12. 贡献
 
 - 在 issue、PR、commit message 中**不要**粘贴真实网关地址、账号或密码
   （DES 密文同样不应粘贴，凭证扫描器会批量尝试）；
