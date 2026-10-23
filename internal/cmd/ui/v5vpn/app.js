@@ -45,7 +45,7 @@
   const connectBtnText = document.getElementById('connect-btn-text');
   const connectSpinner = connectBtn.querySelector('.btn-spinner');
   const voluntaryChangePwdLink = document.getElementById('voluntary-change-pwd-link');
-  const certOnlyLink = document.getElementById('cert-only-link');
+  const certLoginBtn = document.getElementById('cert-login-btn');
 
   // DOM Elements - Challenge Modal (gateway-driven, body is rebuilt per kind)
   const challengeModal = document.getElementById('challenge-modal');
@@ -333,6 +333,33 @@
         const data = await res.json();
         if (!res.ok) {
           const error = new Error(data.error || '短信认证失败');
+          error.code = data.code || '';
+          throw error;
+        }
+        return data;
+      } catch (err) {
+        clearTimeout(timeoutId);
+        if (err.name === 'AbortError') {
+          throw new Error('网关响应超时(20s)，请检查网络与网关端口连通性');
+        }
+        throw err;
+      }
+    },
+    // Submit the dynamic-token (OTP) code and finish the challenged login.
+    async tokenLogin(gwId, code) {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 20000);
+      try {
+        const res = await fetch('/api/token-login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ gwId, code }),
+          signal: controller.signal
+        });
+        clearTimeout(timeoutId);
+        const data = await res.json();
+        if (!res.ok) {
+          const error = new Error(data.error || '动态令牌认证失败');
           error.code = data.code || '';
           throw error;
         }
@@ -639,6 +666,11 @@
     return !!(err && err.code === 'cert_challenge');
   }
 
+  function isTokenChallenge(err) {
+    // The gateway asked for the dynamic-token (OTP) factor (code 4).
+    return !!(err && err.code === 'token_challenge');
+  }
+
   // handleAuthOutcome runs one factor submission and dispatches the result.
   // Every modal submit handler reuses it; a follow-up challenge simply
   // replaces the open modal with the next one.
@@ -670,6 +702,10 @@
     }
     if (isCertChallenge(err)) {
       openChallengeModal('cert', { standalone: false });
+      return;
+    }
+    if (isTokenChallenge(err)) {
+      openChallengeModal('token');
       return;
     }
     if (err && err.code === 'verify_code') {
@@ -722,6 +758,9 @@
     } else if (kind === 'sms') {
       challengeTitle.textContent = '短信认证';
       buildSMSBody();
+    } else if (kind === 'token') {
+      challengeTitle.textContent = '动态令牌认证';
+      buildTokenBody();
     } else if (kind === 'pwd-change') {
       pwdChangeVoluntary = !!(opts && opts.voluntary);
       challengeTitle.textContent = '修改密码';
@@ -884,6 +923,77 @@
       }
     } finally {
       // 模态被替换或关闭后这些元素已不在文档里，无需恢复。
+      if (submitBtn.isConnected) {
+        submitBtn.disabled = false;
+        submitBtn.textContent = '验证并连接';
+      }
+    }
+  }
+
+  // ==================== 动态令牌（OTP 挑战） ====================
+  // 网关要求动态令牌因子（RESULT code 0x4）。与短信不同，令牌码由用户
+  // 手里的硬件/软件令牌自行生成，没有「发送」步骤：输入即提交。
+  function buildTokenBody() {
+    challengeBody.innerHTML = `
+      <p class="challenge-hint">网关要求动态令牌认证（多因素认证）。输入硬件或软件令牌当前显示的动态口令后继续连接。</p>
+      <div class="alert-box alert-error" id="modal-alert" style="display:none;"></div>
+      <div class="form-group">
+        <label for="modal-token-input">动态口令：</label>
+        <div class="sms-input-row">
+          <input type="text" id="modal-token-input" class="form-control" placeholder="请输入令牌上的动态口令" maxlength="8" autocomplete="one-time-code" inputmode="numeric">
+        </div>
+      </div>
+      <div class="challenge-actions">
+        <button type="button" id="modal-token-submit" class="btn btn-primary">验证并连接</button>
+      </div>
+    `;
+    const input = document.getElementById('modal-token-input');
+    document.getElementById('modal-token-submit').addEventListener('click', (e) => {
+      e.preventDefault();
+      handleTokenLogin();
+    });
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        handleTokenLogin();
+      }
+    });
+    input.focus();
+  }
+
+  async function handleTokenLogin() {
+    const gwId = gatewaySelect.value;
+    const input = document.getElementById('modal-token-input');
+    const code = input ? input.value.trim() : '';
+    const submitBtn = document.getElementById('modal-token-submit');
+    if (!gwId) {
+      modalAlert('请选择网关节点', 'error');
+      return;
+    }
+    if (!code) {
+      modalAlert('请输入令牌上的动态口令', 'error');
+      return;
+    }
+    submitBtn.disabled = true;
+    submitBtn.textContent = '正在验证...';
+    setConnectingState(true);
+    try {
+      const res = await api.tokenLogin(gwId, code);
+      closeChallengeModal();
+      showConnectedView(res);
+      return;
+    } catch (err) {
+      setConnectingState(false);
+      if (err && err.code === 'token_code_error') {
+        // 网关只拒绝了这一个码，挑战仍然有效：留在模态里让用户重输。
+        modalAlert('网关提示：动态令牌码错误，请核对令牌当前显示后重新输入。', 'error');
+        input.value = '';
+        input.focus();
+      } else {
+        // 其余结果交给统一分发：可能是下一个挑战模态，也可能是硬错误。
+        dispatchAuthError(err);
+      }
+    } finally {
       if (submitBtn.isConnected) {
         submitBtn.disabled = false;
         submitBtn.textContent = '验证并连接';
@@ -1108,7 +1218,7 @@
         passwordInput.value = newPassword;
         closeChallengeModal();
         if (err.code === 'verify_code') {
-          showLoginAlert('密码已修改，但自动登录需要图形验证码：请点击「立即连接」完成验证。', 'error');
+          showLoginAlert('密码已修改，但自动登录需要图形验证码：请点击「口令登录」完成验证。', 'error');
         } else {
           showLoginAlert('密码已修改，但自动登录未完成：' + baseMsg + ' 请使用新密码重新连接。', 'error');
         }
@@ -1424,8 +1534,9 @@
     openChallengeModal('pwd-change', { voluntary: true });
   });
 
-  // 证书免密入口（原厂 Opt_Cert）：身份完全由 mTLS 证书证明，不经过口令步。
-  certOnlyLink?.addEventListener('click', (e) => {
+  // 证书登录入口（原厂 Opt_Cert）：与口令登录平级的独立起点，身份完全由
+  // mTLS 证书证明，不经过口令步；网关若还要求短信等因子，入口之后走模态。
+  certLoginBtn?.addEventListener('click', (e) => {
     e.preventDefault();
     if (!gatewaySelect.value) {
       showLoginAlert('请选择网关节点', 'error');
@@ -1460,7 +1571,7 @@
     } else {
       connectBtn.disabled = false;
       connectSpinner.style.display = 'none';
-      connectBtnText.textContent = '立即连接';
+      connectBtnText.textContent = '🔑 口令登录';
     }
   }
 

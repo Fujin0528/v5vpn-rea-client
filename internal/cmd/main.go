@@ -818,6 +818,29 @@ func newAPIRouter(uiFS fs.FS, vpnService *service.VPNService, atrustSvc *service
 		writeLoginResult(w, res, err)
 	})
 
+	// /api/token-login submits the dynamic-token (OTP) code and finishes the
+	// challenged login: /vpn/user/auth/token over the session that got code 4.
+	mux.HandleFunc("/api/token-login", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			GWID string `json:"gwId"`
+			Code string `json:"code"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if gw := vpnService.GetConfig().FindGateway(req.GWID); gw != nil && gw.IsATrust() {
+			writeATrustRoutingError(w, gw.Name, config.ProtocolATrust)
+			return
+		}
+		res, err := vpnService.LoginWithToken(req.GWID, req.Code)
+		writeLoginResult(w, res, err)
+	})
+
 	// /api/cert-factor answers a gateway certificate challenge (password step
 	// returned code 2): the chosen certificate is presented on
 	// /vpn/user/auth/cert over the challenged session.
@@ -1070,7 +1093,8 @@ func writeLoginResult(w http.ResponseWriter, res map[string]any, err error) {
 		// A challenge is not a rejected request: the credentials were
 		// accepted and the gateway asks for another factor, so the caller
 		// gets the same 409 as the password-expiry challenge.
-		if code == "password_expired" || code == "sms_challenge" || code == "cert_challenge" {
+		if code == "password_expired" || code == "sms_challenge" ||
+			code == "cert_challenge" || code == "token_challenge" {
 			status = http.StatusConflict
 		}
 		payload := map[string]any{"error": err.Error()}

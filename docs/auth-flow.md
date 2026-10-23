@@ -46,17 +46,18 @@
   （图形验证码 / 客户端证书 / 短信 / 改密）共用一个模态壳，`openChallengeModal`
   按类型重建 body；**多跳链表现为模态的连续替换**，不是面板堆叠。
 
-## 3. 界面形态：固定表单 + 挑战模态
+## 3. 界面形态：两个平级入口 + 挑战模态
 
-登录框**只**包含固定内容，高度恒定：
+登录框**只**包含固定内容，高度恒定。**口令登录与证书登录是两个平级的
+独立入口**（对应原厂 `Opt_Password` / `Opt_Cert`）——它们是登录的起点，
+不是挑战；所有网关挑战都发生在入口**之后**，一律弹模态：
 
 ```
 网关节点 + ⚙️ 设置
 用户名
 登录密码
 [记住密码] [自动登录]        修改密码
-🪪 使用客户端证书直接登录（免口令）
-[ 立即连接 ]
+[ 🔑 口令登录 ] [ 🪪 证书登录 ]   ← 两个并排的入口按钮
 ```
 
 所有网关挑战一律弹模态（`#challenge-modal`），绝不住进登录框：
@@ -66,24 +67,24 @@
 | 图形验证码 | `verify_code` | `buildVerifycodeBody` | 重发 `/api/login`（带一次性验证码） |
 | 客户端证书 | `cert_challenge` | `buildCertBody`（链中模式） | `/api/cert-factor` |
 | 短信 | `sms_challenge` | `buildSMSBody` | `/api/sms-send` + `/api/sms-login` |
+| 动态令牌 | `token_challenge` | `buildTokenBody` | `/api/token-login` |
 | 改密 | `password_expired` | `buildPwdChangeBody` | `/api/change-password` |
 
 **为什么固定表单**：挑战组件住在登录框里时，每弹一个挑战登录框就长高一截，
 连败几次后面板堆叠、按钮让位，视觉来回跳。模态化之后登录框永远是一个
 尺寸，挑战来去都在浮层里。
 
-**证书免密入口是常驻链接，不是页签**：原厂客户端有三个互斥登录入口
-（口令 / 证书 / 匿名），单证书免密登录真实存在——身份完全由 mTLS 证书
-证明，**口令步不是必经的**。所以证书入口与口令表单是并列关系（一行
-链接），点击后打开同一个证书模态的 standalone 模式（提交走
-`/api/login-cert`），而链中模式提交走 `/api/cert-factor`——两种模式
-共享 `buildCertBody`，只差提交端点与「证书自动登录」勾选的可见性。
+**证书入口是按钮不是页签**：证书登录与口令登录是并列的起点（单证书免密
+真实存在，口令步不是必经的），所以两个入口并排平级；点击「证书登录」
+打开证书模态的 standalone 模式（提交走 `/api/login-cert`），而口令提交后
+网关要求证书因子（`0x2`）时的链中模式提交走 `/api/cert-factor`——两种
+模式共享 `buildCertBody`，只差提交端点与「证书自动登录」勾选的可见性。
 
 ## 4. 不变量（改动前自查）
 
 1. **登录框高度恒定**。任何新挑战都进模态；往 `#login-form` 里加
    挑战组件 = 走偏。`ui_structure_test.go` 的 `TestUIsAreSeparated`
-   要求 `challenge-modal` 与 `cert-only-link` 存在，即为此守卫。
+   要求 `challenge-modal` 与 `cert-login-btn` 存在，即为此守卫。
 2. **客户端不写死因子链**。不许出现「口令之后一定是短信」之类的假设；
    一切以 `NextAuthStep` 的返回为准。服务层测试
    `TestSubmitCertFactorSurfacesSMSChallenge` 钉死了「证书后还能跳短信」。
@@ -100,12 +101,14 @@
 
 | 测试 | 守什么 |
 |:---|:---|
-| `internal/protocol/smc_auth_test.go` | 结果码 → AuthStep 解码契约 |
+| `internal/protocol/smc_auth_test.go` | 短信结果码 → AuthStep 解码契约 |
+| `internal/protocol/token_auth_test.go` | 令牌结果码 → AuthStep 解码契约 |
 | `internal/service/cert_service_test.go` | 挑战保留/消费、链上下文、持久化 |
+| `internal/service/vpn_service_token_test.go` | 令牌挑战保留与重试 |
 | `internal/service/vpn_service_smc_test.go` | 短信链上证书因子的保留 |
 | `internal/cmd/api_routes_test.go` | 挑战端点的协议守卫与错误形状 |
 | `internal/cmd/ui_structure_test.go` | 界面结构：模态存在、id 一致、两套 UI 分家 |
-| `test/e2e_v5vpn_multi_test.js` | 9 场景全链截图（含三因素链的模态连续替换） |
+| `test/e2e_v5vpn_multi_test.js` | 10 场景全链截图（含三因素链的模态连续替换） |
 
 E2E 的场景 9（口令 → 证书模态 → 短信模态）是本设计的验收样板：两个
 模态先后替换、挑战会话不断、错码原地重试、最终按「口令+证书」记录会话。

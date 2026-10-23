@@ -335,6 +335,44 @@ func (c *Client) AuthSMC(code string) (*AuthResponse, error) {
 	return &authResp, nil
 }
 
+// AuthToken submits the dynamic-token (OTP) code on /vpn/user/auth/token and
+// marks the session logged in. It completes a login the gateway challenged
+// with the token factor (RESULT code 0x4), so it must run on the same client
+// that received the challenge: the gateway binds the code to the VSG_SESSIONID
+// cookie issued with that response. A wrong code leaves the challenge live,
+// so the caller may ask the user to re-enter it.
+func (c *Client) AuthToken(code string) (*AuthResponse, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.Logger("INFO", "Submitting dynamic token code")
+
+	authResp, respBody, statusCode, err := c.postAuthForm("/vpn/user/auth/token", tokenAuthBody(code))
+	if err != nil {
+		return nil, err
+	}
+
+	c.captureSession()
+
+	if authResp.Result.Code != "" && !isSuccessCode(authResp.Result.Code) {
+		authErr := newAuthError(authResp.Result.Code, authResp.Result.Msg)
+		c.Logger("ERROR", "Gateway rejected the token code: %s", authErr.Error())
+		return &authResp, authErr
+	}
+
+	if statusCode != http.StatusOK {
+		return nil, fmt.Errorf("token auth failed with HTTP status %d: %s", statusCode, string(respBody))
+	}
+
+	if c.SessionID == "" {
+		c.Logger("ERROR", "No valid Session ID received after token auth. Response: %s", string(respBody))
+		return nil, fmt.Errorf("动态令牌认证未下发有效会话ID")
+	}
+
+	c.markLoggedInLocked()
+	return &authResp, nil
+}
+
 // SendSMC asks the gateway to deliver the SMS verification code to the user's
 // registered phone. The original client binds it to the "发送短信" button
 // (SecLogin.dll vtable slot 12: GET /vpn/user/auth/send_smc, no body); the

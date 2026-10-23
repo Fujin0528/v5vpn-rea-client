@@ -54,23 +54,11 @@ body {
   overflow: hidden;
 }
 
-/* 证书免密入口：常驻一行，登录框高度恒定（原厂 Opt_Cert 入口） */
-.cert-entry-row {
-  margin: 4px 0 14px;
-  text-align: center;
-}
-
-.cert-entry-link {
-  font-size: 0.84rem;
-  color: var(--text-muted);
-  text-decoration: none;
-  cursor: pointer;
-  transition: color var(--transition-fast);
-}
-
-.cert-entry-link:hover {
-  color: var(--accent);
-  text-decoration: underline;
+/* 两个平级登录入口：口令登录（主）与证书登录（副）并排，高度恒定 */
+.action-btn-double {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
 }
 
 /* ==================== 短信认证（挑战模态内） ==================== */

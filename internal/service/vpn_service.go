@@ -1120,6 +1120,10 @@ func AuthErrorCode(err error) string {
 		return "sms_challenge"
 	case protocol.AuthKindSMCCodeError:
 		return "sms_code_error"
+	case protocol.AuthKindTokenRequired:
+		return "token_challenge"
+	case protocol.AuthKindTokenCodeError:
+		return "token_code_error"
 	case protocol.AuthKindCertInvalid:
 		return "cert_invalid"
 	case protocol.AuthKindCertUnavailable:
@@ -1162,9 +1166,10 @@ func (s *VPNService) keepChallengeLocked(client *protocol.Client, username strin
 	}
 	next := protocol.NextAuthStep(authErr.Code)
 	switch next {
-	case protocol.AuthStepPasswordChange, protocol.AuthStepSMC, protocol.AuthStepCertificate:
-		// Follow-ups this build can drive. Anything else (token, machine
-		// info, ...) falls through to the caller's generic error path.
+	case protocol.AuthStepPasswordChange, protocol.AuthStepSMC,
+		protocol.AuthStepCertificate, protocol.AuthStepToken:
+		// Follow-ups this build can drive. Anything else (machine info, ...)
+		// falls through to the caller's generic error path.
 	default:
 		return false
 	}
@@ -1272,6 +1277,62 @@ func (s *VPNService) LoginWithSMSCode(gwIdentifier, code string) (map[string]any
 	// recorded: its afterAuth persists the flow's mode selection (password +
 	// certificate, certificate), and a password-only chain keeps the password
 	// mode of record.
+	if afterAuth != nil {
+		afterAuth(gwID)
+	} else {
+		s.rememberPasswordMode(gwName)
+	}
+	return s.enterConnected(client, username, cert, authType), nil
+}
+
+// LoginWithToken completes a login the gateway challenged with the
+// dynamic-token (OTP) factor: the code from the user's hardware or software
+// token is submitted on /vpn/user/auth/token over the challenged session, and
+// on success the tunnel comes up exactly as after a plain login. A wrong code
+// keeps the challenge alive for a retry. The hop count is the gateway's
+// choice: an accepted code can be answered with yet another challenge, which
+// is kept and surfaced the same way the token hop was.
+func (s *VPNService) LoginWithToken(gwIdentifier, code string) (map[string]any, error) {
+	s.mu.Lock()
+	gw := s.Config.FindGateway(gwIdentifier)
+	if gw == nil {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("gateway %q not found", gwIdentifier)
+	}
+	ch := s.challengeLocked(gw, protocol.AuthStepToken)
+	if ch == nil {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("当前没有待完成的动态令牌认证，请重新登录")
+	}
+	client, username, cert, afterAuth, authType := ch.client, ch.username, ch.cert, ch.afterAuth, ch.authType
+	gwID, gwName := gw.ID, gw.Name
+	s.mu.Unlock()
+
+	s.setStatus("Connecting", fmt.Sprintf("Submitting dynamic token code to %s (%s:%d)...", gwName, client.GatewayIP, client.GatewayPort))
+	s.Log("INFO", "Submitting dynamic token code for user %s", username)
+
+	if _, err := client.AuthToken(code); err != nil {
+		s.mu.Lock()
+		if protocol.IsTokenCodeError(err) {
+			// A wrong code: the challenge stays live for an in-place retry.
+		} else if !s.keepChallengeLocked(client, username, err, cert, afterAuth, authType) {
+			// The code was accepted but the gateway asks for a factor this
+			// build cannot drive: the token hop is consumed either way, so
+			// the stale challenge must go.
+			s.challenge = nil
+		}
+		s.mu.Unlock()
+		s.setStatus("Error", fmt.Sprintf("动态令牌认证失败: %v", err))
+		return nil, err
+	}
+
+	// The challenge is consumed; nothing else may submit against this session.
+	s.mu.Lock()
+	if s.challenge == ch {
+		s.challenge = nil
+	}
+	s.mu.Unlock()
+
 	if afterAuth != nil {
 		afterAuth(gwID)
 	} else {

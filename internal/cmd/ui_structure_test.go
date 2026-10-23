@@ -258,7 +258,7 @@ func TestUIsAreSeparated(t *testing.T) {
 				"'/api/login'", "'/api/logout'", "'/api/status'",
 				"protocol !== 'atrust'",
 				"new-gw-algo", "gw-algo-tag",
-				"verifycode", "challenge-modal", "cert-only-link",
+				"verifycode", "challenge-modal", "cert-login-btn",
 				"connected-change-pwd-btn",
 				`href="/atrust/"`,
 			},
@@ -327,8 +327,8 @@ func TestUIViewsAreDistinct(t *testing.T) {
 	at := idSet("ui/atrust/")
 
 	// 这些 ID 只该属于 V5VPN 一套；名称本身已经说明了归属。挑战模态与
-	// 证书免密入口是网关驱动状态机的界面形态，aTrust 那套没有。
-	v5Only := []string{"new-gw-algo", "challenge-modal", "cert-only-link", "connected-change-pwd-btn"}
+	// 证书登录入口是网关驱动状态机的界面形态，aTrust 那套没有。
+	v5Only := []string{"new-gw-algo", "challenge-modal", "cert-login-btn", "connected-change-pwd-btn"}
 	for _, id := range v5Only {
 		if !v5[id] {
 			t.Errorf("V5VPN 界面缺少 %q", id)

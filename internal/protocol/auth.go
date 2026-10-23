@@ -35,6 +35,16 @@ const (
 	// 0x10A rejects a wrong code (language.xml TAG 266 短信码错误).
 	AuthKindSMCRequired
 	AuthKindSMCCodeError
+	// Dynamic-token (OTP) factor results. 0x4 is the challenge bit of the
+	// auth factor mask (SecUI.exe switches to its Edit_Token state on it);
+	// the code is submitted on /vpn/user/auth/token. The wrong-code rejection
+	// is 0x109 by inference only: the SMS rejection is 0x10A (TAG 266) and
+	// the token message 动态令牌码错误 sits next to 短信码错误 in the
+	// original language tables, so TAG 265 is the plausible slot. The real
+	// gateway has not been captured on a token rejection yet — if it answers
+	// a different code, fix this one constant.
+	AuthKindTokenRequired
+	AuthKindTokenCodeError
 )
 
 const (
@@ -64,6 +74,13 @@ const (
 	// submitted on /vpn/user/auth/smc. 0x10A is the wrong-code rejection.
 	codeSMCRequired  = 0x8
 	codeSMCCodeError = 0x10A // TAG 266 短信码错误
+
+	// Dynamic-token (OTP) factor results. 0x4 is the challenge bit of the
+	// mask (SecUI.exe dispatches it to the Edit_Token state); the code is
+	// submitted on /vpn/user/auth/token. 0x109 is the inferred wrong-code
+	// rejection — see AuthKindTokenCodeError for the reasoning.
+	codeTokenRequired  = 0x4
+	codeTokenCodeError = 0x109
 )
 
 // AuthError is a gateway authentication rejection with a stable kind.
@@ -133,6 +150,16 @@ func (e *AuthError) Error() string {
 			msg = "短信码错误"
 		}
 		return fmt.Sprintf("短信验证失败: %s (错误代码: %s)", msg, displayCode(e.Code))
+	case AuthKindTokenRequired:
+		if msg == "" {
+			msg = "多因素认证，动态令牌认证"
+		}
+		return fmt.Sprintf("需要动态令牌: %s (错误代码: %s)", msg, displayCode(e.Code))
+	case AuthKindTokenCodeError:
+		if msg == "" {
+			msg = "动态令牌码错误"
+		}
+		return fmt.Sprintf("动态令牌验证失败: %s (错误代码: %s)", msg, displayCode(e.Code))
 	default:
 		if msg == "" {
 			msg = "网关拒绝登录认证"
@@ -160,6 +187,22 @@ func IsSMSChallenge(err error) bool {
 func IsSMCCodeError(err error) bool {
 	var authErr *AuthError
 	return errors.As(err, &authErr) && authErr.Kind == AuthKindSMCCodeError
+}
+
+// IsTokenChallenge reports whether err is the gateway's dynamic-token (OTP)
+// challenge: the preceding factor was accepted and the gateway now wants the
+// code from the user's hardware/software token, submitted on
+// /vpn/user/auth/token over the same session.
+func IsTokenChallenge(err error) bool {
+	var authErr *AuthError
+	return errors.As(err, &authErr) && authErr.Kind == AuthKindTokenRequired
+}
+
+// IsTokenCodeError reports whether err rejected the submitted token code. The
+// challenge stays live, so the caller may ask the user to re-enter it.
+func IsTokenCodeError(err error) bool {
+	var authErr *AuthError
+	return errors.As(err, &authErr) && authErr.Kind == AuthKindTokenCodeError
 }
 
 func displayCode(code string) string {
@@ -203,6 +246,10 @@ func classifyAuth(code, _ string) AuthKind {
 		return AuthKindSMCRequired
 	case codeSMCCodeError:
 		return AuthKindSMCCodeError
+	case codeTokenRequired:
+		return AuthKindTokenRequired
+	case codeTokenCodeError:
+		return AuthKindTokenCodeError
 	default:
 		return AuthKindOther
 	}
@@ -374,4 +421,12 @@ func passwordChangeBody(oldPassword, newPassword string) string {
 // are digits, so raw concatenation reproduces the original byte for byte.
 func smsAuthBody(code string) string {
 	return "smc=" + code
+}
+
+// tokenAuthBody formats the request body for /vpn/user/auth/token. SecLogin.dll
+// posts the code through the raw format string "token=%s" (0x10041dc8) — the
+// same shape as the SMS form: no encode parameter, no escaping. Token codes
+// are digits, so raw concatenation reproduces the original byte for byte.
+func tokenAuthBody(code string) string {
+	return "token=" + code
 }

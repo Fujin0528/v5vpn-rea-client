@@ -10,7 +10,7 @@
 #   ./test/run.sh go           # 只跑 go 集成测试
 #   ./test/run.sh ui           # 只跑 aTrust UI
 #   ./test/run.sh ui v5vpn     # 跑 v5vpn UI
-#   ./test/run.sh v5vpn-multi  # 跑 v5vpn 全场景（9合1）双因素/三因素/单口令/证书/改密/验证码/短信认证UI回归
+#   ./test/run.sh v5vpn-multi  # 跑 v5vpn 全场景（10合1）双因素/三因素/单口令/证书/改密/验证码/短信/动态令牌UI回归
 #   ./test/run.sh all          # go + aTrust UI + v5vpn UI
 
 set -euo pipefail
@@ -42,7 +42,7 @@ run_ui() {
 }
 
 run_v5vpn_multi() {
-  echo "=== V5VPN 全场景 9 合 1 多重登录与异常路径测试 ==="
+  echo "=== V5VPN 全场景 10 合 1 多重登录与异常路径测试 ==="
   cd "$DIR"
   if [ ! -d node_modules ]; then
     echo "安装依赖: npm install"

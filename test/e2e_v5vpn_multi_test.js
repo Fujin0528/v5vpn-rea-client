@@ -380,7 +380,7 @@ async function run() {
       await record(page, {
         stepId: 1,
         title: '输入账号密码并准备单因素连接',
-        desc: '固定表单输入 admin / admin123，连接按钮显示「立即连接」，无任何附加因子组件。',
+        desc: '固定表单输入 admin / admin123，口令登录入口按钮显示「🔑 口令登录」，无任何附加因子组件。',
         screenshotName: 'sc2_step1_password_panel.png',
         action: async () => {
           await clearAndType(page, '#username-input', 'admin');
@@ -427,7 +427,7 @@ async function run() {
     await runScenario({
       id: 3,
       title: '仅客户端证书免密认证 (Cert Only)',
-      desc: '点击常驻的「🪪 使用客户端证书直接登录」链接，证书模态以 standalone 模式打开；选中证书直接经 TLS 握手登录，全程无需口令（原厂 Opt_Cert 入口）。',
+      desc: '点击与口令登录平级的「🪪 证书登录」入口按钮，证书模态以 standalone 模式打开；选中证书直接经 TLS 握手登录，全程无需口令（原厂 Opt_Cert 入口）。',
       mode: 'cert-only'
     }, async (record) => {
       await setMockMode('pwd-cert');
@@ -438,10 +438,10 @@ async function run() {
       await record(page, {
         stepId: 1,
         title: '证书入口打开证书模态并选中证书',
-        desc: '点击「使用客户端证书直接登录」，模态标题为「证书直接登录」，列表中选中「单因素证书登录」测试证书。',
+        desc: '点击「证书登录」入口按钮，模态标题为「证书直接登录」，列表中选中「单因素证书登录」测试证书。',
         screenshotName: 'sc3_step1_cert_modal.png',
         action: async () => {
-          await page.click('#cert-only-link');
+          await page.click('#cert-login-btn');
           const title = await waitForChallengeModal(page);
           if (!title.includes('证书直接登录')) {
             throw new Error(`模态标题不是证书直接登录: "${title}"`);
@@ -709,7 +709,7 @@ async function run() {
         desc: '从证书入口提交认证，网关判定证书过期返回 0x106；模态保留并展示证书过期提示，用户可原地换证书重试。',
         screenshotName: 'sc7_step1_cert_expired_alert.png',
         action: async () => {
-          await page.click('#cert-only-link');
+          await page.click('#cert-login-btn');
           const title = await waitForChallengeModal(page);
           if (!title.includes('证书直接登录')) {
             throw new Error(`模态标题不是证书直接登录: "${title}"`);
@@ -958,6 +958,101 @@ async function run() {
           const resCount = await page.$eval('#res-count', el => el.textContent.trim());
           const resNames = await page.$$eval('#resources-tbody tr', els => els.map(tr => tr.querySelector('td strong')?.textContent?.trim() || ''));
           return `三因素链完成！验证码 ${expectedCode} 校验通过，会话用户: ${sessionUser}，会话ID: ${sessionId}，内网资源数: ${resCount} 项 [${resNames.join(' | ')}]`;
+        }
+      });
+
+      await safeDisconnect(page);
+    });
+
+    // =========================================================================
+    // SCENARIO 10: 口令 + 动态令牌多因素挑战 (OTP Token)
+    // =========================================================================
+    await runScenario({
+      id: 10,
+      title: '口令 + 动态令牌多因素挑战 (OTP)',
+      desc: '网关返回 code=4（动态令牌认证）要求令牌因子：客户端弹出令牌模态（无「发送」步骤，码由用户令牌自行生成）；错码被 0x109 拦截且挑战保留，正确码完成登录并建立隧道。',
+      mode: 'token'
+    }, async (record) => {
+      await setMockMode('token');
+      await page.goto(TARGET_URL, { waitUntil: 'networkidle0' });
+      await ensureGatewayConfigured(page);
+
+      await record(page, {
+        stepId: 1,
+        title: '口令登录触发动态令牌挑战模态',
+        desc: '输入 admin / admin456（场景 5 改密后的当前口令）点击「口令登录」，网关口令校验通过但返回 code=4，客户端弹出「动态令牌认证」模态。',
+        screenshotName: 'sc10_step1_token_challenge.png',
+        action: async () => {
+          await clearAndType(page, '#username-input', 'admin');
+          await clearAndType(page, '#password-input', 'admin456');
+
+          await page.click('#connect-btn');
+          const title = await waitForChallengeModal(page);
+          if (!title.includes('动态令牌')) {
+            throw new Error(`模态标题不是动态令牌认证: "${title}"`);
+          }
+
+          const hint = await page.$eval('.challenge-hint', el => el.textContent.trim());
+          return `动态令牌模态已弹出。模态提示: "${hint}"`;
+        }
+      });
+
+      await record(page, {
+        stepId: 2,
+        title: '错误令牌码被 0x109 拦截且挑战保留',
+        desc: '输入错误令牌码 000000 提交（POST /vpn/user/auth/token），网关比对失败返回 0x109 动态令牌码错误；模态保留允许原地重试。',
+        screenshotName: 'sc10_step2_token_wrong_rejected.png',
+        action: async () => {
+          await clearAndType(page, '#modal-token-input', '000000');
+          await page.click('#modal-token-submit');
+
+          await page.waitForFunction(() => {
+            const alert = document.getElementById('modal-alert');
+            return alert && alert.style.display !== 'none' && alert.textContent.includes('动态令牌码错误');
+          }, { timeout: 8000 });
+
+          const alertText = await page.$eval('#modal-alert', el => el.textContent.trim());
+          const modalVisible = await page.$eval('#challenge-modal', el => el.style.display !== 'none');
+          const inputCleared = await page.$eval('#modal-token-input', el => el.value === '');
+          return `错误令牌码被拦截，模态保留可重试（模态可见: ${modalVisible}，输入已清空: ${inputCleared}）。模态内提示: "${alertText}"`;
+        }
+      });
+
+      await record(page, {
+        stepId: 3,
+        title: '输入正确令牌码完成多因素登录',
+        desc: '从 mock 网关测试接口读取当前令牌显示（模拟用户查看硬件令牌），填入提交，网关校验通过建立隧道并拉取内网资源。',
+        screenshotName: 'sc10_step3_token_connected.png',
+        action: async () => {
+          let expectedCode = '123456';
+          try {
+            const r = await fetch('https://127.0.0.1:8443/api/tokencode');
+            const data = await r.json();
+            if (data && data.code) expectedCode = data.code;
+          } catch (e) {
+            log(`Fetch mock tokencode: ${e.message}`);
+          }
+
+          log(`  >> Entering active token code: ${expectedCode}`);
+          await clearAndType(page, '#modal-token-input', expectedCode);
+          await page.click('#modal-token-submit');
+
+          await page.waitForFunction(() => {
+            const v = document.getElementById('view-connected');
+            return v && v.style.display !== 'none';
+          }, { timeout: 10000 });
+
+          await page.waitForFunction(() => {
+            const rows = document.querySelectorAll('#resources-tbody tr');
+            const txt = rows[0]?.textContent || '';
+            return rows.length > 0 && !txt.includes('正在从网关拉取');
+          }, { timeout: 10000 });
+
+          const sessionUser = await page.$eval('#session-user-val', el => el.textContent.trim());
+          const sessionId = await page.$eval('#session-id-val', el => el.textContent.trim());
+          const resCount = await page.$eval('#res-count', el => el.textContent.trim());
+          const resNames = await page.$$eval('#resources-tbody tr', els => els.map(tr => tr.querySelector('td strong')?.textContent?.trim() || ''));
+          return `动态令牌认证成功！令牌码 ${expectedCode} 校验通过，会话用户: ${sessionUser}，会话ID: ${sessionId}，内网资源数: ${resCount} 项 [${resNames.join(' | ')}]`;
         }
       });
 

@@ -81,16 +81,18 @@
             <a href="javascript:void(0)" id="voluntary-change-pwd-link" class="voluntary-change-pwd-link" style="margin-left: auto; font-size: 13px; color: #3b82f6; text-decoration: none; cursor: pointer;">修改密码</a>
           </div>
 
-          <!-- 证书免密入口：常驻一行（原厂 Opt_Cert，身份完全由 mTLS 证书证明） -->
-          <div class="cert-entry-row">
-            <a href="javascript:void(0)" id="cert-only-link" class="cert-entry-link">🪪 使用客户端证书直接登录（免口令）</a>
-          </div>
+          <!-- 两个平级登录入口（原厂 Opt_Password / Opt_Cert）：口令登录与
+               证书登录都是独立起点；入口之后的所有网关挑战（验证码 / 证书
+               因子 / 短信 / 令牌 / 改密）才走模态，登录框高度恒定。 -->
 
-          <!-- 登录按钮 -->
-          <div class="action-btn-row">
-            <button type="submit" id="connect-btn" class="btn btn-primary btn-block">
+          <!-- 登录入口 -->
+          <div class="action-btn-row action-btn-double">
+            <button type="submit" id="connect-btn" class="btn btn-primary">
               <span class="btn-spinner" style="display: none;"></span>
-              <span id="connect-btn-text">立即连接</span>
+              <span id="connect-btn-text">🔑 口令登录</span>
+            </button>
+            <button type="button" id="cert-login-btn" class="btn btn-secondary">
+              <span>🪪 证书登录</span>
             </button>
           </div>
         </form>

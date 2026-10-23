@@ -34,7 +34,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  pwd-only   : Single-factor authentication (Password -> Code 0)\n")
 		fmt.Fprintf(os.Stderr, "  pwd-change : Password expired challenge (Password -> Code 256 -> PwdChange -> Code 0)\n")
 		fmt.Fprintf(os.Stderr, "  err-auth   : Authentication error (Password -> Code 0x8000001a)\n")
-		fmt.Fprintf(os.Stderr, "  token      : Dynamic token challenge (Password -> Code 4 -> Token -> Code 0)\n")
+		fmt.Fprintf(os.Stderr, "  token      : Dynamic token challenge (Password -> Code 4 -> Token -> Code 0, wrong code 0x109)\n")
 		fmt.Fprintf(os.Stderr, "  sms        : SMS code challenge (Password -> Code 8 -> send_smc -> smc -> Code 0, wrong code 0x10A)\n")
 	}
 

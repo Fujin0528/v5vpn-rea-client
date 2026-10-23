@@ -56,6 +56,7 @@ type Session struct {
 	AuthMethod string
 	VerifyCode string
 	SMSCode    string
+	TokenCode  string
 	CreatedAt  time.Time
 }
 
@@ -69,6 +70,7 @@ type Server struct {
 	mode              Mode
 	currentVerifyCode string
 	currentSMSCode    string
+	currentTokenCode  string
 	lastChangedTime   time.Time
 }
 
@@ -118,6 +120,7 @@ func New(cfg Config) (*Server, error) {
 	mux.HandleFunc("/vpn/user/auth/verifycode_status", s.handleVerifyCodeStatus)
 	mux.HandleFunc("/api/verifycode", s.handleAPIVerifyCode)
 	mux.HandleFunc("/api/smscode", s.handleAPISMCode)
+	mux.HandleFunc("/api/tokencode", s.handleAPITokenCode)
 	mux.HandleFunc("/vpn/user/check/rule.xml", s.handleRuleXML)
 	mux.HandleFunc("/vpn/user/common/SSOConfig.xml", s.handleSSOConfigXML)
 	mux.HandleFunc("/vpn/user/client/install.xml", s.handleInstallXML)
@@ -359,7 +362,11 @@ func (s *Server) handlePassword(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(fmt.Sprintf(`<?xml version="1.0" encoding="utf-8"?>
 <RESPONSE><RESULT code="0" msg="" sid_name="VSG_SESSIONID"></RESULT></RESPONSE>`)))
 	case ModeToken:
-		log.Printf("[MockServer] <- Token challenge for %q (code: 4)", rawUser)
+		// The challenge is issued together with a token code bound to this
+		// session — that stands in for "whatever the user's token displays
+		// right now"; the E2E driver reads it via the test-only /api/tokencode.
+		tokenCode := s.generateNewTokenCode(sessionID)
+		log.Printf("[MockServer] <- Token challenge for %q (code: 4, token now shows %q)", rawUser, tokenCode)
 		w.Write([]byte(fmt.Sprintf(`<?xml version="1.0" encoding="utf-8"?>
 <RESPONSE><RESULT code="4" msg="need token" sid_name="VSG_SESSIONID"></RESULT></RESPONSE>`)))
 	case ModeSMS:
@@ -464,12 +471,87 @@ func (s *Server) handleCert(w http.ResponseWriter, r *http.Request) {
 <RESPONSE><RESULT code="0" msg="" sid_name="VSG_SESSIONID"></RESULT></RESPONSE>`))
 }
 
+// handleToken backs POST /vpn/user/auth/token: the client submits the code
+// the user's hardware/software token displays. A mismatch answers 0x109 and
+// — like the SMS flow — does NOT regenerate the code: the token keeps
+// displaying the same digits until its own cycle rolls them, and a mistyped
+// retry must not invalidate what the user is looking at. 0x109 itself is an
+// inference (the SMS rejection is 0x10A / TAG 266 and the token message sits
+// next to it in the original language tables); the real gateway has not been
+// captured on a token rejection yet.
 func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
-	log.Printf("[MockServer] -> POST /vpn/user/auth/token: %s", string(body))
+	values, _ := url.ParseQuery(string(body))
+	token := strings.TrimSpace(values.Get("token"))
+
+	sessionID := ""
+	if c, err := r.Cookie("VSG_SESSIONID"); err == nil {
+		sessionID = c.Value
+	}
+	expected := s.getExpectedTokenCode(sessionID)
+
+	log.Printf("[MockServer] -> POST /vpn/user/auth/token (SessionID=%q, token=%q)", sessionID, token)
 	w.Header().Set("Content-Type", "text/xml; charset=utf-8")
+
+	if expected == "" || !strings.EqualFold(token, expected) {
+		log.Printf("[MockServer] <- Token code MISMATCH for session %q: got %q, expected %q (code: 0x109)", sessionID, token, expected)
+		w.Write([]byte(`<?xml version="1.0" encoding="utf-8"?>
+<RESPONSE><RESULT code="0x109" msg="动态令牌码错误" sid_name="VSG_SESSIONID"></RESULT></RESPONSE>`))
+		return
+	}
+
+	s.mu.Lock()
+	if sess, ok := s.sessions[sessionID]; ok && sess != nil {
+		sess.AuthMethod = "动态令牌认证"
+	}
+	s.mu.Unlock()
+
+	log.Printf("[MockServer] <- Token code %q passed for session %q, login success (code: 0)", token, sessionID)
 	w.Write([]byte(`<?xml version="1.0" encoding="utf-8"?>
 <RESPONSE><RESULT code="0" msg="" sid_name="VSG_SESSIONID"></RESULT></RESPONSE>`))
+}
+
+// getExpectedTokenCode returns the token code issued to one session. No
+// global fallback: the code another session was challenged with must never
+// validate here.
+func (s *Server) getExpectedTokenCode(sessionID string) string {
+	if sessionID == "" {
+		return ""
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if sess, ok := s.sessions[sessionID]; ok && sess != nil {
+		return sess.TokenCode
+	}
+	return ""
+}
+
+// generateNewTokenCode issues a fresh 6-digit code, stores it on the session
+// and mirrors it into currentTokenCode for the test-only /api/tokencode
+// endpoint. It stands in for the user's token display.
+func (s *Server) generateNewTokenCode(sessionID string) string {
+	rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
+	code := fmt.Sprintf("%06d", rnd.Intn(1000000))
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.currentTokenCode = code
+	if sessionID != "" {
+		if sess, ok := s.sessions[sessionID]; ok && sess != nil {
+			sess.TokenCode = code
+		}
+	}
+	return code
+}
+
+// handleAPITokenCode exposes the last issued token code to the test harness
+// (the E2E driver has no token device). Test-only, same shape as /api/smscode.
+func (s *Server) handleAPITokenCode(w http.ResponseWriter, r *http.Request) {
+	s.mu.RLock()
+	code := s.currentTokenCode
+	s.mu.RUnlock()
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprintf(w, `{"code":%q}`, code)
 }
 
 // handleSendSMS backs GET /vpn/user/auth/send_smc: the client asks the gateway
@@ -637,6 +719,8 @@ func (s *Server) handleIntegration(w http.ResponseWriter, r *http.Request) {
 			authMethod = "改密续连"
 		case ModeSMS:
 			authMethod = "短信认证"
+		case ModeToken:
+			authMethod = "动态令牌认证"
 		default:
 			authMethod = "口令认证"
 		}
