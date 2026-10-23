@@ -25,15 +25,16 @@ import (
 type Mode string
 
 const (
-	ModePwdCert    Mode = "pwd-cert"   // Two-factor: Password -> code 2 -> Cert -> code 0
-	ModePwdOnly    Mode = "pwd-only"   // Single-factor: Password -> code 0
-	ModeCertOnly   Mode = "cert-only"  // Standalone mTLS Certificate -> code 0
-	ModePwdChange  Mode = "pwd-change" // Password expired: Password -> code 256 -> PwdChange -> code 0
-	ModeVerifyCode Mode = "verifycode" // Captcha required: Password -> code 0x80 -> Captcha -> code 0
-	ModeToken      Mode = "token"      // Password -> code 4 -> Token -> code 0
-	ModeSMS        Mode = "sms"        // Password -> code 8 -> SMS -> code 0
-	ModeErrAuth    Mode = "err-auth"   // Invalid credentials -> code 0x8000001a
-	ModeErrCert    Mode = "err-cert"   // Expired/Invalid certificate -> code 0x106
+	ModePwdCert    Mode = "pwd-cert"     // Two-factor: Password -> code 2 -> Cert -> code 0
+	ModePwdCertSMS Mode = "pwd-cert-sms" // Three-factor chain: Password -> code 2 -> Cert -> code 8 -> SMS -> code 0
+	ModePwdOnly    Mode = "pwd-only"     // Single-factor: Password -> code 0
+	ModeCertOnly   Mode = "cert-only"    // Standalone mTLS Certificate -> code 0
+	ModePwdChange  Mode = "pwd-change"   // Password expired: Password -> code 256 -> PwdChange -> code 0
+	ModeVerifyCode Mode = "verifycode"   // Captcha required: Password -> code 0x80 -> Captcha -> code 0
+	ModeToken      Mode = "token"        // Password -> code 4 -> Token -> code 0
+	ModeSMS        Mode = "sms"          // Password -> code 8 -> SMS -> code 0
+	ModeErrAuth    Mode = "err-auth"     // Invalid credentials -> code 0x8000001a
+	ModeErrCert    Mode = "err-cert"     // Expired/Invalid certificate -> code 0x106
 )
 
 // Config holds options for the mock server.
@@ -54,6 +55,7 @@ type Session struct {
 	PassedCert bool
 	AuthMethod string
 	VerifyCode string
+	SMSCode    string
 	CreatedAt  time.Time
 }
 
@@ -66,6 +68,7 @@ type Server struct {
 	sessions          map[string]*Session
 	mode              Mode
 	currentVerifyCode string
+	currentSMSCode    string
 	lastChangedTime   time.Time
 }
 
@@ -109,10 +112,12 @@ func New(cfg Config) (*Server, error) {
 	mux.HandleFunc("/vpn/user/auth/cert", s.handleCert)
 	mux.HandleFunc("/vpn/user/auth/token", s.handleToken)
 	mux.HandleFunc("/vpn/user/auth/smc", s.handleSMS)
+	mux.HandleFunc("/vpn/user/auth/send_smc", s.handleSendSMS)
 	mux.HandleFunc("/vpn/user/auth/pwdchange", s.handlePwdChange)
 	mux.HandleFunc("/vpn/user/auth/verifycode", s.handleVerifyCode)
 	mux.HandleFunc("/vpn/user/auth/verifycode_status", s.handleVerifyCodeStatus)
 	mux.HandleFunc("/api/verifycode", s.handleAPIVerifyCode)
+	mux.HandleFunc("/api/smscode", s.handleAPISMCode)
 	mux.HandleFunc("/vpn/user/check/rule.xml", s.handleRuleXML)
 	mux.HandleFunc("/vpn/user/common/SSOConfig.xml", s.handleSSOConfigXML)
 	mux.HandleFunc("/vpn/user/client/install.xml", s.handleInstallXML)
@@ -182,6 +187,7 @@ button:hover { background: #0284c7; color: #fff; }
   <p><strong>Expected User:</strong> <code>%s</code> / <code>%s</code></p>
   <p><strong>Switch Simulation Flow:</strong></p>
   <button onclick="setMode('pwd-cert')">🔐 口令+证书双因素 (pwd-cert)</button>
+  <button onclick="setMode('pwd-cert-sms')">🔐💬 口令+证书+短信三因素 (pwd-cert-sms)</button>
   <button onclick="setMode('pwd-only')">🔑 仅口令直连 (pwd-only)</button>
   <button onclick="setMode('cert-only')">🪪 纯证书免密 (cert-only)</button>
   <button onclick="setMode('pwd-change')">🔄 密码过期改密 (pwd-change)</button>
@@ -325,7 +331,7 @@ func (s *Server) handlePassword(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[MockServer] <- Single factor login success for %q (code: 0)", rawUser)
 		w.Write([]byte(fmt.Sprintf(`<?xml version="1.0" encoding="utf-8"?>
 <RESPONSE><RESULT code="0" msg="" sid_name="VSG_SESSIONID"></RESULT></RESPONSE>`)))
-	case ModePwdCert:
+	case ModePwdCert, ModePwdCertSMS:
 		log.Printf("[MockServer] <- Two-factor challenge for %q: requesting Certificate (code: 2)", rawUser)
 		w.Write([]byte(fmt.Sprintf(`<?xml version="1.0" encoding="utf-8"?>
 <RESPONSE><RESULT code="2" msg="need cert" sid_name="VSG_SESSIONID"></RESULT></RESPONSE>`)))
@@ -357,9 +363,11 @@ func (s *Server) handlePassword(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(fmt.Sprintf(`<?xml version="1.0" encoding="utf-8"?>
 <RESPONSE><RESULT code="4" msg="need token" sid_name="VSG_SESSIONID"></RESULT></RESPONSE>`)))
 	case ModeSMS:
+		// msg mirrors the real gateway's challenge text (issue #9 screenshot);
+		// SecUI.exe switches to its Edit_SendSMS state on this code.
 		log.Printf("[MockServer] <- SMS challenge for %q (code: 8)", rawUser)
 		w.Write([]byte(fmt.Sprintf(`<?xml version="1.0" encoding="utf-8"?>
-<RESPONSE><RESULT code="8" msg="need sms" sid_name="VSG_SESSIONID"></RESULT></RESPONSE>`)))
+<RESPONSE><RESULT code="8" msg="多因素认证，短信认证" sid_name="VSG_SESSIONID"></RESULT></RESPONSE>`)))
 	default:
 		w.Write([]byte(`<?xml version="1.0" encoding="utf-8"?>
 <RESPONSE><RESULT code="0" msg="" sid_name="VSG_SESSIONID"></RESULT></RESPONSE>`))
@@ -442,6 +450,16 @@ func (s *Server) handleCert(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[MockServer] <- Standalone certificate auth SUCCESS (SessionID=%q, code: 0)", sessionID)
 	}
 
+	// Three-factor chain: the certificate factor passed, but the gateway still
+	// wants the SMS factor before it grants the session. The challenge text
+	// mirrors the real gateway (issue #9 screenshot).
+	if s.GetMode() == ModePwdCertSMS {
+		log.Printf("[MockServer] <- SMS challenge after certificate factor for session %q (code: 8)", sessionID)
+		w.Write([]byte(`<?xml version="1.0" encoding="utf-8"?>
+<RESPONSE><RESULT code="8" msg="多因素认证，短信认证" sid_name="VSG_SESSIONID"></RESULT></RESPONSE>`))
+		return
+	}
+
 	w.Write([]byte(`<?xml version="1.0" encoding="utf-8"?>
 <RESPONSE><RESULT code="0" msg="" sid_name="VSG_SESSIONID"></RESULT></RESPONSE>`))
 }
@@ -454,12 +472,99 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 <RESPONSE><RESULT code="0" msg="" sid_name="VSG_SESSIONID"></RESULT></RESPONSE>`))
 }
 
-func (s *Server) handleSMS(w http.ResponseWriter, r *http.Request) {
-	body, _ := io.ReadAll(r.Body)
-	log.Printf("[MockServer] -> POST /vpn/user/auth/smc: %s", string(body))
+// handleSendSMS backs GET /vpn/user/auth/send_smc: the client asks the gateway
+// to deliver the SMS verification code to the user's registered phone. The
+// code is generated here and bound to the requesting session, the way the real
+// gateway binds it to the VSG_SESSIONID that received the 0x8 challenge.
+func (s *Server) handleSendSMS(w http.ResponseWriter, r *http.Request) {
+	sessionID := ""
+	if c, err := r.Cookie("VSG_SESSIONID"); err == nil {
+		sessionID = c.Value
+	}
+
+	code := s.generateNewSMSCode(sessionID)
+	log.Printf("[MockServer] <- SMS code delivered for session %q (Code: %q)", sessionID, code)
+
 	w.Header().Set("Content-Type", "text/xml; charset=utf-8")
 	w.Write([]byte(`<?xml version="1.0" encoding="utf-8"?>
+<RESPONSE><RESULT code="0" msg="ok" sid_name="VSG_SESSIONID"></RESULT></RESPONSE>`))
+}
+
+// handleSMS backs POST /vpn/user/auth/smc: the client submits the code from
+// the user's phone. A mismatch answers 0x10A (language.xml TAG 266 短信码
+// 错误) and — unlike the captcha flow — does NOT regenerate the code: the
+// real gateway already sent that SMS, and a mistyped retry must not
+// invalidate what is sitting in the user's inbox.
+func (s *Server) handleSMS(w http.ResponseWriter, r *http.Request) {
+	body, _ := io.ReadAll(r.Body)
+	values, _ := url.ParseQuery(string(body))
+	smc := strings.TrimSpace(values.Get("smc"))
+
+	sessionID := ""
+	if c, err := r.Cookie("VSG_SESSIONID"); err == nil {
+		sessionID = c.Value
+	}
+	expected := s.getExpectedSMSCode(sessionID)
+
+	w.Header().Set("Content-Type", "text/xml; charset=utf-8")
+	if expected == "" || !strings.EqualFold(smc, expected) {
+		log.Printf("[MockServer] <- SMS code MISMATCH for session %q: got %q, expected %q (code: 0x10A)", sessionID, smc, expected)
+		w.Write([]byte(`<?xml version="1.0" encoding="utf-8"?>
+<RESPONSE><RESULT code="0x10A" msg="短信码错误" sid_name="VSG_SESSIONID"></RESULT></RESPONSE>`))
+		return
+	}
+
+	s.mu.Lock()
+	if sess, ok := s.sessions[sessionID]; ok && sess != nil {
+		sess.AuthMethod = "短信认证"
+	}
+	s.mu.Unlock()
+
+	log.Printf("[MockServer] <- SMS code %q passed for session %q, login success (code: 0)", smc, sessionID)
+	w.Write([]byte(`<?xml version="1.0" encoding="utf-8"?>
 <RESPONSE><RESULT code="0" msg="" sid_name="VSG_SESSIONID"></RESULT></RESPONSE>`))
+}
+
+// getExpectedSMSCode returns the SMS code issued to one session. No global
+// fallback: the code another session requested must never validate here.
+func (s *Server) getExpectedSMSCode(sessionID string) string {
+	if sessionID == "" {
+		return ""
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if sess, ok := s.sessions[sessionID]; ok && sess != nil {
+		return sess.SMSCode
+	}
+	return ""
+}
+
+// generateNewSMSCode issues a fresh 6-digit code, stores it on the session and
+// mirrors it into currentSMSCode for the test-only /api/smscode endpoint.
+func (s *Server) generateNewSMSCode(sessionID string) string {
+	rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
+	code := fmt.Sprintf("%06d", rnd.Intn(1000000))
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.currentSMSCode = code
+	if sessionID != "" {
+		if sess, ok := s.sessions[sessionID]; ok && sess != nil {
+			sess.SMSCode = code
+		}
+	}
+	return code
+}
+
+// handleAPISMCode exposes the last issued SMS code to the test harness (the
+// E2E driver has no access to the phone the mock "texted"). Test-only, same
+// shape as /api/verifycode.
+func (s *Server) handleAPISMCode(w http.ResponseWriter, r *http.Request) {
+	s.mu.RLock()
+	code := s.currentSMSCode
+	s.mu.RUnlock()
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprintf(w, `{"code":%q}`, code)
 }
 
 func (s *Server) handlePwdChange(w http.ResponseWriter, r *http.Request) {
@@ -524,10 +629,14 @@ func (s *Server) handleIntegration(w http.ResponseWriter, r *http.Request) {
 			authMethod = "证书认证"
 		case ModePwdCert:
 			authMethod = "双因素认证"
+		case ModePwdCertSMS:
+			authMethod = "多因素认证"
 		case ModeVerifyCode:
 			authMethod = "验证码认证"
 		case ModePwdChange:
 			authMethod = "改密续连"
+		case ModeSMS:
+			authMethod = "短信认证"
 		default:
 			authMethod = "口令认证"
 		}

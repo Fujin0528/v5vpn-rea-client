@@ -159,9 +159,13 @@ func TestUIViewIDsAreUnique(t *testing.T) {
 // that returns null throws at the first property access, which surfaces to the
 // user as a dead button rather than an error dialog.
 //
-// Only #id selectors are checked: class selectors often target nodes the script
-// creates at runtime (certificate cards, table rows), so they are not required
-// to exist in the static markup.
+// An id may live in one of two places: the static index.html, or an innerHTML
+// template inside app.js itself — the V5VPN challenge modal rebuilds its body
+// at runtime (captcha / certificate / SMS / password-change), so its
+// "modal-*" ids exist only as template strings. A lookup is satisfied by
+// either source; requiring both would forbid the modal, requiring only the
+// static markup would forbid the lookup. Class selectors target nodes the
+// script creates at runtime and are not checked.
 func TestAppJSReferencesExistingIDs(t *testing.T) {
 	for _, suite := range uiSuites {
 		t.Run(suite.name, func(t *testing.T) {
@@ -172,19 +176,26 @@ func TestAppJSReferencesExistingIDs(t *testing.T) {
 			for _, m := range regexp.MustCompile(`id="([^"]+)"`).FindAllStringSubmatch(html, -1) {
 				htmlIDs[m[1]] = true
 			}
+			// Ids rendered by JS templates (the challenge modal body).
+			jsIDs := map[string]bool{}
+			for _, m := range regexp.MustCompile(`id="([^"]+)"`).FindAllStringSubmatch(js, -1) {
+				jsIDs[m[1]] = true
+			}
+
+			assertKnown := func(id string, how string) {
+				if !htmlIDs[id] && !jsIDs[id] {
+					t.Errorf("app.js %s '%s' but neither index.html nor an app.js template defines that id", how, id)
+				}
+			}
 
 			getByID := regexp.MustCompile(`getElementById\('([^']+)'\)`)
 			for _, m := range getByID.FindAllStringSubmatch(js, -1) {
-				if !htmlIDs[m[1]] {
-					t.Errorf("app.js calls getElementById('%s') but index.html has no such id", m[1])
-				}
+				assertKnown(m[1], "calls getElementById")
 			}
 
 			idSelector := regexp.MustCompile(`querySelector(?:All)?\('#([A-Za-z0-9_-]+)'\)`)
 			for _, m := range idSelector.FindAllStringSubmatch(js, -1) {
-				if !htmlIDs[m[1]] {
-					t.Errorf("app.js queries '#%s' but index.html has no such id", m[1])
-				}
+				assertKnown(m[1], "queries")
 			}
 		})
 	}
@@ -235,8 +246,9 @@ func TestUIsAreSeparated(t *testing.T) {
 			suite: "v5vpn",
 			dir:   "ui/v5vpn/",
 			// V5VPN 后端没有的能力：零信任的认证链端点。算法、证书、验证码、
-			// 改密是它自己的本事，必须留着。proto-atrust 的样式类也不该留下：
-			// 那套胶囊只出现在 aTrust 界面的表格里。
+			// 改密是它自己的本事，必须留着（证书/验证码/改密现在都住在
+			// 挑战模态里）。proto-atrust 的样式类也不该留下：那套胶囊只出现
+			// 在 aTrust 界面的表格里。
 			forbidden: []string{
 				"'/api/atrust/login'", "'/api/atrust/logout'", "'/api/atrust/status'",
 				"'/api/atrust/resources/refresh'",
@@ -246,7 +258,8 @@ func TestUIsAreSeparated(t *testing.T) {
 				"'/api/login'", "'/api/logout'", "'/api/status'",
 				"protocol !== 'atrust'",
 				"new-gw-algo", "gw-algo-tag",
-				"verifycode", "cert-panel", "connected-change-pwd-btn",
+				"verifycode", "challenge-modal", "cert-only-link",
+				"connected-change-pwd-btn",
 				`href="/atrust/"`,
 			},
 		},
@@ -313,8 +326,9 @@ func TestUIViewsAreDistinct(t *testing.T) {
 	v5 := idSet("ui/v5vpn/")
 	at := idSet("ui/atrust/")
 
-	// 这些 ID 只该属于 V5VPN 一套；名称本身已经说明了归属。
-	v5Only := []string{"new-gw-algo", "verifycode-group", "cert-panel", "connected-change-pwd-btn"}
+	// 这些 ID 只该属于 V5VPN 一套；名称本身已经说明了归属。挑战模态与
+	// 证书免密入口是网关驱动状态机的界面形态，aTrust 那套没有。
+	v5Only := []string{"new-gw-algo", "challenge-modal", "cert-only-link", "connected-change-pwd-btn"}
 	for _, id := range v5Only {
 		if !v5[id] {
 			t.Errorf("V5VPN 界面缺少 %q", id)

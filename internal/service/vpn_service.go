@@ -19,17 +19,31 @@ import (
 	"github.com/hygkui/v5vpn-rea-client/internal/proxy"
 )
 
-// passwordChallenge retains the HTTP client that received a 0x100 login
-// challenge. /vpn/user/auth/pwdchange must reuse it so the VSG_SESSIONID
-// cookie issued by that response is sent with the change request.
-//
-// cert, when set, marks a two-factor login: the challenged client already has
-// the client certificate installed, and the sign-in that follows the password
-// change must present the same certificate again.
-type passwordChallenge struct {
+// authChallenge retains the HTTP client that received a gateway challenge: a
+// RESULT code asking for another factor. The gateway — not the client — drives
+// the login sequence (every submitted factor answers with a RESULT code, and
+// protocol.NextAuthStep names the follow-up), so whatever the next step is,
+// its request must reuse this exact client: the gateway binds the pending
+// factor to the VSG_SESSIONID cookie issued with the challenge response.
+type authChallenge struct {
 	client   *protocol.Client
 	username string
-	cert     *tls.Certificate
+	// next is the factor the gateway asked for (protocol.AuthStep...). It is
+	// the dispatch key: each follow-up (ChangePassword, SendSMSCode,
+	// LoginWithSMSCode) matches the pending challenge by this field, so a new
+	// factor the gateway starts asking for needs no new challenge type here.
+	next protocol.AuthStep
+	// cert, when set, is the certificate factor this chain already presented:
+	// the completed login tunnels with it, and a password change must present
+	// it again on the follow-up sign-in.
+	cert *tls.Certificate
+	// afterAuth, when non-nil, receives the resolved gateway ID once the
+	// challenge completes, so the owning flow persists its mode selection. A
+	// nil afterAuth completes as a plain password login.
+	afterAuth func(gwID string)
+	// authType is how the completed login is reported to the frontend
+	// (authTypePassword, authTypePasswordCertificate, authTypeCertificate).
+	authType string
 }
 
 // PasswordChangedError reports that the gateway accepted the new password but
@@ -64,24 +78,24 @@ const pendingClientTTL = 10 * time.Minute
 
 // VPNService is the backend service exposed to the MyGo frontend
 type VPNService struct {
-	Config            *config.AppConfig
-	Client            *protocol.Client
-	ProxyMgr          *proxy.ProxyManager
-	CertStore         *certstore.Store
-	Status            string // "Disconnected", "Connecting", "Connected", "Error"
-	StatusDetail      string
-	Resources         []protocol.VPNResource
-	resourceState     ResourceLoadState
-	resourceError     string
-	Logs              []string
-	OnStatusChange    func(string)
-	appVersion        string
-	authType          string
-	passwordChallenge *passwordChallenge
-	pendingClients    map[string]*preAuthClient
-	mu                sync.Mutex
-	logMu             sync.Mutex
-	onLog             func(string)
+	Config         *config.AppConfig
+	Client         *protocol.Client
+	ProxyMgr       *proxy.ProxyManager
+	CertStore      *certstore.Store
+	Status         string // "Disconnected", "Connecting", "Connected", "Error"
+	StatusDetail   string
+	Resources      []protocol.VPNResource
+	resourceState  ResourceLoadState
+	resourceError  string
+	Logs           []string
+	OnStatusChange func(string)
+	appVersion     string
+	authType       string
+	challenge      *authChallenge
+	pendingClients map[string]*preAuthClient
+	mu             sync.Mutex
+	logMu          sync.Mutex
+	onLog          func(string)
 }
 
 // NewVPNService initializes the VPN service with loaded settings
@@ -391,7 +405,7 @@ func (s *VPNService) Login(gwIdentifier, username, password, verifycode string, 
 	gwAlgo := gw.Algo
 	s.Config.LastUseGateway = gw.Name
 	// A fresh authentication attempt supersedes any previous challenge.
-	s.passwordChallenge = nil
+	s.challenge = nil
 	// The captcha code is bound to the cookie jar of the client that fetched
 	// the image; reuse it so the VSG_SESSIONID travels with this login.
 	preAuth = s.pendingClientLocked(gw)
@@ -421,16 +435,14 @@ func (s *VPNService) Login(gwIdentifier, username, password, verifycode string, 
 	// connected view appears right away instead of hanging on the login screen
 	// while the portal computes the resource list.
 	if _, err = client.AuthOnly(username, password, verifycode); err != nil {
-		if protocol.IsPasswordExpired(err) {
-			// Keep this client so ChangePassword can reuse its jar and send
-			// the VSG_SESSIONID issued with the 0x100 response.
-			s.mu.Lock()
-			s.passwordChallenge = &passwordChallenge{
-				client:   client,
-				username: username,
-			}
-			s.mu.Unlock()
-		}
+		// Whatever the gateway asks for next (change password, SMS,
+		// certificate, ...) is kept as a challenge on this session; a chain
+		// that never presents a certificate completes as a plain password
+		// login, and SubmitCertFactor upgrades the record when it answers a
+		// certificate challenge.
+		s.mu.Lock()
+		s.keepChallengeLocked(client, username, err, nil, nil, authTypePassword)
+		s.mu.Unlock()
 		s.setStatus("Error", fmt.Sprintf("认证失败: %v", err))
 		return nil, err
 	}
@@ -500,7 +512,7 @@ func (s *VPNService) loginWithPasswordCert(gwIdentifier, username, password, ver
 	}
 	gwID, gwName, gwIP, gwPort, gwAlgo := gw.ID, gw.Name, gw.IP, gw.Port, gw.Algo
 	s.Config.LastUseGateway = gw.Name
-	s.passwordChallenge = nil
+	s.challenge = nil
 	preAuth = s.pendingClientLocked(gw)
 	if remember {
 		s.storeAccountLocked(gw, username, password, remember, auto)
@@ -528,14 +540,20 @@ func (s *VPNService) loginWithPasswordCert(gwIdentifier, username, password, ver
 
 	authResp, err := client.AuthPasswordWithCert(cert, username, password, verifycode)
 	if err != nil {
-		if protocol.IsPasswordExpired(err) {
-			// Keep the certificate with the challenge — the re-login that
-			// follows the password change runs the same two-step flow and
-			// needs it again.
-			s.mu.Lock()
-			s.passwordChallenge = &passwordChallenge{client: client, username: username, cert: cert}
-			s.mu.Unlock()
+		// The chain context: a challenge that follows a presented certificate
+		// factor (password -> certificate -> SMS, or a password change on the
+		// two-factor flow) keeps the certificate, the flow's persistence
+		// callback and the two-factor authType. A challenge that bypassed the
+		// certificate step (the gateway asked for SMS straight on the password
+		// step) must complete as a plain password login — the certificate was
+		// never presented and must not be recorded as a used factor.
+		certFactor, afterAuthChain, authTypeChain := cert, afterAuth, authTypePasswordCertificate
+		if protocol.IsSMSChallenge(err) && (authResp == nil || !authResp.CertFactorUsed) {
+			certFactor, afterAuthChain, authTypeChain = nil, nil, authTypePassword
 		}
+		s.mu.Lock()
+		s.keepChallengeLocked(client, username, err, certFactor, afterAuthChain, authTypeChain)
+		s.mu.Unlock()
 		s.setStatus("Error", fmt.Sprintf("认证失败: %v", err))
 		return nil, err
 	}
@@ -572,6 +590,10 @@ func (s *VPNService) enterConnected(client *protocol.Client, username string, ce
 	// The pre-auth client has become the session of record; drop the pending
 	// reference so it cannot be picked up by another login.
 	s.clearPendingClientLocked(client)
+	// A completed login supersedes any challenge still pending against this
+	// gateway (for instance a certificate login that succeeded while an SMS
+	// panel was left open).
+	s.challenge = nil
 	s.Resources = nil
 	s.resourceState = ResourceLoading
 	s.resourceError = ""
@@ -833,9 +855,10 @@ func (s *VPNService) loginWithLoadedCert(gwIdentifier string, cert *tls.Certific
 	}
 	gwID, gwName, gwIP, gwPort, gwAlgo := gw.ID, gw.Name, gw.IP, gw.Port, gw.Algo
 	s.Config.LastUseGateway = gw.Name
-	// A password-expired challenge belongs to the password flow. Dropping it
-	// here would throw away the session cookie a later ChangePassword needs,
-	// just because a certificate login was attempted in between.
+	// A pending password-change challenge is left alone: dropping it here
+	// would throw away the session cookie a later ChangePassword needs, just
+	// because a certificate login was attempted in between. Only a challenge
+	// this flow itself receives (certificate -> SMS) replaces it.
 	preAuth = s.pendingClientLocked(gw)
 	s.mu.Unlock()
 
@@ -855,7 +878,17 @@ func (s *VPNService) loginWithLoadedCert(gwIdentifier string, cert *tls.Certific
 		return nil, err
 	}
 	if err := client.AuthCertOnly(cert, verifycode); err != nil {
-		client.ClearTLSClientCertificate()
+		if protocol.IsSMSChallenge(err) {
+			// The gateway wants the SMS factor on top of the certificate
+			// (certificate -> SMS chain). Keep the certificate installed on
+			// the challenged client: the follow-up requests and the tunnel
+			// must present the same certificate.
+			s.mu.Lock()
+			s.keepChallengeLocked(client, name, err, cert, afterAuth, authTypeCertificate)
+			s.mu.Unlock()
+		} else {
+			client.ClearTLSClientCertificate()
+		}
 		s.setStatus("Error", fmt.Sprintf("证书认证失败: %v", err))
 		return nil, err
 	}
@@ -977,7 +1010,7 @@ func (s *VPNService) ChangePassword(gwIdentifier, username, password, newPasswor
 
 	s.mu.Lock()
 	client := s.Client
-	challenge := s.passwordChallenge
+	challenge := s.challengeLocked(s.Config.FindGateway(gwIdentifier), protocol.AuthStepPasswordChange)
 	s.mu.Unlock()
 
 	// The certificate that satisfied the mTLS side of a challenged two-factor
@@ -985,8 +1018,7 @@ func (s *VPNService) ChangePassword(gwIdentifier, username, password, newPasswor
 	// profile's stored selection covers a challenge that started on a client
 	// this process no longer holds (ChangePassword with no live challenge).
 	var challengeCert *tls.Certificate
-	challengeMatches := challenge != nil && challenge.username == username &&
-		challenge.client.GatewayIP == gwIP && challenge.client.GatewayPort == gwPort
+	challengeMatches := challenge != nil && challenge.username == username
 	if challengeMatches {
 		challengeCert = challenge.cert
 		// Reuse the HTTP client that received the 0x100 challenge; its cookie
@@ -1027,8 +1059,8 @@ func (s *VPNService) ChangePassword(gwIdentifier, username, password, newPasswor
 	}
 
 	s.mu.Lock()
-	if s.passwordChallenge != nil && s.passwordChallenge.client == client {
-		s.passwordChallenge = nil
+	if s.challenge != nil && s.challenge.client == client {
+		s.challenge = nil
 	}
 	s.Status = "Disconnected"
 	s.StatusDetail = "密码已更新，正在登录"
@@ -1084,6 +1116,10 @@ func AuthErrorCode(err error) string {
 		return "bad_credentials"
 	case protocol.AuthKindVerifyCode:
 		return "verify_code"
+	case protocol.AuthKindSMCRequired:
+		return "sms_challenge"
+	case protocol.AuthKindSMCCodeError:
+		return "sms_code_error"
 	case protocol.AuthKindCertInvalid:
 		return "cert_invalid"
 	case protocol.AuthKindCertUnavailable:
@@ -1095,6 +1131,12 @@ func AuthErrorCode(err error) string {
 	case protocol.AuthKindCertBadSignature:
 		return "cert_signature"
 	default:
+		// A RESULT code asking for the certificate factor (0x2 on the
+		// password step) is not a rejection: the login continues by
+		// presenting a certificate on the same session (SubmitCertFactor).
+		if protocol.NextAuthStep(authErr.Code) == protocol.AuthStepCertificate {
+			return "cert_challenge"
+		}
 		return ""
 	}
 }
@@ -1102,6 +1144,208 @@ func AuthErrorCode(err error) string {
 // IsPasswordExpired reports a gateway password-change challenge.
 func IsPasswordExpired(err error) bool {
 	return AuthErrorCode(err) == "password_expired"
+}
+
+// keepChallengeLocked records a gateway challenge so its follow-up factor can
+// be submitted on the same session. The next step is read from the gateway's
+// own result code (protocol.NextAuthStep), not from the calling flow, so any
+// challenge this build knows how to drive — password change, SMS, and
+// whatever factor is added to the switch below — is kept the same way.
+//
+// cert/afterAuth/authType carry what the challenged chain already presented
+// (nil cert for a password-only chain); the completed login reports and
+// tunnels with them. Caller holds s.mu.
+func (s *VPNService) keepChallengeLocked(client *protocol.Client, username string, err error, cert *tls.Certificate, afterAuth func(gwID string), authType string) bool {
+	var authErr *protocol.AuthError
+	if !errors.As(err, &authErr) {
+		return false
+	}
+	next := protocol.NextAuthStep(authErr.Code)
+	switch next {
+	case protocol.AuthStepPasswordChange, protocol.AuthStepSMC, protocol.AuthStepCertificate:
+		// Follow-ups this build can drive. Anything else (token, machine
+		// info, ...) falls through to the caller's generic error path.
+	default:
+		return false
+	}
+	s.challenge = &authChallenge{
+		client:    client,
+		username:  username,
+		next:      next,
+		cert:      cert,
+		afterAuth: afterAuth,
+		authType:  authType,
+	}
+	return true
+}
+
+// challengeLocked returns the pending challenge for a gateway whose next step
+// matches, or nil. Caller holds s.mu.
+func (s *VPNService) challengeLocked(gw *config.GatewayProfile, step protocol.AuthStep) *authChallenge {
+	if s.challenge == nil || gw == nil {
+		return nil
+	}
+	ch := s.challenge
+	if ch.client == nil || ch.next != step ||
+		ch.client.GatewayIP != gw.IP || ch.client.GatewayPort != gw.Port {
+		return nil
+	}
+	return ch
+}
+
+// SendSMSCode asks the gateway to deliver the SMS verification code to the
+// user's registered phone. It backs the login form's "发送短信" button and
+// runs on the client that received the 0x8 challenge, so the code is issued
+// for that exact session.
+func (s *VPNService) SendSMSCode(gwIdentifier string) error {
+	s.mu.Lock()
+	gw := s.Config.FindGateway(gwIdentifier)
+	if gw == nil {
+		s.mu.Unlock()
+		return fmt.Errorf("gateway %q not found", gwIdentifier)
+	}
+	ch := s.challengeLocked(gw, protocol.AuthStepSMC)
+	if ch == nil {
+		s.mu.Unlock()
+		return fmt.Errorf("当前没有待完成的短信认证，请重新登录")
+	}
+	client := ch.client
+	s.mu.Unlock()
+
+	s.Log("INFO", "Requesting SMS verification code from %s (%s:%d)...", gw.Name, gw.IP, gw.Port)
+	if err := client.SendSMC(); err != nil {
+		s.Log("ERROR", "Send SMS code failed: %v", err)
+		return err
+	}
+	return nil
+}
+
+// LoginWithSMSCode completes a login the gateway challenged with the SMS
+// factor: the code from the user's phone is submitted on /vpn/user/auth/smc
+// over the challenged session, and on success the tunnel comes up exactly as
+// after a plain login. A wrong code keeps the challenge alive for a retry.
+// The hop count is the gateway's choice: a code the gateway accepts can be
+// answered with yet another challenge (for instance a password change), which
+// is kept and surfaced the same way as the SMS hop was.
+func (s *VPNService) LoginWithSMSCode(gwIdentifier, code string) (map[string]any, error) {
+	s.mu.Lock()
+	gw := s.Config.FindGateway(gwIdentifier)
+	if gw == nil {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("gateway %q not found", gwIdentifier)
+	}
+	ch := s.challengeLocked(gw, protocol.AuthStepSMC)
+	if ch == nil {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("当前没有待完成的短信认证，请重新登录")
+	}
+	client, username, cert, afterAuth, authType := ch.client, ch.username, ch.cert, ch.afterAuth, ch.authType
+	gwID, gwName := gw.ID, gw.Name
+	s.mu.Unlock()
+
+	s.setStatus("Connecting", fmt.Sprintf("Submitting SMS verification code to %s (%s:%d)...", gwName, client.GatewayIP, client.GatewayPort))
+	s.Log("INFO", "Submitting SMS verification code for user %s", username)
+
+	if _, err := client.AuthSMC(code); err != nil {
+		s.mu.Lock()
+		if protocol.IsSMCCodeError(err) {
+			// A wrong code: the challenge stays live for an in-place retry.
+		} else if !s.keepChallengeLocked(client, username, err, cert, afterAuth, authType) {
+			// The code was accepted but the gateway asks for a factor this
+			// build cannot drive (for instance a token): the SMS hop is
+			// consumed either way, so the stale challenge must go.
+			s.challenge = nil
+		}
+		s.mu.Unlock()
+		s.setStatus("Error", fmt.Sprintf("短信认证失败: %v", err))
+		return nil, err
+	}
+
+	// The challenge is consumed; nothing else may submit against this session.
+	s.mu.Lock()
+	if s.challenge == ch {
+		s.challenge = nil
+	}
+	s.mu.Unlock()
+
+	// The chain the challenge grew out of decides how the completed login is
+	// recorded: its afterAuth persists the flow's mode selection (password +
+	// certificate, certificate), and a password-only chain keeps the password
+	// mode of record.
+	if afterAuth != nil {
+		afterAuth(gwID)
+	} else {
+		s.rememberPasswordMode(gwName)
+	}
+	return s.enterConnected(client, username, cert, authType), nil
+}
+
+// SubmitCertFactor answers a gateway certificate challenge — the password step
+// returned RESULT code 0x2 — by presenting the chosen certificate on
+// /vpn/user/auth/cert over the challenged session. The hop count is the
+// gateway's choice: the certificate step's response goes through the same
+// dispatch as every other factor, so it may complete the login, ask for the
+// SMS factor, or open a password change. A rejected certificate keeps the
+// challenge live so the user can pick another one and retry.
+func (s *VPNService) SubmitCertFactor(gwIdentifier string, source int, certID, verifycode string) (map[string]any, error) {
+	store := s.certStore()
+	if store == nil {
+		return nil, fmt.Errorf("证书目录不可用")
+	}
+	cert, err := store.LoadTLS(certID, certstore.Source(source))
+	if err != nil {
+		return nil, err
+	}
+
+	s.mu.Lock()
+	gw := s.Config.FindGateway(gwIdentifier)
+	if gw == nil {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("gateway %q not found", gwIdentifier)
+	}
+	ch := s.challengeLocked(gw, protocol.AuthStepCertificate)
+	if ch == nil {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("当前没有待完成的证书认证，请重新登录")
+	}
+	client, username := ch.client, ch.username
+	gwID := gw.ID
+	s.mu.Unlock()
+
+	s.setStatus("Connecting", fmt.Sprintf("Presenting client certificate to %s (%s:%d)...", gw.Name, client.GatewayIP, client.GatewayPort))
+	s.Log("INFO", "Submitting the certificate factor for user %s, cert=%s", username, certDisplayName(cert, "certificate"))
+
+	// The certificate factor was presented; a challenge that follows on this
+	// step (SMS, password change) completes as a password + certificate
+	// session, and the selection is persisted once the chain finishes.
+	afterAuth := func(id string) { s.persistPasswordCertSelection(id, source, certID) }
+
+	if err := client.AuthCertOnly(cert, verifycode); err != nil {
+		s.mu.Lock()
+		if protocol.IsCertAuthError(err) {
+			// The certificate itself was rejected; the challenge stays live
+			// so the user can pick another certificate and retry.
+		} else if !s.keepChallengeLocked(client, username, err, cert, afterAuth, authTypePasswordCertificate) {
+			// The certificate was accepted but the gateway asks for a factor
+			// this build cannot drive (for instance a token): the
+			// certificate hop is consumed either way, so the stale challenge
+			// must go.
+			s.challenge = nil
+		}
+		s.mu.Unlock()
+		s.setStatus("Error", fmt.Sprintf("证书认证失败: %v", err))
+		return nil, err
+	}
+
+	// The challenge is consumed; nothing else may submit against this session.
+	s.mu.Lock()
+	if s.challenge == ch {
+		s.challenge = nil
+	}
+	s.mu.Unlock()
+
+	afterAuth(gwID)
+	return s.enterConnected(client, username, cert, authTypePasswordCertificate), nil
 }
 
 func (s *VPNService) storeAccountLocked(gw *config.GatewayProfile, username, password string, remember, auto bool) {
@@ -1134,7 +1378,7 @@ func (s *VPNService) cleanupStaleSessionLocked() {
 	oldProxy := s.ProxyMgr
 	s.Client = nil
 	s.ProxyMgr = nil
-	s.passwordChallenge = nil
+	s.challenge = nil
 	s.Status = "Disconnected"
 	s.StatusDetail = "Disconnected"
 	s.Resources = nil
@@ -1159,7 +1403,7 @@ func (s *VPNService) Logout() (bool, error) {
 	client := s.Client
 	s.ProxyMgr = nil
 	s.Client = nil
-	s.passwordChallenge = nil
+	s.challenge = nil
 	s.pendingClients = nil
 	s.Status = "Disconnected"
 	s.StatusDetail = "Disconnected"

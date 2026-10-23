@@ -30,6 +30,11 @@ const (
 	AuthKindCertExpired
 	AuthKindCertRevoked
 	AuthKindCertBadSignature
+	// SMS factor results. 0x8 is the challenge that asks for the code from
+	// the user's phone (SecUI.exe switches to its Edit_SendSMS state on it);
+	// 0x10A rejects a wrong code (language.xml TAG 266 短信码错误).
+	AuthKindSMCRequired
+	AuthKindSMCCodeError
 )
 
 const (
@@ -53,6 +58,12 @@ const (
 	codeCertRevoked      = 0x107 // TAG 263 证书已被注销
 	codeCertBadSignature = 0x108 // TAG 264 证书签名错误
 	codeCertFailed       = 0x162 // TAG 354 证书认证失败（超期或验证失败）
+
+	// SMS factor results. 0x8 is the challenge bit of the auth factor mask
+	// (jquery.sslvpn.js dispatches it to the SMC step); the code itself is
+	// submitted on /vpn/user/auth/smc. 0x10A is the wrong-code rejection.
+	codeSMCRequired  = 0x8
+	codeSMCCodeError = 0x10A // TAG 266 短信码错误
 )
 
 // AuthError is a gateway authentication rejection with a stable kind.
@@ -112,6 +123,16 @@ func (e *AuthError) Error() string {
 			msg = "证书签名错误，请重新选择证书进行认证"
 		}
 		return fmt.Sprintf("证书登录失败: %s (错误代码: %s)", msg, displayCode(e.Code))
+	case AuthKindSMCRequired:
+		if msg == "" {
+			msg = "多因素认证，短信认证"
+		}
+		return fmt.Sprintf("需要短信验证码: %s (错误代码: %s)", msg, displayCode(e.Code))
+	case AuthKindSMCCodeError:
+		if msg == "" {
+			msg = "短信码错误"
+		}
+		return fmt.Sprintf("短信验证失败: %s (错误代码: %s)", msg, displayCode(e.Code))
 	default:
 		if msg == "" {
 			msg = "网关拒绝登录认证"
@@ -124,6 +145,21 @@ func (e *AuthError) Error() string {
 func IsPasswordExpired(err error) bool {
 	var authErr *AuthError
 	return errors.As(err, &authErr) && authErr.Kind == AuthKindPasswordExpired
+}
+
+// IsSMSChallenge reports whether err is the gateway's SMS-factor challenge:
+// the password was accepted and the gateway now wants the code it sent to the
+// user's phone, submitted on /vpn/user/auth/smc over the same session.
+func IsSMSChallenge(err error) bool {
+	var authErr *AuthError
+	return errors.As(err, &authErr) && authErr.Kind == AuthKindSMCRequired
+}
+
+// IsSMCCodeError reports whether err rejected the submitted SMS code. The
+// challenge stays live, so the caller may ask the user to re-enter it.
+func IsSMCCodeError(err error) bool {
+	var authErr *AuthError
+	return errors.As(err, &authErr) && authErr.Kind == AuthKindSMCCodeError
 }
 
 func displayCode(code string) string {
@@ -163,60 +199,74 @@ func classifyAuth(code, _ string) AuthKind {
 		return AuthKindCertRevoked
 	case codeCertBadSignature:
 		return AuthKindCertBadSignature
+	case codeSMCRequired:
+		return AuthKindSMCRequired
+	case codeSMCCodeError:
+		return AuthKindSMCCodeError
 	default:
 		return AuthKindOther
 	}
 }
 
-// authStep is the factor a gateway asks for next. The masks mirror the portal
+// AuthStep is the factor a gateway asks for next. The masks mirror the portal
 // driver (jquery.sslvpn.js), which dispatches on the bits of each auth RESULT
 // code: the lowest set factor bit names the step the client must submit next.
-type authStep int
+// The gateway — not the client — drives the sequence, so a login may chain
+// any order of factors (password -> certificate -> SMS, cert -> SMS, ...).
+type AuthStep int
 
 const (
-	authStepUnknown authStep = iota
-	authStepFailure
-	authStepChallenge
-	authStepPassword
-	authStepCertificate
-	authStepToken
-	authStepSMC
-	authStepPasswordChange
-	authStepMachineInfo
-	authStepRule
-	authStepDone
+	AuthStepUnknown AuthStep = iota
+	AuthStepFailure
+	AuthStepChallenge
+	AuthStepPassword
+	AuthStepCertificate
+	AuthStepToken
+	AuthStepSMC
+	AuthStepPasswordChange
+	AuthStepMachineInfo
+	AuthStepRule
+	AuthStepDone
 )
 
 // nextAuthStep decodes the next-factor mask of an auth result code. The
 // precedence follows the portal driver exactly, because the masks overlap:
 // 0x102, for instance, means "certificate" because 0x2 is tested before 0x180.
-func nextAuthStep(code string) authStep {
+func nextAuthStep(code string) AuthStep {
 	n, ok := parseResultCode(code)
 	if !ok {
-		return authStepUnknown
+		return AuthStepUnknown
 	}
 	switch {
 	case n&0x80000000 != 0:
-		return authStepFailure
+		return AuthStepFailure
 	case n == 0x00010001:
-		return authStepChallenge
+		return AuthStepChallenge
 	case n&0x1 != 0:
-		return authStepPassword
+		return AuthStepPassword
 	case n&0x2 != 0:
-		return authStepCertificate
+		return AuthStepCertificate
 	case n&0x4 != 0:
-		return authStepToken
+		return AuthStepToken
 	case n&0x8 != 0:
-		return authStepSMC
+		return AuthStepSMC
 	case n&0x180 != 0:
-		return authStepPasswordChange
+		return AuthStepPasswordChange
 	case n&0x270 != 0:
-		return authStepMachineInfo
+		return AuthStepMachineInfo
 	case n&0x30000000 != 0:
-		return authStepRule
+		return AuthStepRule
 	default:
-		return authStepDone
+		return AuthStepDone
 	}
+}
+
+// NextAuthStep reports which factor the gateway asks for next after the auth
+// response carrying this result code. It is the single dispatch point for a
+// gateway-driven login: every submitted factor answers with a RESULT code,
+// and this function names the follow-up (AuthStepDone on success).
+func NextAuthStep(code string) AuthStep {
+	return nextAuthStep(code)
 }
 
 // IsCertAuthError reports whether err is a certificate-authentication
@@ -316,4 +366,12 @@ func passwordChangeBody(oldPassword, newPassword string) string {
 		"old_pwd": {oldPassword},
 		"new_pwd": {newPassword},
 	}.Encode()
+}
+
+// smsAuthBody formats the request body for /vpn/user/auth/smc. SecLogin.dll
+// posts the code through the same raw format string "smc=%s" (0x10041da8) it
+// uses for the other auth forms — no encode parameter, no escaping. SMS codes
+// are digits, so raw concatenation reproduces the original byte for byte.
+func smsAuthBody(code string) string {
+	return "smc=" + code
 }

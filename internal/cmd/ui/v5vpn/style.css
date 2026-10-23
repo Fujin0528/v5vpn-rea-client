@@ -54,28 +54,39 @@ body {
   overflow: hidden;
 }
 
-.password-change-panel {
-  margin-top: 14px;
-  padding: 12px 14px 14px;
-  border: 1px solid rgba(245, 158, 11, 0.45);
-  border-radius: var(--radius-md);
-  background: rgba(245, 158, 11, 0.08);
+/* 证书免密入口：常驻一行，登录框高度恒定（原厂 Opt_Cert 入口） */
+.cert-entry-row {
+  margin: 4px 0 14px;
+  text-align: center;
 }
 
-.password-change-hint {
-  font-size: 0.82rem;
-  color: #fcd34d;
-  margin-bottom: 12px;
-  line-height: 1.45;
+.cert-entry-link {
+  font-size: 0.84rem;
+  color: var(--text-muted);
+  text-decoration: none;
+  cursor: pointer;
+  transition: color var(--transition-fast);
 }
 
-.password-change-actions {
+.cert-entry-link:hover {
+  color: var(--accent);
+  text-decoration: underline;
+}
+
+/* ==================== 短信认证（挑战模态内） ==================== */
+/* 网关返回 code=8（多因素认证，短信认证）时在挑战模态里展开。 */
+.sms-input-row {
   display: flex;
   gap: 8px;
 }
 
-.password-change-actions .btn {
+.sms-input-row .form-control {
   flex: 1;
+}
+
+.sms-send-btn {
+  flex: 0 0 auto;
+  white-space: nowrap;
 }
 
 .login-wrapper {
@@ -299,7 +310,7 @@ label {
   gap: 8px;
 }
 
-.verifycode-container #verifycode-input {
+.verifycode-container #modal-verifycode-input {
   flex: 1;
   text-transform: uppercase;
   font-weight: 600;
@@ -1157,79 +1168,31 @@ button.github-link {
   justify-content: flex-end;
 }
 
-/* ==================== 认证方式切换 ==================== */
-.auth-tabs {
-  display: flex;
-  gap: 4px;
-  padding: 3px;
-  margin-bottom: 16px;
-  background: var(--bg-input);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
+/* ==================== 认证挑战模态 ==================== */
+/* 登录框只保留固定表单；图形验证码 / 客户端证书 / 短信 / 改密四种挑战
+   都在同一个模态里弹出，body 由 app.js 按挑战类型重建。 */
+.challenge-dialog {
+  max-width: 460px;
 }
 
-.auth-tab {
-  flex: 1;
-  padding: 7px 10px;
-  background: transparent;
-  border: 1px solid transparent;
-  border-radius: 4px;
+.challenge-hint {
+  font-size: 0.84rem;
   color: var(--text-muted);
-  font-size: 0.86rem;
-  font-family: inherit;
-  cursor: pointer;
-  transition: all 0.2s ease;
+  margin: 0 0 14px;
+  line-height: 1.5;
 }
 
-.auth-tab:hover {
-  color: var(--text-main);
-  background: var(--bg-hover);
-}
-
-.auth-tab.is-active {
-  background: var(--bg-hover);
-  border-color: rgba(16, 185, 129, 0.3);
-  color: var(--accent);
-  font-weight: 600;
-}
-
-/* ==================== 证书登录 ==================== */
-.cert-source-tabs {
+.challenge-actions {
   display: flex;
-  gap: 6px;
+  gap: 8px;
+  margin-top: 6px;
 }
 
-.cert-source {
+.challenge-actions .btn {
   flex: 1;
-  padding: 6px 8px;
-  background: var(--bg-input);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  color: var(--text-muted);
-  font-size: 0.8rem;
-  font-family: inherit;
-  cursor: pointer;
-  transition: all 0.2s ease;
 }
 
-.cert-source:hover:not(:disabled) {
-  border-color: var(--border-focus);
-  color: var(--text-main);
-}
-
-.cert-source.is-active {
-  border-color: var(--accent);
-  background: rgba(16, 185, 129, 0.12);
-  color: var(--accent);
-  font-weight: 600;
-}
-
-.cert-source.is-disabled,
-.cert-source:disabled {
-  opacity: 0.45;
-  cursor: not-allowed;
-}
-
+/* ==================== 证书列表（挑战模态内） ==================== */
 .cert-list {
   max-height: 190px;
   overflow-y: auto;
@@ -1343,28 +1306,6 @@ button.github-link {
 .import-path-row .form-control {
   flex: 1;
   min-width: 0;
-}
-
-/* ==================== 口令 + 证书（双因子） ==================== */
-.pwd-cert-row {
-  display: flex;
-  gap: 8px;
-}
-
-.pwd-cert-row .form-control {
-  flex: 1;
-  min-width: 0;
-}
-
-/* The source selector is a short fixed label; the certificate list takes the
-   remaining width. */
-.pwd-cert-row .pwd-cert-source {
-  flex: 0 0 104px;
-}
-
-.password-change-actions {
-  display: flex;
-  gap: 8px;
 }
 
 /* ==================== 资源加载状态 ==================== */
