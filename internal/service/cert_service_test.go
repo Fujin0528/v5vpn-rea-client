@@ -316,6 +316,163 @@ func TestLoginWithPasswordAndCertPasswordOnlyGateway(t *testing.T) {
 	}
 }
 
+// TestSubmitCertFactorAnswersPasswordChallenge drives the gateway-driven
+// chain the fixed login form produces: the password-only login draws the
+// certificate challenge (code 2), the challenge stays on the session, and
+// SubmitCertFactor presents the chosen certificate over that same session.
+// The completed login is recorded (and persisted) as password + certificate.
+func TestSubmitCertFactorAnswersPasswordChallenge(t *testing.T) {
+	probe := &twoFactorServiceProbe{}
+	server := newTwoFactorGateway(t, probe, "")
+	host, port := hostPortOf(t, server.URL)
+
+	t.Chdir(t.TempDir())
+	store := mustStore(t)
+	certID := mustImportCert(t, store, "chain-cert")
+
+	s := &VPNService{
+		Config: &config.AppConfig{Gateways: []config.GatewayProfile{{
+			ID:   "gw-0",
+			Name: "gw",
+			IP:   host,
+			Port: port,
+		}}},
+		CertStore: store,
+		Status:    "Disconnected",
+	}
+	defer s.Logout()
+
+	// 1. The password is accepted; the gateway asks for the certificate.
+	if _, err := s.Login("gw", "alice", "secret", "", false, false); AuthErrorCode(err) != "cert_challenge" {
+		t.Fatalf("expected cert_challenge, got %v", err)
+	}
+
+	// 2. The certificate factor is presented on the challenged session.
+	res, err := s.SubmitCertFactor("gw", int(certstore.SourceFile), certID, "")
+	if err != nil {
+		t.Fatalf("SubmitCertFactor: %v", err)
+	}
+	if !probe.sawCertStep {
+		t.Fatal("the certificate step did not present the client certificate")
+	}
+	if res["authType"] != authTypePasswordCertificate {
+		t.Fatalf("authType = %v, want %q", res["authType"], authTypePasswordCertificate)
+	}
+	if s.Client == nil || s.Client.ClientCertificate() == nil {
+		t.Fatal("session client did not retain the certificate for the tunnel")
+	}
+
+	// 3. The two-factor selection is persisted for the next launch.
+	gw := s.GetGateways()[0]
+	if !gw.CertWithPassword || gw.SelectedCertID != certID {
+		t.Fatalf("certificate factor selection was not persisted: %+v", gw)
+	}
+
+	// 4. The challenge is consumed; a second submission must not succeed.
+	if _, err := s.SubmitCertFactor("gw", int(certstore.SourceFile), certID, ""); err == nil {
+		t.Fatal("a consumed challenge accepted a second submission")
+	}
+}
+
+// TestSubmitCertFactorRequiresPendingChallenge pins the guard: without a live
+// certificate challenge there is nothing to continue.
+func TestSubmitCertFactorRequiresPendingChallenge(t *testing.T) {
+	server := newTwoFactorGateway(t, nil, "")
+	host, port := hostPortOf(t, server.URL)
+
+	t.Chdir(t.TempDir())
+	store := mustStore(t)
+	certID := mustImportCert(t, store, "chain-cert")
+
+	s := &VPNService{
+		Config: &config.AppConfig{Gateways: []config.GatewayProfile{{
+			ID:   "gw-0",
+			Name: "gw",
+			IP:   host,
+			Port: port,
+		}}},
+		CertStore: store,
+		Status:    "Disconnected",
+	}
+	if _, err := s.SubmitCertFactor("gw", int(certstore.SourceFile), certID, ""); err == nil {
+		t.Fatal("SubmitCertFactor without a challenge should fail")
+	}
+}
+
+// TestSubmitCertFactorSurfacesSMSChallenge proves the hop count is the
+// gateway's choice: the certificate step itself can be answered with the SMS
+// factor, which stays on the same chain and completes as password +
+// certificate once the code is submitted.
+func TestSubmitCertFactorSurfacesSMSChallenge(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/vpn/version.xml", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `<VERSION major="2" minor="0"/>`)
+	})
+	mux.HandleFunc("/vpn/user/auth/password", func(w http.ResponseWriter, r *http.Request) {
+		http.SetCookie(w, &http.Cookie{Name: "VSG_SESSIONID", Value: "cert-sms-chain", Path: "/"})
+		_, _ = io.WriteString(w, `<RESPONSE><RESULT code="2" msg="certificate factor required"/></RESPONSE>`)
+	})
+	mux.HandleFunc("/vpn/user/auth/cert", func(w http.ResponseWriter, r *http.Request) {
+		if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
+			http.Error(w, "client certificate required", http.StatusBadRequest)
+			return
+		}
+		_, _ = io.WriteString(w, `<RESPONSE><RESULT code="8" msg="多因素认证，短信认证"/></RESPONSE>`)
+	})
+	mux.HandleFunc("/vpn/user/auth/send_smc", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `<RESPONSE><RESULT code="0" msg="ok"/></RESPONSE>`)
+	})
+	mux.HandleFunc("/vpn/user/auth/smc", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `<RESPONSE><RESULT code="0" msg=""/></RESPONSE>`)
+	})
+	mux.HandleFunc("/vpn/user/portal/intergration.xml", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `<INTERGRATION_INFO><USER name="alice"/><SESSION detect_interval="180"/><RESOURCE_LIST></RESOURCE_LIST></INTERGRATION_INFO>`)
+	})
+	server := httptest.NewUnstartedServer(mux)
+	server.TLS = &tls.Config{ClientAuth: tls.RequestClientCert}
+	server.StartTLS()
+	defer server.Close()
+	host, port := hostPortOf(t, server.URL)
+
+	t.Chdir(t.TempDir())
+	store := mustStore(t)
+	certID := mustImportCert(t, store, "chain-cert")
+
+	s := &VPNService{
+		Config: &config.AppConfig{Gateways: []config.GatewayProfile{{
+			ID:   "gw-0",
+			Name: "gw",
+			IP:   host,
+			Port: port,
+		}}},
+		CertStore: store,
+		Status:    "Disconnected",
+	}
+	defer s.Logout()
+
+	if _, err := s.Login("gw", "alice", "secret", "", false, false); AuthErrorCode(err) != "cert_challenge" {
+		t.Fatalf("expected cert_challenge, got %v", err)
+	}
+	if _, err := s.SubmitCertFactor("gw", int(certstore.SourceFile), certID, ""); AuthErrorCode(err) != "sms_challenge" {
+		t.Fatalf("expected the SMS challenge after the certificate factor, got %v", err)
+	}
+
+	if err := s.SendSMSCode("gw"); err != nil {
+		t.Fatalf("SendSMSCode: %v", err)
+	}
+	res, err := s.LoginWithSMSCode("gw", "123456")
+	if err != nil {
+		t.Fatalf("LoginWithSMSCode: %v", err)
+	}
+	if res["authType"] != authTypePasswordCertificate {
+		t.Fatalf("authType = %v, want %q", res["authType"], authTypePasswordCertificate)
+	}
+	gw := s.GetGateways()[0]
+	if !gw.CertWithPassword || gw.SelectedCertID != certID {
+		t.Fatalf("certificate factor selection was not persisted after the SMS step: %+v", gw)
+	}
+}
+
 // A rejected two-factor login must not rewrite the stored mode.
 func TestLoginWithPasswordAndCertRejectedKeepsSavedMode(t *testing.T) {
 	server := newTwoFactorGateway(t, nil, `<RESULT code="0x101" msg="用户名或密码错误"/>`)

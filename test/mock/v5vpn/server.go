@@ -25,15 +25,17 @@ import (
 type Mode string
 
 const (
-	ModePwdCert    Mode = "pwd-cert"   // Two-factor: Password -> code 2 -> Cert -> code 0
-	ModePwdOnly    Mode = "pwd-only"   // Single-factor: Password -> code 0
-	ModeCertOnly   Mode = "cert-only"  // Standalone mTLS Certificate -> code 0
-	ModePwdChange  Mode = "pwd-change" // Password expired: Password -> code 256 -> PwdChange -> code 0
-	ModeVerifyCode Mode = "verifycode" // Captcha required: Password -> code 0x80 -> Captcha -> code 0
-	ModeToken      Mode = "token"      // Password -> code 4 -> Token -> code 0
-	ModeSMS        Mode = "sms"        // Password -> code 8 -> SMS -> code 0
-	ModeErrAuth    Mode = "err-auth"   // Invalid credentials -> code 0x8000001a
-	ModeErrCert    Mode = "err-cert"   // Expired/Invalid certificate -> code 0x106
+	ModePwdCert    Mode = "pwd-cert"     // Two-factor: Password -> code 2 -> Cert -> code 0
+	ModePwdCertSMS Mode = "pwd-cert-sms" // Three-factor chain: Password -> code 2 -> Cert -> code 8 -> SMS -> code 0
+	ModeFullChain  Mode = "full-chain"   // Every factor in one chain: Password(+captcha) -> code 2 -> Cert -> code 8 -> SMS -> code 4 -> Token -> code 0
+	ModePwdOnly    Mode = "pwd-only"     // Single-factor: Password -> code 0
+	ModeCertOnly   Mode = "cert-only"    // Standalone mTLS Certificate -> code 0
+	ModePwdChange  Mode = "pwd-change"   // Password expired: Password -> code 256 -> PwdChange -> code 0
+	ModeVerifyCode Mode = "verifycode"   // Captcha required: Password -> code 0x80 -> Captcha -> code 0
+	ModeToken      Mode = "token"        // Password -> code 4 -> Token -> code 0
+	ModeSMS        Mode = "sms"          // Password -> code 8 -> SMS -> code 0
+	ModeErrAuth    Mode = "err-auth"     // Invalid credentials -> code 0x8000001a
+	ModeErrCert    Mode = "err-cert"     // Expired/Invalid certificate -> code 0x106
 )
 
 // Config holds options for the mock server.
@@ -54,6 +56,8 @@ type Session struct {
 	PassedCert bool
 	AuthMethod string
 	VerifyCode string
+	SMSCode    string
+	TokenCode  string
 	CreatedAt  time.Time
 }
 
@@ -66,6 +70,8 @@ type Server struct {
 	sessions          map[string]*Session
 	mode              Mode
 	currentVerifyCode string
+	currentSMSCode    string
+	currentTokenCode  string
 	lastChangedTime   time.Time
 }
 
@@ -109,10 +115,13 @@ func New(cfg Config) (*Server, error) {
 	mux.HandleFunc("/vpn/user/auth/cert", s.handleCert)
 	mux.HandleFunc("/vpn/user/auth/token", s.handleToken)
 	mux.HandleFunc("/vpn/user/auth/smc", s.handleSMS)
+	mux.HandleFunc("/vpn/user/auth/send_smc", s.handleSendSMS)
 	mux.HandleFunc("/vpn/user/auth/pwdchange", s.handlePwdChange)
 	mux.HandleFunc("/vpn/user/auth/verifycode", s.handleVerifyCode)
 	mux.HandleFunc("/vpn/user/auth/verifycode_status", s.handleVerifyCodeStatus)
 	mux.HandleFunc("/api/verifycode", s.handleAPIVerifyCode)
+	mux.HandleFunc("/api/smscode", s.handleAPISMCode)
+	mux.HandleFunc("/api/tokencode", s.handleAPITokenCode)
 	mux.HandleFunc("/vpn/user/check/rule.xml", s.handleRuleXML)
 	mux.HandleFunc("/vpn/user/common/SSOConfig.xml", s.handleSSOConfigXML)
 	mux.HandleFunc("/vpn/user/client/install.xml", s.handleInstallXML)
@@ -182,6 +191,8 @@ button:hover { background: #0284c7; color: #fff; }
   <p><strong>Expected User:</strong> <code>%s</code> / <code>%s</code></p>
   <p><strong>Switch Simulation Flow:</strong></p>
   <button onclick="setMode('pwd-cert')">🔐 口令+证书双因素 (pwd-cert)</button>
+  <button onclick="setMode('pwd-cert-sms')">🔐💬 口令+证书+短信三因素 (pwd-cert-sms)</button>
+  <button onclick="setMode('full-chain')">🧩 全链挑战: 验证码+证书+短信+令牌 (full-chain)</button>
   <button onclick="setMode('pwd-only')">🔑 仅口令直连 (pwd-only)</button>
   <button onclick="setMode('cert-only')">🪪 纯证书免密 (cert-only)</button>
   <button onclick="setMode('pwd-change')">🔄 密码过期改密 (pwd-change)</button>
@@ -325,7 +336,7 @@ func (s *Server) handlePassword(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[MockServer] <- Single factor login success for %q (code: 0)", rawUser)
 		w.Write([]byte(fmt.Sprintf(`<?xml version="1.0" encoding="utf-8"?>
 <RESPONSE><RESULT code="0" msg="" sid_name="VSG_SESSIONID"></RESULT></RESPONSE>`)))
-	case ModePwdCert:
+	case ModePwdCert, ModePwdCertSMS:
 		log.Printf("[MockServer] <- Two-factor challenge for %q: requesting Certificate (code: 2)", rawUser)
 		w.Write([]byte(fmt.Sprintf(`<?xml version="1.0" encoding="utf-8"?>
 <RESPONSE><RESULT code="2" msg="need cert" sid_name="VSG_SESSIONID"></RESULT></RESPONSE>`)))
@@ -353,13 +364,42 @@ func (s *Server) handlePassword(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(fmt.Sprintf(`<?xml version="1.0" encoding="utf-8"?>
 <RESPONSE><RESULT code="0" msg="" sid_name="VSG_SESSIONID"></RESULT></RESPONSE>`)))
 	case ModeToken:
-		log.Printf("[MockServer] <- Token challenge for %q (code: 4)", rawUser)
+		// The challenge is issued together with a token code bound to this
+		// session — that stands in for "whatever the user's token displays
+		// right now"; the E2E driver reads it via the test-only /api/tokencode.
+		tokenCode := s.generateNewTokenCode(sessionID)
+		log.Printf("[MockServer] <- Token challenge for %q (code: 4, token now shows %q)", rawUser, tokenCode)
 		w.Write([]byte(fmt.Sprintf(`<?xml version="1.0" encoding="utf-8"?>
 <RESPONSE><RESULT code="4" msg="need token" sid_name="VSG_SESSIONID"></RESULT></RESPONSE>`)))
+	case ModeFullChain:
+		// The password step is guarded by a captcha first — same semantics as
+		// ModeVerifyCode: the code rides the password request as a field, it
+		// has no endpoint of its own. Once it passes, the gateway walks the
+		// remaining factors: cert -> SMS -> token.
+		verifycode := values.Get("verifycode")
+		if verifycode == "" {
+			log.Printf("[MockServer] <- Verifycode required for %q (code: 0x80)", rawUser)
+			w.Write([]byte(fmt.Sprintf(`<?xml version="1.0" encoding="utf-8"?>
+<RESPONSE><RESULT code="0x80" msg="需要图形验证码" sid_name="VSG_SESSIONID"></RESULT></RESPONSE>`)))
+			return
+		}
+		expected := s.getExpectedVerifyCode(sessionID)
+		if expected == "" || !strings.EqualFold(strings.TrimSpace(verifycode), expected) {
+			log.Printf("[MockServer] <- Verifycode MISMATCH for %q: received %q, expected %q (code: 0x80000021)", rawUser, verifycode, expected)
+			s.generateNewVerifyCode(sessionID)
+			w.Write([]byte(fmt.Sprintf(`<?xml version="1.0" encoding="utf-8"?>
+<RESPONSE><RESULT code="0x80000021" msg="图形验证码错误，请重新输入" sid_name="VSG_SESSIONID"></RESULT></RESPONSE>`)))
+			return
+		}
+		log.Printf("[MockServer] <- Captcha passed for %q, requesting Certificate (code: 2)", rawUser)
+		w.Write([]byte(fmt.Sprintf(`<?xml version="1.0" encoding="utf-8"?>
+<RESPONSE><RESULT code="2" msg="need cert" sid_name="VSG_SESSIONID"></RESULT></RESPONSE>`)))
 	case ModeSMS:
+		// msg mirrors the real gateway's challenge text (issue #9 screenshot);
+		// SecUI.exe switches to its Edit_SendSMS state on this code.
 		log.Printf("[MockServer] <- SMS challenge for %q (code: 8)", rawUser)
 		w.Write([]byte(fmt.Sprintf(`<?xml version="1.0" encoding="utf-8"?>
-<RESPONSE><RESULT code="8" msg="need sms" sid_name="VSG_SESSIONID"></RESULT></RESPONSE>`)))
+<RESPONSE><RESULT code="8" msg="多因素认证，短信认证" sid_name="VSG_SESSIONID"></RESULT></RESPONSE>`)))
 	default:
 		w.Write([]byte(`<?xml version="1.0" encoding="utf-8"?>
 <RESPONSE><RESULT code="0" msg="" sid_name="VSG_SESSIONID"></RESULT></RESPONSE>`))
@@ -442,24 +482,209 @@ func (s *Server) handleCert(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[MockServer] <- Standalone certificate auth SUCCESS (SessionID=%q, code: 0)", sessionID)
 	}
 
+	// Three-factor chain: the certificate factor passed, but the gateway still
+	// wants the SMS factor before it grants the session. The challenge text
+	// mirrors the real gateway (issue #9 screenshot). The full-chain mode walks
+	// the same hop on its way to the token factor.
+	if s.GetMode() == ModePwdCertSMS || s.GetMode() == ModeFullChain {
+		log.Printf("[MockServer] <- SMS challenge after certificate factor for session %q (code: 8)", sessionID)
+		w.Write([]byte(`<?xml version="1.0" encoding="utf-8"?>
+<RESPONSE><RESULT code="8" msg="多因素认证，短信认证" sid_name="VSG_SESSIONID"></RESULT></RESPONSE>`))
+		return
+	}
+
 	w.Write([]byte(`<?xml version="1.0" encoding="utf-8"?>
 <RESPONSE><RESULT code="0" msg="" sid_name="VSG_SESSIONID"></RESULT></RESPONSE>`))
 }
 
+// handleToken backs POST /vpn/user/auth/token: the client submits the code
+// the user's hardware/software token displays. A mismatch answers 0x109 and
+// — like the SMS flow — does NOT regenerate the code: the token keeps
+// displaying the same digits until its own cycle rolls them, and a mistyped
+// retry must not invalidate what the user is looking at. 0x109 itself is an
+// inference (the SMS rejection is 0x10A / TAG 266 and the token message sits
+// next to it in the original language tables); the real gateway has not been
+// captured on a token rejection yet.
 func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
-	log.Printf("[MockServer] -> POST /vpn/user/auth/token: %s", string(body))
+	values, _ := url.ParseQuery(string(body))
+	token := strings.TrimSpace(values.Get("token"))
+
+	sessionID := ""
+	if c, err := r.Cookie("VSG_SESSIONID"); err == nil {
+		sessionID = c.Value
+	}
+	expected := s.getExpectedTokenCode(sessionID)
+
+	log.Printf("[MockServer] -> POST /vpn/user/auth/token (SessionID=%q, token=%q)", sessionID, token)
 	w.Header().Set("Content-Type", "text/xml; charset=utf-8")
+
+	if expected == "" || !strings.EqualFold(token, expected) {
+		log.Printf("[MockServer] <- Token code MISMATCH for session %q: got %q, expected %q (code: 0x109)", sessionID, token, expected)
+		w.Write([]byte(`<?xml version="1.0" encoding="utf-8"?>
+<RESPONSE><RESULT code="0x109" msg="动态令牌码错误" sid_name="VSG_SESSIONID"></RESULT></RESPONSE>`))
+		return
+	}
+
+	s.mu.Lock()
+	if sess, ok := s.sessions[sessionID]; ok && sess != nil {
+		sess.AuthMethod = "动态令牌认证"
+	}
+	s.mu.Unlock()
+
+	log.Printf("[MockServer] <- Token code %q passed for session %q, login success (code: 0)", token, sessionID)
 	w.Write([]byte(`<?xml version="1.0" encoding="utf-8"?>
 <RESPONSE><RESULT code="0" msg="" sid_name="VSG_SESSIONID"></RESULT></RESPONSE>`))
 }
 
-func (s *Server) handleSMS(w http.ResponseWriter, r *http.Request) {
-	body, _ := io.ReadAll(r.Body)
-	log.Printf("[MockServer] -> POST /vpn/user/auth/smc: %s", string(body))
+// getExpectedTokenCode returns the token code issued to one session. No
+// global fallback: the code another session was challenged with must never
+// validate here.
+func (s *Server) getExpectedTokenCode(sessionID string) string {
+	if sessionID == "" {
+		return ""
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if sess, ok := s.sessions[sessionID]; ok && sess != nil {
+		return sess.TokenCode
+	}
+	return ""
+}
+
+// generateNewTokenCode issues a fresh 6-digit code, stores it on the session
+// and mirrors it into currentTokenCode for the test-only /api/tokencode
+// endpoint. It stands in for the user's token display.
+func (s *Server) generateNewTokenCode(sessionID string) string {
+	rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
+	code := fmt.Sprintf("%06d", rnd.Intn(1000000))
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.currentTokenCode = code
+	if sessionID != "" {
+		if sess, ok := s.sessions[sessionID]; ok && sess != nil {
+			sess.TokenCode = code
+		}
+	}
+	return code
+}
+
+// handleAPITokenCode exposes the last issued token code to the test harness
+// (the E2E driver has no token device). Test-only, same shape as /api/smscode.
+func (s *Server) handleAPITokenCode(w http.ResponseWriter, r *http.Request) {
+	s.mu.RLock()
+	code := s.currentTokenCode
+	s.mu.RUnlock()
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprintf(w, `{"code":%q}`, code)
+}
+
+// handleSendSMS backs GET /vpn/user/auth/send_smc: the client asks the gateway
+// to deliver the SMS verification code to the user's registered phone. The
+// code is generated here and bound to the requesting session, the way the real
+// gateway binds it to the VSG_SESSIONID that received the 0x8 challenge.
+func (s *Server) handleSendSMS(w http.ResponseWriter, r *http.Request) {
+	sessionID := ""
+	if c, err := r.Cookie("VSG_SESSIONID"); err == nil {
+		sessionID = c.Value
+	}
+
+	code := s.generateNewSMSCode(sessionID)
+	log.Printf("[MockServer] <- SMS code delivered for session %q (Code: %q)", sessionID, code)
+
 	w.Header().Set("Content-Type", "text/xml; charset=utf-8")
 	w.Write([]byte(`<?xml version="1.0" encoding="utf-8"?>
+<RESPONSE><RESULT code="0" msg="ok" sid_name="VSG_SESSIONID"></RESULT></RESPONSE>`))
+}
+
+// handleSMS backs POST /vpn/user/auth/smc: the client submits the code from
+// the user's phone. A mismatch answers 0x10A (language.xml TAG 266 短信码
+// 错误) and — unlike the captcha flow — does NOT regenerate the code: the
+// real gateway already sent that SMS, and a mistyped retry must not
+// invalidate what is sitting in the user's inbox.
+func (s *Server) handleSMS(w http.ResponseWriter, r *http.Request) {
+	body, _ := io.ReadAll(r.Body)
+	values, _ := url.ParseQuery(string(body))
+	smc := strings.TrimSpace(values.Get("smc"))
+
+	sessionID := ""
+	if c, err := r.Cookie("VSG_SESSIONID"); err == nil {
+		sessionID = c.Value
+	}
+	expected := s.getExpectedSMSCode(sessionID)
+
+	w.Header().Set("Content-Type", "text/xml; charset=utf-8")
+	if expected == "" || !strings.EqualFold(smc, expected) {
+		log.Printf("[MockServer] <- SMS code MISMATCH for session %q: got %q, expected %q (code: 0x10A)", sessionID, smc, expected)
+		w.Write([]byte(`<?xml version="1.0" encoding="utf-8"?>
+<RESPONSE><RESULT code="0x10A" msg="短信码错误" sid_name="VSG_SESSIONID"></RESULT></RESPONSE>`))
+		return
+	}
+
+	s.mu.Lock()
+	if sess, ok := s.sessions[sessionID]; ok && sess != nil {
+		sess.AuthMethod = "短信认证"
+	}
+	s.mu.Unlock()
+
+	// Full chain: the SMS factor passed, but the gateway still wants the
+	// dynamic-token factor. Issue a token code bound to this session — the
+	// user's token "display" — and challenge with code 4, exactly like the
+	// dedicated token mode does on its password step.
+	if s.GetMode() == ModeFullChain {
+		tokenCode := s.generateNewTokenCode(sessionID)
+		log.Printf("[MockServer] <- Token challenge after SMS factor for session %q (code: 4, token now shows %q)", sessionID, tokenCode)
+		w.Write([]byte(`<?xml version="1.0" encoding="utf-8"?>
+<RESPONSE><RESULT code="4" msg="need token" sid_name="VSG_SESSIONID"></RESULT></RESPONSE>`))
+		return
+	}
+
+	log.Printf("[MockServer] <- SMS code %q passed for session %q, login success (code: 0)", smc, sessionID)
+	w.Write([]byte(`<?xml version="1.0" encoding="utf-8"?>
 <RESPONSE><RESULT code="0" msg="" sid_name="VSG_SESSIONID"></RESULT></RESPONSE>`))
+}
+
+// getExpectedSMSCode returns the SMS code issued to one session. No global
+// fallback: the code another session requested must never validate here.
+func (s *Server) getExpectedSMSCode(sessionID string) string {
+	if sessionID == "" {
+		return ""
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if sess, ok := s.sessions[sessionID]; ok && sess != nil {
+		return sess.SMSCode
+	}
+	return ""
+}
+
+// generateNewSMSCode issues a fresh 6-digit code, stores it on the session and
+// mirrors it into currentSMSCode for the test-only /api/smscode endpoint.
+func (s *Server) generateNewSMSCode(sessionID string) string {
+	rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
+	code := fmt.Sprintf("%06d", rnd.Intn(1000000))
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.currentSMSCode = code
+	if sessionID != "" {
+		if sess, ok := s.sessions[sessionID]; ok && sess != nil {
+			sess.SMSCode = code
+		}
+	}
+	return code
+}
+
+// handleAPISMCode exposes the last issued SMS code to the test harness (the
+// E2E driver has no access to the phone the mock "texted"). Test-only, same
+// shape as /api/verifycode.
+func (s *Server) handleAPISMCode(w http.ResponseWriter, r *http.Request) {
+	s.mu.RLock()
+	code := s.currentSMSCode
+	s.mu.RUnlock()
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprintf(w, `{"code":%q}`, code)
 }
 
 func (s *Server) handlePwdChange(w http.ResponseWriter, r *http.Request) {
@@ -524,10 +749,18 @@ func (s *Server) handleIntegration(w http.ResponseWriter, r *http.Request) {
 			authMethod = "证书认证"
 		case ModePwdCert:
 			authMethod = "双因素认证"
+		case ModePwdCertSMS:
+			authMethod = "多因素认证"
+		case ModeFullChain:
+			authMethod = "多因素认证"
 		case ModeVerifyCode:
 			authMethod = "验证码认证"
 		case ModePwdChange:
 			authMethod = "改密续连"
+		case ModeSMS:
+			authMethod = "短信认证"
+		case ModeToken:
+			authMethod = "动态令牌认证"
 		default:
 			authMethod = "口令认证"
 		}

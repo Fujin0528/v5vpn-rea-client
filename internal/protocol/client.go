@@ -297,6 +297,141 @@ func (c *Client) AuthOnly(username, password, verifycode string) (*AuthResponse,
 	return resp, nil
 }
 
+// AuthSMC submits the SMS verification code on /vpn/user/auth/smc and marks
+// the session logged in. It completes a login the gateway challenged with the
+// SMS factor (RESULT code 0x8), so it must run on the same client that
+// received the challenge: the gateway binds the code to the VSG_SESSIONID
+// cookie issued with that response. A wrong code (0x10A) leaves the challenge
+// live, so the caller may ask the user to re-enter it.
+func (c *Client) AuthSMC(code string) (*AuthResponse, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.Logger("INFO", "Submitting SMS verification code")
+
+	authResp, respBody, statusCode, err := c.postAuthForm("/vpn/user/auth/smc", smsAuthBody(code))
+	if err != nil {
+		return nil, err
+	}
+
+	c.captureSession()
+
+	if authResp.Result.Code != "" && !isSuccessCode(authResp.Result.Code) {
+		authErr := newAuthError(authResp.Result.Code, authResp.Result.Msg)
+		c.Logger("ERROR", "Gateway rejected the SMS code: %s", authErr.Error())
+		return &authResp, authErr
+	}
+
+	if statusCode != http.StatusOK {
+		return nil, fmt.Errorf("sms auth failed with HTTP status %d: %s", statusCode, string(respBody))
+	}
+
+	if c.SessionID == "" {
+		c.Logger("ERROR", "No valid Session ID received after SMS auth. Response: %s", string(respBody))
+		return nil, fmt.Errorf("短信认证未下发有效会话ID")
+	}
+
+	c.markLoggedInLocked()
+	return &authResp, nil
+}
+
+// AuthToken submits the dynamic-token (OTP) code on /vpn/user/auth/token and
+// marks the session logged in. It completes a login the gateway challenged
+// with the token factor (RESULT code 0x4), so it must run on the same client
+// that received the challenge: the gateway binds the code to the VSG_SESSIONID
+// cookie issued with that response. A wrong code leaves the challenge live,
+// so the caller may ask the user to re-enter it.
+func (c *Client) AuthToken(code string) (*AuthResponse, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.Logger("INFO", "Submitting dynamic token code")
+
+	authResp, respBody, statusCode, err := c.postAuthForm("/vpn/user/auth/token", tokenAuthBody(code))
+	if err != nil {
+		return nil, err
+	}
+
+	c.captureSession()
+
+	if authResp.Result.Code != "" && !isSuccessCode(authResp.Result.Code) {
+		authErr := newAuthError(authResp.Result.Code, authResp.Result.Msg)
+		c.Logger("ERROR", "Gateway rejected the token code: %s", authErr.Error())
+		return &authResp, authErr
+	}
+
+	if statusCode != http.StatusOK {
+		return nil, fmt.Errorf("token auth failed with HTTP status %d: %s", statusCode, string(respBody))
+	}
+
+	if c.SessionID == "" {
+		c.Logger("ERROR", "No valid Session ID received after token auth. Response: %s", string(respBody))
+		return nil, fmt.Errorf("动态令牌认证未下发有效会话ID")
+	}
+
+	c.markLoggedInLocked()
+	return &authResp, nil
+}
+
+// SendSMC asks the gateway to deliver the SMS verification code to the user's
+// registered phone. The original client binds it to the "发送短信" button
+// (SecLogin.dll vtable slot 12: GET /vpn/user/auth/send_smc, no body); the
+// gateway answers RESULT code 0 once the message is queued. Rejections — for
+// instance a user with no phone number on file — arrive as ordinary RESULT
+// codes and surface as AuthError.
+func (c *Client) SendSMC() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	sendURL := fmt.Sprintf("%s/vpn/user/auth/send_smc", c.BaseURL)
+	req, err := http.NewRequest(http.MethodGet, sendURL, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("User-Agent", "LeadSec VPN Client")
+
+	c.Logger("INFO", "Requesting the gateway to send the SMS verification code")
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		c.Logger("ERROR", "Send SMS request failed: %v", err)
+		return fmt.Errorf("发送短信请求失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, readErr := io.ReadAll(resp.Body)
+	if readErr != nil {
+		return fmt.Errorf("读取发送短信响应失败: %w", readErr)
+	}
+	respBody = prepareGatewayXML(respBody)
+
+	var authResp AuthResponse
+	parseErr := xml.Unmarshal(respBody, &authResp)
+	if parseErr != nil {
+		c.Logger("WARN", "Send SMS response was not XML: %s", string(respBody))
+	}
+	resultCode := strings.TrimSpace(authResp.Result.Code)
+
+	// A gateway error is authoritative even when it arrives with a non-200
+	// status, so surface it before the HTTP status check.
+	if parseErr == nil && resultCode != "" && !isSuccessCode(resultCode) {
+		authErr := newAuthError(resultCode, authResp.Result.Msg)
+		c.Logger("ERROR", "Gateway refused SMS delivery: %s", authErr.Error())
+		return authErr
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("send sms failed with HTTP status %d: %s", resp.StatusCode, string(respBody))
+	}
+	if parseErr != nil {
+		return fmt.Errorf("发送短信响应无法解析: %w", parseErr)
+	}
+	if resultCode == "" {
+		return fmt.Errorf("发送短信响应缺少结果码，无法确认已发送")
+	}
+
+	c.Logger("SUCCESS", "Gateway accepted the SMS delivery request")
+	return nil
+}
+
 // AuthPasswordWithCert performs the two-factor "password + certificate" login
 // the way the original client drives it. SecUI.exe submits the password first
 // on a connection that presents no client certificate; only when the
@@ -327,7 +462,7 @@ func (c *Client) AuthPasswordWithCert(cert *tls.Certificate, username, password,
 		return resp, nil
 	}
 	var authErr *AuthError
-	if !errors.As(err, &authErr) || nextAuthStep(authErr.Code) != authStepCertificate {
+	if !errors.As(err, &authErr) || nextAuthStep(authErr.Code) != AuthStepCertificate {
 		return resp, err
 	}
 
@@ -336,6 +471,10 @@ func (c *Client) AuthPasswordWithCert(cert *tls.Certificate, username, password,
 	if cert != nil {
 		c.installClientCertLocked(cert)
 	}
+	// The certificate factor was requested and presented. A challenge that
+	// follows on the certificate step (for instance the SMS factor) must
+	// still report the certificate as part of the chain.
+	resp.CertFactorUsed = true
 	certResp, err := c.certAuthLocked(verifycode)
 	if err != nil {
 		return resp, err
@@ -369,6 +508,13 @@ func (c *Client) installClientCertLocked(cert *tls.Certificate) {
 		tr.TLSClientConfig.GetClientCertificate = func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
 			return cert, nil
 		}
+		// The original client never reuses a connection across auth steps
+		// (every SecLogin.dll request is a fresh curl easy handle), so the
+		// certificate step always handshakes anew. Idle connections pooled
+		// before the certificate was installed would be reused without one,
+		// dropping the mTLS factor silently; close them so the next request
+		// dials a connection that presents the certificate.
+		tr.CloseIdleConnections()
 	}
 }
 
@@ -441,7 +587,14 @@ func (c *Client) restartHeartbeatLocked(integration *IntegrationInfo) {
 }
 
 func (c *Client) postAuth(authBody string) (AuthResponse, []byte, int, error) {
-	authURL := fmt.Sprintf("%s/vpn/user/auth/password", c.BaseURL)
+	return c.postAuthForm("/vpn/user/auth/password", authBody)
+}
+
+// postAuthForm posts one application/x-www-form-urlencoded auth request and
+// parses the gateway's <RESPONSE><RESULT> envelope. It backs the password and
+// the SMS-code submissions, which share the request shape.
+func (c *Client) postAuthForm(path, authBody string) (AuthResponse, []byte, int, error) {
+	authURL := fmt.Sprintf("%s%s", c.BaseURL, path)
 	req, err := http.NewRequest(http.MethodPost, authURL, strings.NewReader(authBody))
 	if err != nil {
 		return AuthResponse{}, nil, 0, err
@@ -606,6 +759,9 @@ func (c *Client) ClearTLSClientCertificate() {
 	}
 	tr.TLSClientConfig.Certificates = nil
 	tr.TLSClientConfig.GetClientCertificate = nil
+	// Mirror installClientCertLocked: pooled connections handshaked with the
+	// certificate must not leak it into steps that must not carry one.
+	tr.CloseIdleConnections()
 }
 
 // LoginWithCert authenticates with a client certificate at
@@ -680,6 +836,11 @@ func (c *Client) certAuthLocked(verifycode string) (*AuthResponse, error) {
 		c.Logger("WARN", "Certificate auth response was not XML: %s", string(respBody))
 	}
 
+	// Capture the session before the result-code check, mirroring the password
+	// path: a challenge response (for instance the SMS factor after the
+	// certificate) issues the VSG_SESSIONID the follow-up factor must bind to.
+	c.captureSession()
+
 	// The gateway error code is authoritative even with a non-200 status.
 	if parseErr == nil {
 		resultCode := strings.TrimSpace(authResp.Result.Code)
@@ -697,7 +858,6 @@ func (c *Client) certAuthLocked(verifycode string) (*AuthResponse, error) {
 		return nil, fmt.Errorf("证书登录响应无法解析: %w", parseErr)
 	}
 
-	c.captureSession()
 	if c.SessionID == "" {
 		c.Logger("ERROR", "No valid Session ID received after certificate auth. Response: %s", string(respBody))
 		return nil, fmt.Errorf("证书登录未下发有效会话ID")

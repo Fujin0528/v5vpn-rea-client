@@ -17,7 +17,7 @@ test/
     atrust/     aTrust 零信任网关 mock 实现
     v5vpn/      V5VPN / 网御网关 mock 实现（package mockserver，可被测试 import）
   e2e_ui_test.js          自拉起生命周期的轻量 UI E2E（支持 atrust 与 v5vpn 场景）
-  e2e_v5vpn_multi_test.js V5VPN 7合1多重认证与异常流深度自动化测试（含2FA/单口令/证书/改密/图形验证码等）
+  e2e_v5vpn_multi_test.js V5VPN 11合1多重认证与异常流深度自动化测试（含2FA/三因素链/全链挑战/单口令/证书/改密/图形验证码/短信/动态令牌等）
   run.sh                  总入口：go 集成测试 + UI 端到端
   results/                运行期产物（报告、逐步截图、日志），已 gitignore
 ```
@@ -38,14 +38,14 @@ test/
 ./test/run.sh go              # 只跑 Go（快，CI 用这个）
 ./test/run.sh ui              # 只跑 aTrust UI
 ./test/run.sh ui v5vpn        # 跑 v5vpn 基础 UI
-./test/run.sh v5vpn-multi     # 跑 V5VPN 7合1 全场景双因素/图形验证码/在线改密 E2E
+./test/run.sh v5vpn-multi     # 跑 V5VPN 11合1 全场景双因素/三因素链/全链挑战/图形验证码/在线改密/短信/动态令牌 E2E
 ./test/run.sh all             # 全部
 ```
 
 `v5vpn-multi` 会自动生成并导入两张客户端测试证书，界面上按名字区分：
 
-- `单因素证书登录`：用于「证书登录」Tab 的纯证书免密认证；
-- `双因素证书`：用于「口令 + 证书」Tab 的双因素认证。
+- `单因素证书登录`：用于证书免密入口（「🪪 使用客户端证书直接登录」）的纯证书认证；
+- `双因素证书`：用于口令提交后证书挑战模态（`0x2`）中呈递的证书因子。
 
 证书文件生成在 `test/results/`（已 gitignore），口令均为 `123456`。
 

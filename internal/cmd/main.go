@@ -761,6 +761,112 @@ func newAPIRouter(uiFS fs.FS, vpnService *service.VPNService, atrustSvc *service
 		writeLoginResult(w, res, err)
 	})
 
+	// /api/sms-send asks the gateway to deliver the SMS verification code for
+	// a login the gateway challenged with the SMS factor (RESULT code 0x8).
+	// The challenged session lives in the service; the request only names the
+	// gateway so the session cannot be crossed between profiles.
+	mux.HandleFunc("/api/sms-send", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			GWID string `json:"gwId"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if gw := vpnService.GetConfig().FindGateway(req.GWID); gw != nil && gw.IsATrust() {
+			writeATrustRoutingError(w, gw.Name, config.ProtocolATrust)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := vpnService.SendSMSCode(req.GWID); err != nil {
+			code := service.AuthErrorCode(err)
+			payload := map[string]any{"error": err.Error()}
+			if code != "" {
+				payload["code"] = code
+			}
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(payload)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]bool{"success": true})
+	})
+
+	// /api/sms-login submits the SMS verification code and finishes the
+	// challenged login: /vpn/user/auth/smc over the session that got code 8.
+	mux.HandleFunc("/api/sms-login", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			GWID string `json:"gwId"`
+			Code string `json:"code"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if gw := vpnService.GetConfig().FindGateway(req.GWID); gw != nil && gw.IsATrust() {
+			writeATrustRoutingError(w, gw.Name, config.ProtocolATrust)
+			return
+		}
+		res, err := vpnService.LoginWithSMSCode(req.GWID, req.Code)
+		writeLoginResult(w, res, err)
+	})
+
+	// /api/token-login submits the dynamic-token (OTP) code and finishes the
+	// challenged login: /vpn/user/auth/token over the session that got code 4.
+	mux.HandleFunc("/api/token-login", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			GWID string `json:"gwId"`
+			Code string `json:"code"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if gw := vpnService.GetConfig().FindGateway(req.GWID); gw != nil && gw.IsATrust() {
+			writeATrustRoutingError(w, gw.Name, config.ProtocolATrust)
+			return
+		}
+		res, err := vpnService.LoginWithToken(req.GWID, req.Code)
+		writeLoginResult(w, res, err)
+	})
+
+	// /api/cert-factor answers a gateway certificate challenge (password step
+	// returned code 2): the chosen certificate is presented on
+	// /vpn/user/auth/cert over the challenged session.
+	mux.HandleFunc("/api/cert-factor", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			GWID       string `json:"gwId"`
+			Source     int    `json:"source"`
+			CertID     string `json:"certId"`
+			Verifycode string `json:"verifycode"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if gw := vpnService.GetConfig().FindGateway(req.GWID); gw != nil && gw.IsATrust() {
+			writeATrustRoutingError(w, gw.Name, config.ProtocolATrust)
+			return
+		}
+		res, err := vpnService.SubmitCertFactor(req.GWID, req.Source, req.CertID, req.Verifycode)
+		writeLoginResult(w, res, err)
+	})
+
 	mux.HandleFunc("/api/logout", func(w http.ResponseWriter, r *http.Request) {
 		// 共用入口：UI 的断开按钮不区分协议。按"谁在活动"决定断开谁，
 		// 否则 aTrust 连接时点断开会去登出 V5VPN（一个空会话）而毫无效果。
@@ -984,7 +1090,11 @@ func writeLoginResult(w http.ResponseWriter, res map[string]any, err error) {
 	if err != nil {
 		code := service.AuthErrorCode(err)
 		status := http.StatusBadRequest
-		if code == "password_expired" {
+		// A challenge is not a rejected request: the credentials were
+		// accepted and the gateway asks for another factor, so the caller
+		// gets the same 409 as the password-expiry challenge.
+		if code == "password_expired" || code == "sms_challenge" ||
+			code == "cert_challenge" || code == "token_challenge" {
 			status = http.StatusConflict
 		}
 		payload := map[string]any{"error": err.Error()}

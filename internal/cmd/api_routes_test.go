@@ -239,6 +239,154 @@ func TestWrongBackendGuardReverse(t *testing.T) {
 	}
 }
 
+// TestSMSRoutesGuardAndShape 锁定短信认证两个端点的接线：
+//   - aTrust 网关打过来必须是 409 wrong_backend（与 /api/login 同一守卫）；
+//   - 没有待完成的短信挑战时，两个端点都要以 400 + error 拒绝，
+//     而不是 404（路由没挂上）或 500。
+func TestSMSRoutesGuardAndShape(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	v5 := service.NewVPNService(nil)
+	at := service.NewATrustService(v5)
+
+	if err := v5.SaveGateway(config.GatewayProfile{
+		ID: "gw-at", Name: "零信任网关", IP: "198.51.100.20", Port: 443,
+		Protocol: config.ProtocolATrust,
+	}); err != nil {
+		t.Fatalf("保存网关失败: %v", err)
+	}
+	if err := v5.SaveGateway(config.GatewayProfile{
+		ID: "gw-v5", Name: "短信网关", IP: "192.0.2.30", Port: 443,
+	}); err != nil {
+		t.Fatalf("保存网关失败: %v", err)
+	}
+
+	h := newAPIRouter(testUIFS(), v5, at)
+
+	// 协议守卫：aTrust 网关不能走 V5VPN 的短信端点。
+	for _, path := range []string{"/api/sms-send", "/api/sms-login"} {
+		rec := postJSON(t, h, path, `{"gwId":"gw-at","code":"123456"}`)
+		if rec.Code != http.StatusConflict {
+			t.Fatalf("%s: status = %d，期望 409。body=%s", path, rec.Code, rec.Body)
+		}
+		var payload map[string]string
+		_ = json.Unmarshal(rec.Body.Bytes(), &payload)
+		if payload["code"] != "wrong_backend" {
+			t.Errorf("%s: code = %q，期望 wrong_backend", path, payload["code"])
+		}
+	}
+
+	// V5VPN 网关但没有挑战：端点在，业务层拒绝。
+	rec := postJSON(t, h, "/api/sms-send", `{"gwId":"gw-v5"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("/api/sms-send: status = %d，期望 400。body=%s", rec.Code, rec.Body)
+	}
+	var sendPayload map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &sendPayload)
+	if sendPayload["error"] == nil {
+		t.Errorf("/api/sms-send 响应缺少 error 字段: %s", rec.Body)
+	}
+
+	rec = postJSON(t, h, "/api/sms-login", `{"gwId":"gw-v5","code":"123456"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("/api/sms-login: status = %d，期望 400。body=%s", rec.Code, rec.Body)
+	}
+	var loginPayload map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &loginPayload)
+	if loginPayload["error"] == nil {
+		t.Errorf("/api/sms-login 响应缺少 error 字段: %s", rec.Body)
+	}
+}
+
+// TestCertFactorRouteGuardAndShape 锁定证书因子端点的协议守卫与错误形状：
+// aTrust 网关走 /api/cert-factor 要回 409 wrong_backend；V5VPN 网关没有
+// 挂起的证书挑战时业务层拒绝（400 + error）。
+func TestCertFactorRouteGuardAndShape(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	v5 := service.NewVPNService(nil)
+	at := service.NewATrustService(v5)
+
+	if err := v5.SaveGateway(config.GatewayProfile{
+		ID: "gw-at", Name: "零信任网关", IP: "198.51.100.20", Port: 443,
+		Protocol: config.ProtocolATrust,
+	}); err != nil {
+		t.Fatalf("保存网关失败: %v", err)
+	}
+	if err := v5.SaveGateway(config.GatewayProfile{
+		ID: "gw-v5", Name: "证书网关", IP: "192.0.2.40", Port: 443,
+	}); err != nil {
+		t.Fatalf("保存网关失败: %v", err)
+	}
+
+	h := newAPIRouter(testUIFS(), v5, at)
+
+	// 协议守卫：aTrust 网关不能走 V5VPN 的证书因子端点。
+	rec := postJSON(t, h, "/api/cert-factor", `{"gwId":"gw-at","certId":"c1"}`)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("/api/cert-factor: status = %d，期望 409。body=%s", rec.Code, rec.Body)
+	}
+	var payload map[string]string
+	_ = json.Unmarshal(rec.Body.Bytes(), &payload)
+	if payload["code"] != "wrong_backend" {
+		t.Errorf("/api/cert-factor: code = %q，期望 wrong_backend", payload["code"])
+	}
+
+	// V5VPN 网关但没有挑战：端点在，业务层拒绝。
+	rec = postJSON(t, h, "/api/cert-factor", `{"gwId":"gw-v5","certId":"missing"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("/api/cert-factor: status = %d，期望 400。body=%s", rec.Code, rec.Body)
+	}
+	var errPayload map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &errPayload)
+	if errPayload["error"] == nil {
+		t.Errorf("/api/cert-factor 响应缺少 error 字段: %s", rec.Body)
+	}
+}
+
+// TestTokenRouteGuardAndShape 锁定动态令牌端点的接线：aTrust 网关走
+// /api/token-login 要回 409 wrong_backend；V5VPN 网关没有挂起的令牌挑战时
+// 业务层拒绝（400 + error）。
+func TestTokenRouteGuardAndShape(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	v5 := service.NewVPNService(nil)
+	at := service.NewATrustService(v5)
+
+	if err := v5.SaveGateway(config.GatewayProfile{
+		ID: "gw-at", Name: "零信任网关", IP: "198.51.100.20", Port: 443,
+		Protocol: config.ProtocolATrust,
+	}); err != nil {
+		t.Fatalf("保存网关失败: %v", err)
+	}
+	if err := v5.SaveGateway(config.GatewayProfile{
+		ID: "gw-v5", Name: "令牌网关", IP: "192.0.2.50", Port: 443,
+	}); err != nil {
+		t.Fatalf("保存网关失败: %v", err)
+	}
+
+	h := newAPIRouter(testUIFS(), v5, at)
+
+	// 协议守卫：aTrust 网关不能走 V5VPN 的令牌端点。
+	rec := postJSON(t, h, "/api/token-login", `{"gwId":"gw-at","code":"123456"}`)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("/api/token-login: status = %d，期望 409。body=%s", rec.Code, rec.Body)
+	}
+	var payload map[string]string
+	_ = json.Unmarshal(rec.Body.Bytes(), &payload)
+	if payload["code"] != "wrong_backend" {
+		t.Errorf("/api/token-login: code = %q，期望 wrong_backend", payload["code"])
+	}
+
+	// V5VPN 网关但没有挑战：端点在，业务层拒绝。
+	rec = postJSON(t, h, "/api/token-login", `{"gwId":"gw-v5","code":"123456"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("/api/token-login: status = %d，期望 400。body=%s", rec.Code, rec.Body)
+	}
+	var errPayload map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &errPayload)
+	if errPayload["error"] == nil {
+		t.Errorf("/api/token-login 响应缺少 error 字段: %s", rec.Body)
+	}
+}
+
 // TestWriteATrustResultCodes 锁定 aTrust 侧的稳定错误码。
 //
 // 两边码值集合不同（aTrust 没有 password_expired，V5VPN 没有
