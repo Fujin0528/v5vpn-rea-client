@@ -415,6 +415,13 @@ func passwordChangeBody(oldPassword, newPassword string) string {
 	}.Encode()
 }
 
+// passwordChangeBodyEncoded 是改密的兼容编码：部分网关的 pwdchange 与登录
+// 一样按 Base64 + encode=1 解析口令，明文提交会被判成「原密码错误」。
+func passwordChangeBodyEncoded(oldPassword, newPassword string) string {
+	return fmt.Sprintf("old_pwd=%s&new_pwd=%s&encode=1",
+		base64AuthParam(oldPassword), base64AuthParam(newPassword))
+}
+
 // smsAuthBody formats the request body for /vpn/user/auth/smc. SecLogin.dll
 // posts the code through the same raw format string "smc=%s" (0x10041da8) it
 // uses for the other auth forms — no encode parameter, no escaping. SMS codes
