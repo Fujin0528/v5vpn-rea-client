@@ -1059,6 +1059,166 @@ async function run() {
       await safeDisconnect(page);
     });
 
+    // =========================================================================
+    // SCENARIO 11: 全链挑战：验证码 + 证书 + 短信 + 令牌 (full-chain)
+    // =========================================================================
+    await runScenario({
+      id: 11,
+      title: '全链挑战：验证码 + 证书 + 短信 + 令牌',
+      desc: 'full-chain 模式把所有挑战编进一条链：口令步先被图形验证码守卫（0x80，验证码随口令请求重发，无独立端点），通过后网关依次要求证书 (code=2)、短信 (code=8)、动态令牌 (code=4)。四个模态在同一个挑战会话上连续替换，登录框全程不动——网关驱动状态机的极端验收。',
+      mode: 'full-chain'
+    }, async (record) => {
+      await setMockMode('full-chain');
+      await page.goto(TARGET_URL, { waitUntil: 'networkidle0' });
+      await ensureGatewayConfigured(page);
+      await ensureCertImported(page);
+
+      await record(page, {
+        stepId: 1,
+        title: '口令登录被图形验证码守卫拦截（第一跳）',
+        desc: '输入 admin / admin456 点击「口令登录」，网关返回 0x80 要求图形验证码，客户端弹出验证码模态（图片+输入框，固定表单不动）。',
+        screenshotName: 'sc11_step1_verifycode_challenge.png',
+        action: async () => {
+          await clearAndType(page, '#username-input', 'admin');
+          await clearAndType(page, '#password-input', 'admin456');
+
+          await page.click('#connect-btn');
+          const title = await waitForChallengeModal(page);
+          if (!title.includes('图形验证码')) {
+            throw new Error(`第一跳模态标题不是图形验证码: "${title}"`);
+          }
+          const hasImg = await page.$eval('#modal-verifycode-img', el => el.src.length > 50);
+          if (!hasImg) throw new Error('验证码图片未渲染');
+          return '验证码模态已弹出（第一跳），验证码图片已渲染。';
+        }
+      });
+
+      await record(page, {
+        stepId: 2,
+        title: '验证码通过，模态替换为证书挑战（第二跳）',
+        desc: '从 mock 读取验证码填入提交——验证码随口令请求重发 /api/login；口令校验通过后网关返回 code=2，验证码模态原地替换为证书模态。',
+        screenshotName: 'sc11_step2_cert_challenge.png',
+        action: async () => {
+          let expectedCode = '1234';
+          try {
+            const r = await fetch('https://127.0.0.1:8443/api/verifycode');
+            const data = await r.json();
+            if (data && data.code) expectedCode = data.code;
+          } catch (e) {
+            log(`Fetch mock verifycode: ${e.message}`);
+          }
+
+          await clearAndType(page, '#modal-verifycode-input', expectedCode);
+          await page.click('#modal-verifycode-submit');
+
+          await page.waitForFunction(() => {
+            const t = document.getElementById('challenge-title');
+            return t && t.textContent.includes('客户端证书');
+          }, { timeout: 10000 });
+
+          const certText = await selectCertInModal(page, TEST_CERTS.twoFactor.alias);
+          return `验证码 ${expectedCode} 通过，模态已替换为证书挑战（第二跳）。选中证书: "${certText}"`;
+        }
+      });
+
+      await record(page, {
+        stepId: 3,
+        title: '证书因子通过，模态替换为短信挑战（第三跳）',
+        desc: '提交证书因子（mTLS 呈递），网关追加 code=8；证书模态被短信模态原地替换，点击「发送短信」下发验证码。',
+        screenshotName: 'sc11_step3_sms_challenge.png',
+        action: async () => {
+          await page.click('#modal-cert-submit');
+          await page.waitForFunction(() => {
+            const t = document.getElementById('challenge-title');
+            return t && t.textContent.includes('短信认证');
+          }, { timeout: 10000 });
+
+          await page.click('#modal-sms-send');
+          await page.waitForFunction(() => {
+            const btn = document.getElementById('modal-sms-send');
+            return btn && btn.disabled && /秒/.test(btn.textContent);
+          }, { timeout: 8000 });
+
+          const btnText = await page.$eval('#modal-sms-send', el => el.textContent.trim());
+          return `证书因子通过，模态已替换为短信挑战（第三跳），验证码已下发。按钮倒计时: "${btnText}"`;
+        }
+      });
+
+      await record(page, {
+        stepId: 4,
+        title: '短信码通过，模态替换为动态令牌挑战（第四跳）',
+        desc: '错误短信码被 0x10A 拦截后原地重试；正确码提交，网关追加 code=4，短信模态被令牌模态原地替换。',
+        screenshotName: 'sc11_step4_token_challenge.png',
+        action: async () => {
+          await clearAndType(page, '#modal-sms-input', '000000');
+          await page.click('#modal-sms-submit');
+          await page.waitForFunction(() => {
+            const alert = document.getElementById('modal-alert');
+            return alert && alert.style.display !== 'none' && alert.textContent.includes('短信验证码错误');
+          }, { timeout: 8000 });
+
+          let expectedCode = '123456';
+          try {
+            const r = await fetch('https://127.0.0.1:8443/api/smscode');
+            const data = await r.json();
+            if (data && data.code) expectedCode = data.code;
+          } catch (e) {
+            log(`Fetch mock smscode: ${e.message}`);
+          }
+
+          await clearAndType(page, '#modal-sms-input', expectedCode);
+          await page.click('#modal-sms-submit');
+
+          await page.waitForFunction(() => {
+            const t = document.getElementById('challenge-title');
+            return t && t.textContent.includes('动态令牌');
+          }, { timeout: 10000 });
+
+          const hint = await page.$eval('.challenge-hint', el => el.textContent.trim());
+          return `短信码 ${expectedCode} 通过（错码先被 0x10A 拦截重试），模态已替换为动态令牌挑战（第四跳）。模态提示: "${hint}"`;
+        }
+      });
+
+      await record(page, {
+        stepId: 5,
+        title: '正确令牌码完成全链登录',
+        desc: '从 mock 读取令牌当前显示（模拟用户查看硬件令牌），提交后网关校验通过建立隧道，拉取内网资源——四跳全部走完。',
+        screenshotName: 'sc11_step5_fullchain_connected.png',
+        action: async () => {
+          let expectedCode = '123456';
+          try {
+            const r = await fetch('https://127.0.0.1:8443/api/tokencode');
+            const data = await r.json();
+            if (data && data.code) expectedCode = data.code;
+          } catch (e) {
+            log(`Fetch mock tokencode: ${e.message}`);
+          }
+
+          await clearAndType(page, '#modal-token-input', expectedCode);
+          await page.click('#modal-token-submit');
+
+          await page.waitForFunction(() => {
+            const v = document.getElementById('view-connected');
+            return v && v.style.display !== 'none';
+          }, { timeout: 10000 });
+
+          await page.waitForFunction(() => {
+            const rows = document.querySelectorAll('#resources-tbody tr');
+            const txt = rows[0]?.textContent || '';
+            return rows.length > 0 && !txt.includes('正在从网关拉取');
+          }, { timeout: 10000 });
+
+          const sessionUser = await page.$eval('#session-user-val', el => el.textContent.trim());
+          const sessionId = await page.$eval('#session-id-val', el => el.textContent.trim());
+          const resCount = await page.$eval('#res-count', el => el.textContent.trim());
+          const resNames = await page.$$eval('#resources-tbody tr', els => els.map(tr => tr.querySelector('td strong')?.textContent?.trim() || ''));
+          return `全链完成！验证码→证书→短信→令牌四跳全部通过，令牌码 ${expectedCode} 校验成功，会话用户: ${sessionUser}，会话ID: ${sessionId}，内网资源数: ${resCount} 项 [${resNames.join(' | ')}]`;
+        }
+      });
+
+      await safeDisconnect(page);
+    });
+
     log(`\nAll ${scenarios.length} Scenarios executed! Total Scenarios: ${scenarios.length}`);
 
   } catch (err) {

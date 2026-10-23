@@ -16,7 +16,7 @@ import (
 
 func main() {
 	addr := flag.String("addr", "127.0.0.1:8443", "TCP address to listen on (HTTPS)")
-	mode := flag.String("mode", "pwd-cert", "Gateway simulation mode: pwd-cert, pwd-cert-sms, pwd-only, pwd-change, err-auth, token, sms")
+	mode := flag.String("mode", "pwd-cert", "Gateway simulation mode: pwd-cert, pwd-cert-sms, full-chain, pwd-only, pwd-change, err-auth, token, sms")
 	user := flag.String("user", "admin", "Expected username")
 	pwd := flag.String("pwd", "admin123", "Expected password")
 	requireCert := flag.Bool("require-cert", false, "Strictly require a client TLS certificate in /vpn/user/auth/cert")
@@ -30,6 +30,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "\nSimulation Modes:\n")
 		fmt.Fprintf(os.Stderr, "  pwd-cert   : Two-factor authentication (Password -> Challenge Code 2 -> Cert -> Code 0)\n")
 		fmt.Fprintf(os.Stderr, "  pwd-cert-sms: Three-factor chain (Password -> Code 2 -> Cert -> Code 8 -> send_smc -> smc -> Code 0)\n")
+		fmt.Fprintf(os.Stderr, "  full-chain : Every factor in one chain (Password+captcha -> Code 2 -> Cert -> Code 8 -> SMS -> Code 4 -> Token -> Code 0)\n")
 		fmt.Fprintf(os.Stderr, "  pwd-only   : Single-factor authentication (Password -> Code 0)\n")
 		fmt.Fprintf(os.Stderr, "  pwd-change : Password expired challenge (Password -> Code 256 -> PwdChange -> Code 0)\n")
 		fmt.Fprintf(os.Stderr, "  err-auth   : Authentication error (Password -> Code 0x8000001a)\n")

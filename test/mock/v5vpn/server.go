@@ -27,6 +27,7 @@ type Mode string
 const (
 	ModePwdCert    Mode = "pwd-cert"     // Two-factor: Password -> code 2 -> Cert -> code 0
 	ModePwdCertSMS Mode = "pwd-cert-sms" // Three-factor chain: Password -> code 2 -> Cert -> code 8 -> SMS -> code 0
+	ModeFullChain  Mode = "full-chain"   // Every factor in one chain: Password(+captcha) -> code 2 -> Cert -> code 8 -> SMS -> code 4 -> Token -> code 0
 	ModePwdOnly    Mode = "pwd-only"     // Single-factor: Password -> code 0
 	ModeCertOnly   Mode = "cert-only"    // Standalone mTLS Certificate -> code 0
 	ModePwdChange  Mode = "pwd-change"   // Password expired: Password -> code 256 -> PwdChange -> code 0
@@ -191,6 +192,7 @@ button:hover { background: #0284c7; color: #fff; }
   <p><strong>Switch Simulation Flow:</strong></p>
   <button onclick="setMode('pwd-cert')">🔐 口令+证书双因素 (pwd-cert)</button>
   <button onclick="setMode('pwd-cert-sms')">🔐💬 口令+证书+短信三因素 (pwd-cert-sms)</button>
+  <button onclick="setMode('full-chain')">🧩 全链挑战: 验证码+证书+短信+令牌 (full-chain)</button>
   <button onclick="setMode('pwd-only')">🔑 仅口令直连 (pwd-only)</button>
   <button onclick="setMode('cert-only')">🪪 纯证书免密 (cert-only)</button>
   <button onclick="setMode('pwd-change')">🔄 密码过期改密 (pwd-change)</button>
@@ -369,6 +371,29 @@ func (s *Server) handlePassword(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[MockServer] <- Token challenge for %q (code: 4, token now shows %q)", rawUser, tokenCode)
 		w.Write([]byte(fmt.Sprintf(`<?xml version="1.0" encoding="utf-8"?>
 <RESPONSE><RESULT code="4" msg="need token" sid_name="VSG_SESSIONID"></RESULT></RESPONSE>`)))
+	case ModeFullChain:
+		// The password step is guarded by a captcha first — same semantics as
+		// ModeVerifyCode: the code rides the password request as a field, it
+		// has no endpoint of its own. Once it passes, the gateway walks the
+		// remaining factors: cert -> SMS -> token.
+		verifycode := values.Get("verifycode")
+		if verifycode == "" {
+			log.Printf("[MockServer] <- Verifycode required for %q (code: 0x80)", rawUser)
+			w.Write([]byte(fmt.Sprintf(`<?xml version="1.0" encoding="utf-8"?>
+<RESPONSE><RESULT code="0x80" msg="需要图形验证码" sid_name="VSG_SESSIONID"></RESULT></RESPONSE>`)))
+			return
+		}
+		expected := s.getExpectedVerifyCode(sessionID)
+		if expected == "" || !strings.EqualFold(strings.TrimSpace(verifycode), expected) {
+			log.Printf("[MockServer] <- Verifycode MISMATCH for %q: received %q, expected %q (code: 0x80000021)", rawUser, verifycode, expected)
+			s.generateNewVerifyCode(sessionID)
+			w.Write([]byte(fmt.Sprintf(`<?xml version="1.0" encoding="utf-8"?>
+<RESPONSE><RESULT code="0x80000021" msg="图形验证码错误，请重新输入" sid_name="VSG_SESSIONID"></RESULT></RESPONSE>`)))
+			return
+		}
+		log.Printf("[MockServer] <- Captcha passed for %q, requesting Certificate (code: 2)", rawUser)
+		w.Write([]byte(fmt.Sprintf(`<?xml version="1.0" encoding="utf-8"?>
+<RESPONSE><RESULT code="2" msg="need cert" sid_name="VSG_SESSIONID"></RESULT></RESPONSE>`)))
 	case ModeSMS:
 		// msg mirrors the real gateway's challenge text (issue #9 screenshot);
 		// SecUI.exe switches to its Edit_SendSMS state on this code.
@@ -459,8 +484,9 @@ func (s *Server) handleCert(w http.ResponseWriter, r *http.Request) {
 
 	// Three-factor chain: the certificate factor passed, but the gateway still
 	// wants the SMS factor before it grants the session. The challenge text
-	// mirrors the real gateway (issue #9 screenshot).
-	if s.GetMode() == ModePwdCertSMS {
+	// mirrors the real gateway (issue #9 screenshot). The full-chain mode walks
+	// the same hop on its way to the token factor.
+	if s.GetMode() == ModePwdCertSMS || s.GetMode() == ModeFullChain {
 		log.Printf("[MockServer] <- SMS challenge after certificate factor for session %q (code: 8)", sessionID)
 		w.Write([]byte(`<?xml version="1.0" encoding="utf-8"?>
 <RESPONSE><RESULT code="8" msg="多因素认证，短信认证" sid_name="VSG_SESSIONID"></RESULT></RESPONSE>`))
@@ -602,6 +628,18 @@ func (s *Server) handleSMS(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Unlock()
 
+	// Full chain: the SMS factor passed, but the gateway still wants the
+	// dynamic-token factor. Issue a token code bound to this session — the
+	// user's token "display" — and challenge with code 4, exactly like the
+	// dedicated token mode does on its password step.
+	if s.GetMode() == ModeFullChain {
+		tokenCode := s.generateNewTokenCode(sessionID)
+		log.Printf("[MockServer] <- Token challenge after SMS factor for session %q (code: 4, token now shows %q)", sessionID, tokenCode)
+		w.Write([]byte(`<?xml version="1.0" encoding="utf-8"?>
+<RESPONSE><RESULT code="4" msg="need token" sid_name="VSG_SESSIONID"></RESULT></RESPONSE>`))
+		return
+	}
+
 	log.Printf("[MockServer] <- SMS code %q passed for session %q, login success (code: 0)", smc, sessionID)
 	w.Write([]byte(`<?xml version="1.0" encoding="utf-8"?>
 <RESPONSE><RESULT code="0" msg="" sid_name="VSG_SESSIONID"></RESULT></RESPONSE>`))
@@ -712,6 +750,8 @@ func (s *Server) handleIntegration(w http.ResponseWriter, r *http.Request) {
 		case ModePwdCert:
 			authMethod = "双因素认证"
 		case ModePwdCertSMS:
+			authMethod = "多因素认证"
+		case ModeFullChain:
 			authMethod = "多因素认证"
 		case ModeVerifyCode:
 			authMethod = "验证码认证"
