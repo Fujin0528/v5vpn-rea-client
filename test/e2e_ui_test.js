@@ -370,16 +370,25 @@ async function main() {
     await waitForPort(mockPort, 20000, 'mock');
     log(`mock 已就绪: ${meta.mockURL}`);
 
-    // 3. 在隔离 APPDATA 下拉起 app，拿到 HTTP UI 端口
-    log('=== [3/5] 启动客户端（隔离 APPDATA）===');
+    // 3. 在隔离的用户数据目录下拉起 app，拿到 HTTP UI 端口
+    log('=== [3/5] 启动客户端（隔离用户数据目录）===');
     const appPort = await findFreePort();
     // 直接打开本协议的界面目录：两套前端物理分开，根路径的重定向行为
     // 另由 TestRootRedirectsToProtocolUI 在 Go 侧覆盖。这里固定走
     // /atrust/ 或 /v5vpn/，避免"启动路由选错界面"把 UI 场景掩盖成别的错误。
     meta.appURL = `http://127.0.0.1:${appPort}${SCENARIO.uiPath}`;
+    // 跨平台隔离：Windows 应用读 APPDATA；macOS/Linux 的用户配置根是
+    // HOME（mygo PathUserData 与 os.UserConfigDir 都从 HOME 派生），只设
+    // APPDATA 会漏到真实配置。cwd 落在只含二进制的 bin 目录，堵住
+    // 「工作目录 setting.xml」这条候选路径读到开发机配置。
+    const appEnv = { ...process.env, APPDATA: appDataDir };
+    if (process.platform !== 'win32') {
+      appEnv.HOME = appDataDir;
+    }
     const appProc = spawn(appExe, ['-port', String(appPort)], {
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: { ...process.env, APPDATA: appDataDir },
+      env: appEnv,
+      cwd: binDir,
     });
     children.push(appProc);
     appProc.stdout.on('data', d => fs.appendFileSync(LOG_FILE, `[app] ${d}`));
@@ -537,16 +546,14 @@ async function runScenario(page) {
     action: async () => {
       await fill(page, '#username-input', gw.username);
       await fill(page, '#password-input', gw.password);
-      // V5VPN 有图形验证码；aTrust 的界面上根本没有这个元素，
-      // 用 $eval 会在 aTrust 场景里直接抛 "no such element"。
-      let verifyVisible = false;
-      if (!isATrust) {
-        verifyVisible = await page.$eval('#verifycode-group', el => el.offsetParent !== null);
-      }
+      // PR #10 界面重构（固定表单 + 挑战模态）后，验证码不再是表单常驻
+      // 元素：网关要验证码时以模态弹出，由 e2e_v5vpn_multi_test.js 的
+      // 验证码场景专门覆盖。这里 mock 用 pwd-only 模式，提交后直接进
+      // 认证链，无需断言任何挑战组件。
       await page.click('#connect-btn');
       return isATrust
         ? '凭据已填写（aTrust 界面无验证码输入框）'
-        : `凭据已填写；验证码输入框可见=${verifyVisible}`;
+        : '凭据已提交（pwd-only 模式无挑战，等待认证链）';
     },
   });
 

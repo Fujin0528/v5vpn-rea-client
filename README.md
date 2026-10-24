@@ -376,6 +376,9 @@ go run ./cmd/e2e-atrust -gw https://127.0.0.1:8443 -user user1@local -pass any
 - 修改协议相关代码前先在私有分支跑通两套测试：单元测试 + `go test
   -short` 跳过的集成测试需要自行提供 `GATEWAY_IP / GATEWAY_PORT /
   GATEWAY_USER / GATEWAY_PASSWORD` 环境变量；
+- **提交/推送前的完整测试清单（`go test` ≠ 测完，UI E2E 不进 CI 必须本机跑）
+  见 [`AGENTS.md`](AGENTS.md)**：改动登录链 / 认证 / 资源代理时加跑
+  `bash test/run.sh ui v5vpn` 或 `v5vpn-multi`，报告与截图可作 PR 证据；
 - UI 改动请附前后对比截图，CSS 改动请确认在 1280x800 与 1920x1080
   两个分辨率下都不破布局。
 
