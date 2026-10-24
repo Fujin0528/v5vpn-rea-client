@@ -191,3 +191,33 @@ func TestManagerStartReportsFailure(t *testing.T) {
 		t.Fatalf("Start error = %v", err)
 	}
 }
+
+func TestWSLIPFiltersExcludedIP(t *testing.T) {
+	m := NewManager(filepath.Join(t.TempDir(), "ipsec.conf"))
+	fr := &fakeRunner{output: []byte("10.70.0.5 172.28.16.2\n")}
+	m.Runner = fr
+
+	// 排除 VirtualIP 后，应当返回 Hyper-V 宿主适配器地址 172.28.16.2
+	ip, err := m.WSLIP(context.Background(), "10.70.0.5")
+	if err != nil {
+		t.Fatalf("WSLIP with exclude failed: %v", err)
+	}
+	if ip != "172.28.16.2" {
+		t.Errorf("WSLIP = %q, want 172.28.16.2", ip)
+	}
+
+	// 不排除任何 IP 时，返回首个 IPv4
+	ipDefault, err := m.WSLIP(context.Background())
+	if err != nil {
+		t.Fatalf("WSLIP without exclude failed: %v", err)
+	}
+	if ipDefault != "10.70.0.5" {
+		t.Errorf("WSLIP default = %q, want 10.70.0.5", ipDefault)
+	}
+
+	// 如果所有 IPv4 都被排除，应报错
+	_, err = m.WSLIP(context.Background(), "10.70.0.5", "172.28.16.2")
+	if err == nil {
+		t.Errorf("expected error when all IPs excluded")
+	}
+}

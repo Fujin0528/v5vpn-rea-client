@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -145,14 +146,22 @@ func (m *Manager) Status(ctx context.Context) (string, error) {
 
 // WSLIP returns the first IPv4 address of the distribution. Windows routes
 // point at this address for the tunnel subnets.
-func (m *Manager) WSLIP(ctx context.Context) (string, error) {
+func (m *Manager) WSLIP(ctx context.Context, exclude ...string) (string, error) {
 	out, err := m.runner().Run(ctx, "wsl.exe", "-d", m.distro(), "--", "hostname", "-I")
 	if err != nil {
 		return "", err
 	}
+	excludeSet := make(map[string]bool)
+	for _, ex := range exclude {
+		if parsed := net.ParseIP(strings.TrimSpace(ex)); parsed != nil {
+			excludeSet[parsed.String()] = true
+		}
+	}
 	for _, f := range strings.Fields(string(out)) {
-		if ip := strings.TrimSpace(f); ip != "" && !strings.Contains(ip, ":") {
-			return ip, nil
+		if parsed := net.ParseIP(strings.TrimSpace(f)); parsed != nil && parsed.To4() != nil {
+			if !excludeSet[parsed.String()] {
+				return parsed.String(), nil
+			}
 		}
 	}
 	return "", fmt.Errorf("无法获取 WSL 的 IPv4 地址")

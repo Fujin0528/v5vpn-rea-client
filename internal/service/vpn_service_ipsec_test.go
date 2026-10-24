@@ -11,6 +11,7 @@ import (
 	"encoding/xml"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/hygkui/v5vpn-rea-client/internal/config"
@@ -23,22 +24,41 @@ import (
 // "hostname -I" 是 WSLIP——单测里让它失败，避免 AddRoutes 碰到真实
 // route.exe / 路由表（该路径由实网验证覆盖）。
 type fakeIPsecRunner struct {
+	mu        sync.Mutex
 	available bool
 	startOK   bool
 	calls     []string
+	wslIPOut  string
+	onStart   func()
+}
+
+func (f *fakeIPsecRunner) getCalls() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	copied := make([]string, len(f.calls))
+	copy(copied, f.calls)
+	return copied
 }
 
 func (f *fakeIPsecRunner) Run(_ context.Context, name string, args ...string) ([]byte, error) {
 	line := strings.TrimSpace(name + " " + strings.Join(args, " "))
+	f.mu.Lock()
 	f.calls = append(f.calls, line)
+	f.mu.Unlock()
 	switch {
 	case strings.HasSuffix(line, "-- true"):
 		if !f.available {
 			return nil, errors.New("exit status 1")
 		}
 	case strings.Contains(line, "hostname -I"):
+		if f.wslIPOut != "" {
+			return []byte(f.wslIPOut), nil
+		}
 		return nil, errors.New("exit status 1")
 	case strings.Contains(line, "swanctl --load-all"):
+		if f.onStart != nil {
+			f.onStart()
+		}
 		if !f.startOK {
 			return []byte("mock: initiate failed"), errors.New("exit status 1")
 		}
@@ -56,6 +76,7 @@ func newIPsecTestService(t *testing.T, runner ipsec.CommandRunner) *VPNService {
 	t.Cleanup(func() { config.SetUserDataDir(prev) })
 
 	s := NewVPNService(nil)
+	s.Status = "Connected"
 	s.newIPsecManager = func(confPath string) *ipsec.Manager {
 		m := ipsec.NewManager(confPath)
 		m.Runner = runner
@@ -177,13 +198,13 @@ func TestStopIPsecClearsStateAndTerminates(t *testing.T) {
 		t.Fatalf("stop 后状态未清空: state=%v err=%v", st["ipsecState"], st["ipsecError"])
 	}
 	terminated := false
-	for _, c := range runner.calls {
+	for _, c := range runner.getCalls() {
 		if strings.Contains(c, "swanctl --terminate") {
 			terminated = true
 		}
 	}
 	if !terminated {
-		t.Errorf("stop 未下发 swanctl --terminate, calls = %v", runner.calls)
+		t.Errorf("stop 未下发 swanctl --terminate, calls = %v", runner.getCalls())
 	}
 }
 
@@ -207,5 +228,108 @@ func TestStartIPsecRejectsProfileWithoutRoutes(t *testing.T) {
 	}
 	if msg, _ := st["ipsecError"].(string); !strings.Contains(msg, "没有可路由的子网") {
 		t.Errorf("ipsecError = %q, want FromNC 的拒绝原因", msg)
+	}
+}
+
+// startIPsec 在调用 WSLIP 时必须排除 VirtualIP，确保作为 Windows 路由网关的是
+// WSL2 Hyper-V 宿主地址而非 VirtualIP。
+func TestStartIPsecFiltersVirtualIPInWSLIP(t *testing.T) {
+	runner := &fakeIPsecRunner{
+		available: true,
+		startOK:   true,
+		wslIPOut:  "10.70.0.5 172.28.16.2\n",
+	}
+	s := newIPsecTestService(t, runner)
+	s.startIPsec(ncTestResources(t))
+
+	s.mu.Lock()
+	gw := s.ipsecGateway
+	s.mu.Unlock()
+
+	if gw != "172.28.16.2" {
+		t.Fatalf("ipsecGateway = %q, want 172.28.16.2 (VirtualIP 10.70.0.5 必须被过滤)", gw)
+	}
+}
+
+// 在 startIPsec 正在执行 mgr.Start 期间调用 Logout()：
+// startIPsec 必须感知取消，禁止将 ipsecState 置为 up，并调用 mgr.Stop 回滚隧道。
+func TestStartIPsecAbortsOnLogoutRace(t *testing.T) {
+	started := make(chan struct{})
+	continueStart := make(chan struct{})
+	runner := &fakeIPsecRunner{
+		available: true,
+		startOK:   true,
+		onStart: func() {
+			close(started)
+			<-continueStart
+		},
+	}
+	s := newIPsecTestService(t, runner)
+
+	done := make(chan struct{})
+	go func() {
+		s.startIPsec(ncTestResources(t))
+		close(done)
+	}()
+
+	<-started
+	// 用户在 start 期间执行登出
+	_, _ = s.Logout()
+	close(continueStart)
+	<-done
+
+	st := s.GetStatus()
+	if st["ipsecState"] != "" {
+		t.Errorf("Logout 后 ipsecState 应为空, got %v", st["ipsecState"])
+	}
+	if s.ipsecGateway != "" {
+		t.Errorf("ipsecGateway 应被清空, got %q", s.ipsecGateway)
+	}
+
+	// 断言下发了 terminate
+	terminated := false
+	for _, c := range runner.getCalls() {
+		if strings.Contains(c, "swanctl --terminate") {
+			terminated = true
+		}
+	}
+	if !terminated {
+		t.Errorf("startIPsec 回滚或 stopIPsec 必须下发 swanctl --terminate, calls: %v", runner.getCalls())
+	}
+}
+
+// 当处于 Connected 状态时触发 cleanupStaleSessionLocked（如重连），
+// 必须停掉既有的 IPsec 隧道，避免残留的 iptables SNAT 规则与路由污染新会话。
+func TestCleanupStaleSessionStopsIPsecAndWebProxies(t *testing.T) {
+	runner := &fakeIPsecRunner{available: true, startOK: true}
+	s := newIPsecTestService(t, runner)
+	s.startIPsec(ncTestResources(t))
+
+	st := ipsecStatus(t, s)
+	if st["ipsecState"] != "up" {
+		t.Fatalf("前置条件失败: ipsecState = %v, want up", st["ipsecState"])
+	}
+
+	// 模拟重连：进入 cleanupStaleSessionLocked
+	s.mu.Lock()
+	s.cleanupStaleSessionLocked()
+	s.mu.Unlock()
+
+	stAfter := ipsecStatus(t, s)
+	if stAfter["ipsecState"] != "" {
+		t.Errorf("cleanupStaleSessionLocked 后 ipsecState 应为空, got %v", stAfter["ipsecState"])
+	}
+	if s.ipsecMgr != nil || s.ipsecCfg != nil {
+		t.Errorf("cleanupStaleSessionLocked 未清空 ipsecMgr / ipsecCfg")
+	}
+
+	terminated := false
+	for _, c := range runner.getCalls() {
+		if strings.Contains(c, "swanctl --terminate") {
+			terminated = true
+		}
+	}
+	if !terminated {
+		t.Errorf("cleanupStaleSessionLocked 必须停止 IPsec 隧道下发 terminate, calls: %v", runner.getCalls())
 	}
 }

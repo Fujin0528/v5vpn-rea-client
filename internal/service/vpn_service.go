@@ -105,6 +105,7 @@ type VPNService struct {
 	ipsecGateway string
 	ipsecState   string // "", "starting", "up", "error", "unavailable"
 	ipsecError   string
+	ipsecCancel  context.CancelFunc
 	// newIPsecManager builds the WSL Manager for a session. nil means
 	// ipsec.NewManager; tests substitute it to inject a fake CommandRunner.
 	newIPsecManager func(confPath string) *ipsec.Manager
@@ -765,7 +766,17 @@ func (s *VPNService) startIPsec(ncs []protocol.NCResource) {
 		newMgr = ipsec.NewManager
 	}
 	mgr := newMgr(filepath.Join(confDir, "ipsec.conf"))
+
 	s.mu.Lock()
+	if s.Status == "Disconnected" {
+		s.mu.Unlock()
+		return
+	}
+	if s.ipsecCancel != nil {
+		s.ipsecCancel()
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	s.ipsecCancel = cancel
 	s.ipsecMgr = mgr
 	s.ipsecCfg = cfg
 	s.ipsecGateway = ""
@@ -773,18 +784,43 @@ func (s *VPNService) startIPsec(ncs []protocol.NCResource) {
 	s.ipsecState = "starting"
 	s.mu.Unlock()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-	defer cancel()
+	defer func() {
+		cancel()
+		s.mu.Lock()
+		if s.ipsecMgr == mgr {
+			s.ipsecCancel = nil
+		}
+		s.mu.Unlock()
+	}()
 
 	if !mgr.Available(ctx) {
+		s.mu.Lock()
+		if s.Status == "Disconnected" || s.ipsecMgr != mgr || ctx.Err() != nil {
+			s.mu.Unlock()
+			return
+		}
 		msg := "WSL 发行版 v5vpn 不可用，请先运行 scripts/setup-ipsec-wsl.ps1"
-		s.setIPsecState("unavailable", msg)
+		s.ipsecState = "unavailable"
+		s.ipsecError = msg
+		s.mu.Unlock()
 		s.Log("WARN", "IPsec 数据面不可用: %s", msg)
 		return
 	}
 
 	s.Log("INFO", "正在通过 WSL/strongSwan 建立 IPsec 隧道到 %s ...", ipsec.FormatServerPort(*cfg))
-	if out, err := mgr.Start(ctx, *cfg); err != nil {
+	out, err := mgr.Start(ctx, *cfg)
+
+	s.mu.Lock()
+	aborted := s.Status == "Disconnected" || s.ipsecMgr != mgr || ctx.Err() != nil
+	s.mu.Unlock()
+	if aborted {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cleanupCancel()
+		_ = mgr.Stop(cleanupCtx, *cfg)
+		return
+	}
+
+	if err != nil {
 		s.setIPsecState("error", err.Error())
 		s.Log("ERROR", "IPsec 隧道建立失败: %v", err)
 		if out != "" {
@@ -794,11 +830,24 @@ func (s *VPNService) startIPsec(ncs []protocol.NCResource) {
 	}
 
 	gateway := ""
-	if ip, err := mgr.WSLIP(ctx); err == nil {
+	if ip, err := mgr.WSLIP(ctx, cfg.VirtualIP); err == nil {
 		gateway = ip
-		s.mu.Lock()
-		s.ipsecGateway = gateway
+	} else {
+		s.Log("WARN", "无法获取 WSL 地址，跳过 Windows 路由: %v", err)
+	}
+
+	s.mu.Lock()
+	if s.Status == "Disconnected" || s.ipsecMgr != mgr || ctx.Err() != nil {
 		s.mu.Unlock()
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cleanupCancel()
+		_ = mgr.Stop(cleanupCtx, *cfg)
+		return
+	}
+	s.ipsecGateway = gateway
+	s.mu.Unlock()
+
+	if gateway != "" {
 		if err := ipsec.AddRoutes(ctx, cfg.Routes, gateway); err != nil {
 			if errors.Is(err, ipsec.ErrNotElevated) {
 				s.Log("WARN", "IPsec 隧道已建立，但当前进程不是管理员：Windows 应用暂时无法自动路由到内网（可手动添加路由，或从 WSL 内访问）")
@@ -808,11 +857,22 @@ func (s *VPNService) startIPsec(ncs []protocol.NCResource) {
 		} else {
 			s.Log("SUCCESS", "已为 IPsec 网段添加 Windows 路由（网关 %s）", gateway)
 		}
-	} else {
-		s.Log("WARN", "无法获取 WSL 地址，跳过 Windows 路由: %v", err)
 	}
 
-	s.setIPsecState("up", "")
+	s.mu.Lock()
+	if s.Status == "Disconnected" || s.ipsecMgr != mgr || ctx.Err() != nil {
+		s.mu.Unlock()
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cleanupCancel()
+		if gateway != "" {
+			_ = ipsec.RemoveRoutes(cleanupCtx, cfg.Routes, gateway)
+		}
+		_ = mgr.Stop(cleanupCtx, *cfg)
+		return
+	}
+	s.ipsecState = "up"
+	s.ipsecError = ""
+	s.mu.Unlock()
 	s.Log("SUCCESS", "IPsec 隧道已建立: %s", ipsec.FormatServerPort(*cfg))
 }
 
@@ -827,6 +887,10 @@ func (s *VPNService) setIPsecState(state, errMsg string) {
 // to call when no tunnel is running.
 func (s *VPNService) stopIPsec() {
 	s.mu.Lock()
+	if s.ipsecCancel != nil {
+		s.ipsecCancel()
+		s.ipsecCancel = nil
+	}
 	mgr := s.ipsecMgr
 	cfg := s.ipsecCfg
 	gateway := s.ipsecGateway
@@ -1633,20 +1697,33 @@ func (s *VPNService) cleanupStaleSessionLocked() {
 	s.Log("WARN", "Tearing down existing session (status: %s) to start fresh login attempt", s.Status)
 	oldClient := s.Client
 	oldProxy := s.ProxyMgr
+	oldWebProxies := s.WebProxies
 	s.Client = nil
 	s.ProxyMgr = nil
+	s.WebProxies = nil
+	s.WebResources = nil
 	s.challenge = nil
+	s.pendingClients = nil
 	s.Status = "Disconnected"
 	s.StatusDetail = "Disconnected"
 	s.Resources = nil
 	s.IPsecResources = nil
 	s.resourceState = ""
 	s.resourceError = ""
+	s.passwordExpiryDays = 0
+	s.loginNotice = ""
 	s.mu.Unlock()
+
+	s.stopIPsec()
 
 	if oldProxy != nil {
 		oldProxy.Stop()
 	}
+	for _, wp := range oldWebProxies {
+		wp.Stop()
+	}
+	s.disableSystemPAC()
+
 	if oldClient != nil {
 		_ = oldClient.Logout()
 	}
