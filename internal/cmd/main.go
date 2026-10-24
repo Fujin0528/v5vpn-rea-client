@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -37,6 +39,81 @@ const AppName = "v5vpn-rea"
 var AppVersion = "v0.4.0"
 
 var mainWindow *mygo.Window
+
+// 窗口尺寸按视图分别记忆（登录 / 已连接 / 设置）：用户手动调整过某个视图
+// 后，切回该视图或重启客户端都会恢复对应尺寸。
+var (
+	windowSizes     = map[string][2]int{}
+	windowStatePath string
+	currentView     = "login"
+)
+
+func loadWindowSizes() {
+	dir := config.UserDataDir()
+	if dir == "" {
+		return
+	}
+	windowStatePath = filepath.Join(dir, "window-sizes.json")
+	if data, err := os.ReadFile(windowStatePath); err == nil {
+		_ = json.Unmarshal(data, &windowSizes) // 文件损坏则忽略，回退默认尺寸
+	}
+}
+
+func persistWindowSizes() {
+	if windowStatePath == "" || len(windowSizes) == 0 {
+		return
+	}
+	data, err := json.MarshalIndent(windowSizes, "", "  ")
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(windowStatePath, data, 0o600)
+}
+
+func windowSizeFor(mode string, defW, defH int) (int, int) {
+	if s, ok := windowSizes[mode]; ok && s[0] >= 320 && s[1] >= 400 {
+		return s[0], s[1]
+	}
+	return defW, defH
+}
+
+// captureWindowSize 记录当前视图的窗口尺寸，必须在主线程调用。
+func captureWindowSize(w *mygo.Window) {
+	if w == nil || w.IsDestroyed() {
+		return
+	}
+	width, height := w.Size()
+	if width <= 0 || height <= 0 {
+		return
+	}
+	windowSizes[currentView] = [2]int{width, height}
+}
+
+// applyWindowView 先记录当前视图的尺寸，再应用目标视图记住的尺寸。
+func applyWindowView(mode string) {
+	if mainWindow == nil || mainWindow.IsDestroyed() {
+		return
+	}
+	captureWindowSize(mainWindow)
+	switch mode {
+	case "login":
+		w, h := windowSizeFor("login", 460, 718)
+		mainWindow.SetSize(w, h)
+		mainWindow.Center()
+	case "connected":
+		w, h := windowSizeFor("connected", 1248, 832)
+		mainWindow.SetSize(w, h)
+		mainWindow.Center()
+	case "settings":
+		w, h := windowSizeFor("settings", 920, 660)
+		mainWindow.SetSize(w, h)
+		mainWindow.Center()
+	default:
+		return
+	}
+	currentView = mode
+	persistWindowSizes()
+}
 
 func init() {
 	attachConsole()
@@ -90,6 +167,8 @@ func main() {
 	if dataDir, err := mygo.App.Path(mygo.PathUserData); err == nil && dataDir != "" {
 		config.SetUserDataDir(dataDir)
 	}
+	// 用户上次调整过的窗口尺寸（按视图分别记忆）。
+	loadWindowSizes()
 
 	// Handle password dumping
 	if *dumpPasswords {
@@ -149,6 +228,8 @@ func main() {
 	svcPair := &backends{v5vpn: vpnService, atrust: atrustService}
 
 	actualPort := startHTTPServer(serverPort, uiFS, vpnService, atrustService)
+	// PAC 必须能被系统浏览器访问，地址基于实际监听端口生成。
+	vpnService.SetLocalPort(actualPort)
 
 	// Initialize MyGo Desktop Framework
 	log.Printf("Starting V5VPN Client with MyGo framework...")
@@ -168,10 +249,11 @@ func main() {
 	mygo.SetFrontend(uiFS)
 
 	mygo.App.WhenReady(func() {
+		startW, startH := windowSizeFor("login", 460, 718)
 		win := mygo.NewWindow(mygo.WindowOptions{
 			Title:  fmt.Sprintf("V5VPN 现代客户端 %s (MyGo)", AppVersion),
-			Width:  460,
-			Height: 718,
+			Width:  startW,
+			Height: startH,
 			// 两套界面按协议分家后没有统一的 /index.html，先打开哪一套
 			// 取决于上次使用的网关协议（见 ui_routes.go）。
 			URL: fmt.Sprintf("http://127.0.0.1:%d%s", actualPort, initialUIPath(vpnService.GetConfig())),
@@ -221,6 +303,8 @@ func main() {
 						isExiting = true
 						svcPair.logoutActive()
 						mygo.RunOnMain(func() {
+							captureWindowSize(win)
+							persistWindowSizes()
 							win.Destroy()
 							mygo.App.Quit()
 							os.Exit(0)
@@ -381,6 +465,8 @@ func main() {
 							isExiting = true
 							svcPair.logoutActive()
 							mygo.RunOnMain(func() {
+								captureWindowSize(win)
+								persistWindowSizes()
 								if win != nil {
 									win.Destroy()
 								}
@@ -418,7 +504,7 @@ func main() {
 				updateTray()
 				if mainWindow != nil && !mainWindow.IsDestroyed() {
 					if status == "Disconnected" {
-						mainWindow.SetSize(460, 718)
+						applyWindowView("login")
 						page := mainWindow.Page()
 						if page != nil {
 							_, _ = page.Eval("window.onVPNDisconnected && window.onVPNDisconnected()")
@@ -507,6 +593,40 @@ func newAPIRouter(uiFS fs.FS, vpnService *service.VPNService, atrustSvc *service
 		_ = json.NewEncoder(w).Encode(st)
 	})
 
+	// 网页代理设置：PAC 开关 + 额外代理地址（持久化到用户数据目录）。
+	mux.HandleFunc("/api/web-proxy/config", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method {
+		case http.MethodGet:
+			_ = json.NewEncoder(w).Encode(vpnService.GetWebProxyConfig())
+		case http.MethodPost:
+			var req struct {
+				PACEnabled   bool   `json:"pacEnabled"`
+				ExtraTargets string `json:"extraTargets"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+				return
+			}
+			if err := vpnService.SetWebProxyConfig(req.PACEnabled, req.ExtraTargets); err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"success": true})
+		default:
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
+
+	// 系统 PAC：只把网页资源的目标地址指向本地代理，其余直连。
+	mux.HandleFunc("/proxy.pac", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-ns-proxy-autoconfig")
+		w.Header().Set("Cache-Control", "no-store")
+		_, _ = io.WriteString(w, vpnService.PACScript())
+	})
+
 	mux.HandleFunc("/api/window-size", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -521,17 +641,7 @@ func newAPIRouter(uiFS fs.FS, vpnService *service.VPNService, atrustSvc *service
 		}
 		if mainWindow != nil {
 			mygo.RunOnMain(func() {
-				switch req.Mode {
-				case "login":
-					mainWindow.SetSize(460, 718)
-					mainWindow.Center()
-				case "connected":
-					mainWindow.SetSize(1248, 832)
-					mainWindow.Center()
-				case "settings":
-					mainWindow.SetSize(920, 660)
-					mainWindow.Center()
-				}
+				applyWindowView(req.Mode)
 			})
 		}
 		w.Header().Set("Content-Type", "application/json")
