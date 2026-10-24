@@ -23,14 +23,11 @@
 'use strict';
 
 const puppeteer = require('puppeteer-core');
-const { spawn, execFileSync } = require('child_process');
 const fs = require('fs');
-const net = require('net');
-const os = require('os');
 const path = require('path');
 const { findBrowser } = require('./lib/find-browser');
+const { startSandbox } = require('./lib/harness');
 
-const REPO_ROOT = path.resolve(__dirname, '..');
 const TEST_DIR = __dirname;
 const RESULTS_DIR = path.join(TEST_DIR, 'results');
 
@@ -49,6 +46,10 @@ function parseArgs(argv) {
 }
 
 const ARGS = parseArgs(process.argv);
+
+// REPORT_PATH 是本套件的单套报告；套件摘要（suite-*.json）供 e2e_run.js
+// 聚合成统一报告。
+const REPORT_PATH = path.join(RESULTS_DIR, `report-${ARGS.scenario}.html`);
 
 // 场景定义：协议、mock 包路径、网关表单值、期望在界面上看到的资源名。
 //
@@ -145,46 +146,8 @@ async function recordStep(page, { id, title, desc, screenshotName, action }) {
 }
 
 // ---------------------------------------------------------------------------
-// 进程编排
+// 进程编排（构建/端口/沙盒拉起统一在 lib/harness.js，与 multi 套件共用）
 // ---------------------------------------------------------------------------
-
-function goBuild(outPath, pkg) {
-  log(`构建 ${pkg} → ${outPath}`);
-  execFileSync('go', ['build', '-o', outPath, pkg], {
-    cwd: REPO_ROOT,
-    stdio: 'inherit',
-    env: { ...process.env },
-  });
-}
-
-// findFreePort 用 net 模块实际 bind 一次拿端口，避免和正在跑的 mock 抢 8443。
-function findFreePort() {
-  return new Promise((resolve, reject) => {
-    const srv = net.createServer();
-    srv.unref();
-    srv.on('error', reject);
-    srv.listen(0, '127.0.0.1', () => {
-      const { port } = srv.address();
-      srv.close(() => resolve(port));
-    });
-  });
-}
-
-function waitForPort(port, timeoutMs, label) {
-  const deadline = Date.now() + timeoutMs;
-  return new Promise((resolve, reject) => {
-    const attempt = () => {
-      const sock = net.connect(port, '127.0.0.1');
-      sock.once('connect', () => { sock.destroy(); resolve(); });
-      sock.once('error', () => {
-        sock.destroy();
-        if (Date.now() > deadline) reject(new Error(`${label} 在 ${timeoutMs}ms 内未监听 ${port}`));
-        else setTimeout(attempt, 200);
-      });
-    };
-    attempt();
-  });
-}
 
 // ---------------------------------------------------------------------------
 // 报告
@@ -194,7 +157,7 @@ function generateHtmlReport(meta) {
   const passCount = steps.filter(s => s.status === 'PASS').length;
   const failCount = steps.filter(s => s.status === 'FAIL').length;
   const totalMs = steps.reduce((a, s) => a + s.durationMs, 0);
-  const reportPath = path.join(RESULTS_DIR, `report-${ARGS.scenario}.html`);
+  const reportPath = REPORT_PATH;
   const logText = fs.existsSync(LOG_FILE) ? fs.readFileSync(LOG_FILE, 'utf-8') : '';
   const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
@@ -320,81 +283,26 @@ function generateHtmlReport(meta) {
 // 浏览器探测在 lib/find-browser.js：跨平台候选列表，EDGE_PATH 优先。
 
 async function main() {
-  const workDir = fs.mkdtempSync(path.join(os.tmpdir(), `e2e-${ARGS.scenario}-`));
-  const binDir = path.join(workDir, 'bin');
-  fs.mkdirSync(binDir, { recursive: true });
-
-  const exeSuffix = os.platform() === 'win32' ? '.exe' : '';
-  const mockExe = path.join(binDir, `mock${exeSuffix}`);
-  const appExe = path.join(binDir, `app${exeSuffix}`);
-  const mockDataDir = path.join(workDir, 'mock-data');
-  // ★ 隔离的 APPDATA：app 的 setting.xml 与 deviceId 都落在里面，
-  //   不会碰到开发机上真实账号配置。
-  const appDataDir = path.join(workDir, 'appdata');
-  fs.mkdirSync(mockDataDir, { recursive: true });
-  fs.mkdirSync(appDataDir, { recursive: true });
-
-  const children = [];
-  const cleanup = () => {
-    for (const c of children.reverse()) {
-      try { c.kill('SIGKILL'); } catch { /* 已退出 */ }
-    }
-    if (!ARGS.keep) {
-      try { fs.rmSync(workDir, { recursive: true, force: true }); } catch { /* Windows 句柄未释放 */ }
-    } else {
-      log(`保留临时目录: ${workDir}`);
-    }
-  };
-
   let browser = null;
   let reportPath = null;
-  meta.appDataDir = appDataDir;
+  let sandbox = null;
 
   try {
-    // 1. 构建 mock 与 app
-    log('=== [1/5] 构建 mock 与客户端 ===');
-    goBuild(mockExe, SCENARIO.entryPkg || SCENARIO.mockPkg);
-    goBuild(appExe, 'github.com/hygkui/v5vpn-rea-client/internal/cmd');
-
-    // 2. 拉起 mock
-    log('=== [2/5] 启动 mock 网关 ===');
-    const mockPort = await findFreePort();
-    const mockAddr = `127.0.0.1:${mockPort}`;
-    meta.mockURL = `https://${mockAddr}`;
-    const mockProc = spawn(mockExe, SCENARIO.mockArgs(mockAddr, mockDataDir), {
-      stdio: ['ignore', 'pipe', 'pipe'],
+    // 1-3. 沙盒：构建 mock 与客户端、隔离用户数据目录、随机端口拉起。
+    //   生命周期统一在 lib/harness.js，与 e2e_v5vpn_multi_test.js 共用，
+    //   任何 E2E 套件单独可跑，不再有「手工先起服务」的前置。
+    log(`=== [1/5] 构建沙盒（场景: ${SCENARIO.name}） ===`);
+    sandbox = await startSandbox({
+      entryPkg: SCENARIO.entryPkg,
+      mockPkg: SCENARIO.mockPkg,
+      mockArgs: SCENARIO.mockArgs,
+      uiPath: SCENARIO.uiPath,
+      keep: ARGS.keep,
+      tag: (msg) => { fs.appendFileSync(LOG_FILE, `${msg}\n`); log(msg); },
     });
-    children.push(mockProc);
-    mockProc.stdout.on('data', d => fs.appendFileSync(LOG_FILE, `[mock] ${d}`));
-    mockProc.stderr.on('data', d => fs.appendFileSync(LOG_FILE, `[mock!] ${d}`));
-    await waitForPort(mockPort, 20000, 'mock');
-    log(`mock 已就绪: ${meta.mockURL}`);
-
-    // 3. 在隔离的用户数据目录下拉起 app，拿到 HTTP UI 端口
-    log('=== [3/5] 启动客户端（隔离用户数据目录）===');
-    const appPort = await findFreePort();
-    // 直接打开本协议的界面目录：两套前端物理分开，根路径的重定向行为
-    // 另由 TestRootRedirectsToProtocolUI 在 Go 侧覆盖。这里固定走
-    // /atrust/ 或 /v5vpn/，避免"启动路由选错界面"把 UI 场景掩盖成别的错误。
-    meta.appURL = `http://127.0.0.1:${appPort}${SCENARIO.uiPath}`;
-    // 跨平台隔离：Windows 应用读 APPDATA；macOS/Linux 的用户配置根是
-    // HOME（mygo PathUserData 与 os.UserConfigDir 都从 HOME 派生），只设
-    // APPDATA 会漏到真实配置。cwd 落在只含二进制的 bin 目录，堵住
-    // 「工作目录 setting.xml」这条候选路径读到开发机配置。
-    const appEnv = { ...process.env, APPDATA: appDataDir };
-    if (process.platform !== 'win32') {
-      appEnv.HOME = appDataDir;
-    }
-    const appProc = spawn(appExe, ['-port', String(appPort)], {
-      stdio: ['ignore', 'pipe', 'pipe'],
-      env: appEnv,
-      cwd: binDir,
-    });
-    children.push(appProc);
-    appProc.stdout.on('data', d => fs.appendFileSync(LOG_FILE, `[app] ${d}`));
-    appProc.stderr.on('data', d => fs.appendFileSync(LOG_FILE, `[app!] ${d}`));
-    await waitForPort(appPort, 30000, 'app');
-    log(`客户端 UI 已就绪: ${meta.appURL}（配置目录 ${appDataDir}）`);
+    meta.mockURL = sandbox.mockURL;
+    meta.appURL = sandbox.appURL;
+    meta.appDataDir = sandbox.appDataDir;
 
     // 4. 浏览器
     const browserPath = findBrowser();
@@ -425,14 +333,48 @@ async function main() {
     // 失败也要出报告——里面的截图和日志是排障的唯一线索。
   } finally {
     if (browser) await browser.close().catch(() => {});
-    cleanup();
+    if (sandbox) sandbox.kill();
     reportPath = generateHtmlReport(meta);
     log(`报告: ${reportPath}`);
+    writeSuiteSummary();
   }
 
   const failed = steps.filter(s => s.status === 'FAIL').length;
   const crashed = steps.length === 0;
   process.exit(failed || crashed ? 1 : 0);
+}
+
+// writeSuiteSummary 导出一份机器可读的套件摘要（results/suite-*.json），
+// 供 e2e_run.js 聚合成统一报告：一个入口、一份报告，避免漏跑。
+function writeSuiteSummary() {
+  const summary = {
+    suite: `ui:${ARGS.scenario}`,
+    title: `${SCENARIO.name} 主链路 UI E2E`,
+    logFile: path.basename(LOG_FILE),
+    reportFile: path.basename(REPORT_PATH),
+    scenarios: [{
+      id: 1,
+      title: `${SCENARIO.name} 主链路（登录 → 资源 → 断开）`,
+      desc: '表单 → API → 渲染 → 断开的完整回归。',
+      status: steps.some(s => s.status === 'FAIL') ? 'FAIL' : 'PASS',
+      steps: steps.map(s => ({
+        stepId: s.id,
+        title: s.title,
+        desc: s.desc,
+        status: s.status,
+        details: s.details || '',
+        durationMs: s.durationMs || 0,
+        screenshot: s.screenshotFile || null,
+      })),
+    }],
+  };
+  try {
+    fs.writeFileSync(
+      path.join(RESULTS_DIR, `suite-ui-${ARGS.scenario}.json`),
+      JSON.stringify(summary, null, 2));
+  } catch (err) {
+    log(`写套件摘要失败: ${err.message}`);
+  }
 }
 
 // runScenario 是场景步骤的主体。

@@ -3,12 +3,20 @@ const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
 const { findBrowser } = require('./lib/find-browser');
+const { startSandbox } = require('./lib/harness');
 
-const TARGET_URL = 'http://127.0.0.1:45678/v5vpn/';
+// 目标地址支持两种来源：
+//   1. 外部传入（e2e_run.js 聚合运行或手工调试）：V5VPN_APP_URL +
+//      V5VPN_MOCK_URL 环境变量，两个都设才生效；
+//   2. 都没设时自建沙盒（lib/harness.js：构建、隔离用户数据目录、随机
+//      端口、跑完清理）——单独 `node e2e_v5vpn_multi_test.js` 也能完整
+//      自跑，不再依赖「手工先起 app@45678 + mock@8443」的前置。
+let TARGET_URL = process.env.V5VPN_APP_URL || '';
+let MOCK_BASE = process.env.V5VPN_MOCK_URL || '';
 const MOCK_GATEWAY = {
   name: '网御星云测试网关(多场景)',
   ip: '127.0.0.1',
-  port: 8443,
+  port: parseInt((process.env.V5VPN_MOCK_URL || 'https://127.0.0.1:8443').split(':').pop(), 10) || 8443,
   algo: 0 // 国际标准 TLS
 };
 
@@ -65,7 +73,7 @@ async function clearAndType(page, selector, value) {
 async function setMockMode(mode) {
   log(`[MockServer] Switching simulation mode to: ${mode}`);
   try {
-    const res = await fetch(`https://127.0.0.1:8443/api/mode?mode=${mode}`, {
+    const res = await fetch(`${MOCK_BASE}/api/mode?mode=${mode}`, {
       method: 'POST',
     });
     return await res.json();
@@ -264,6 +272,22 @@ async function safeDisconnect(page) {
 }
 
 async function run() {
+  // 未提供外部环境时自建沙盒：mock + 客户端 + 隔离用户数据目录 + 随机端口。
+  let sandbox = null;
+  if (!TARGET_URL || !MOCK_BASE) {
+    log('=== [0/5] 自建沙盒（构建 mock 与客户端、隔离用户数据目录） ===');
+    sandbox = await startSandbox({
+      entryPkg: 'github.com/hygkui/v5vpn-rea-client/cmd/mockserver',
+      mockArgs: (addr) => ['-addr', addr],
+      uiPath: '/v5vpn/',
+      tag: (msg) => log(msg),
+    });
+    TARGET_URL = sandbox.appURL;
+    MOCK_BASE = sandbox.mockURL;
+    MOCK_GATEWAY.port = sandbox.mockPort;
+    log(`沙盒就绪: 客户端 ${TARGET_URL} | mock ${MOCK_BASE}`);
+  }
+
   const browserPath = findBrowser();
   if (!browserPath) throw new Error('未找到 Edge/Chrome；可用 EDGE_PATH 环境变量指定');
   log(`使用浏览器: ${browserPath}`);
@@ -656,7 +680,7 @@ async function run() {
         action: async () => {
           let expectedCode = '1234';
           try {
-            const r = await fetch('https://127.0.0.1:8443/api/verifycode');
+            const r = await fetch(`${MOCK_BASE}/api/verifycode`);
             const data = await r.json();
             if (data && data.code) expectedCode = data.code;
           } catch (e) {
@@ -810,7 +834,7 @@ async function run() {
         action: async () => {
           let expectedCode = '123456';
           try {
-            const r = await fetch('https://127.0.0.1:8443/api/smscode');
+            const r = await fetch(`${MOCK_BASE}/api/smscode`);
             const data = await r.json();
             if (data && data.code) expectedCode = data.code;
           } catch (e) {
@@ -931,7 +955,7 @@ async function run() {
         action: async () => {
           let expectedCode = '123456';
           try {
-            const r = await fetch('https://127.0.0.1:8443/api/smscode');
+            const r = await fetch(`${MOCK_BASE}/api/smscode`);
             const data = await r.json();
             if (data && data.code) expectedCode = data.code;
           } catch (e) {
@@ -1026,7 +1050,7 @@ async function run() {
         action: async () => {
           let expectedCode = '123456';
           try {
-            const r = await fetch('https://127.0.0.1:8443/api/tokencode');
+            const r = await fetch(`${MOCK_BASE}/api/tokencode`);
             const data = await r.json();
             if (data && data.code) expectedCode = data.code;
           } catch (e) {
@@ -1101,7 +1125,7 @@ async function run() {
         action: async () => {
           let expectedCode = '1234';
           try {
-            const r = await fetch('https://127.0.0.1:8443/api/verifycode');
+            const r = await fetch(`${MOCK_BASE}/api/verifycode`);
             const data = await r.json();
             if (data && data.code) expectedCode = data.code;
           } catch (e) {
@@ -1159,7 +1183,7 @@ async function run() {
 
           let expectedCode = '123456';
           try {
-            const r = await fetch('https://127.0.0.1:8443/api/smscode');
+            const r = await fetch(`${MOCK_BASE}/api/smscode`);
             const data = await r.json();
             if (data && data.code) expectedCode = data.code;
           } catch (e) {
@@ -1187,7 +1211,7 @@ async function run() {
         action: async () => {
           let expectedCode = '123456';
           try {
-            const r = await fetch('https://127.0.0.1:8443/api/tokencode');
+            const r = await fetch(`${MOCK_BASE}/api/tokencode`);
             const data = await r.json();
             if (data && data.code) expectedCode = data.code;
           } catch (e) {
@@ -1228,10 +1252,44 @@ async function run() {
     await setMockMode('pwd-cert');
     await browser.close();
     log(`Browser closed.`);
+    if (sandbox) sandbox.kill();
   }
 
   // Generate Comprehensive HTML Report
   generateHtmlReport();
+  writeSuiteSummary();
+}
+
+// writeSuiteSummary 导出机器可读的套件摘要（results/suite-multi.json），
+// 供 e2e_run.js 聚合成统一报告。
+function writeSuiteSummary() {
+  const summary = {
+    suite: 'multi:v5vpn',
+    title: 'V5VPN 11 合 1 多重认证与异常流深度 E2E',
+    logFile: path.basename(LOG_FILE),
+    reportFile: path.basename(REPORT_FILE),
+    scenarios: scenarios.map(sc => ({
+      id: sc.id,
+      title: sc.title,
+      desc: sc.desc,
+      mode: sc.mode,
+      status: sc.status,
+      steps: (sc.steps || []).map(st => ({
+        stepId: st.stepId,
+        title: st.title,
+        desc: st.desc,
+        status: st.status,
+        details: st.details || '',
+        durationMs: st.durationMs || 0,
+        screenshot: st.screenshotName || null,
+      })),
+    })),
+  };
+  try {
+    fs.writeFileSync(path.join(RESULTS_DIR, 'suite-multi.json'), JSON.stringify(summary, null, 2));
+  } catch (err) {
+    log(`写套件摘要失败: ${err.message}`);
+  }
 }
 
 function generateHtmlReport() {
@@ -1468,7 +1526,7 @@ function generateHtmlReport() {
         </div>
         <div class="meta-item">
           <span class="meta-label">网关仿真环境</span>
-          <span class="meta-value">网御星云多模式仿真网关 (127.0.0.1:8443)</span>
+          <span class="meta-value">网御星云多模式仿真网关 (${MOCK_BASE})</span>
         </div>
         <div class="meta-item">
           <span class="meta-label">自动化引擎</span>

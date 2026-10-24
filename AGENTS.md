@@ -9,7 +9,7 @@
 | 层 | 命令 | 进 CI？ | 验什么 |
 |:---|:---|:---:|:---|
 | Go 集成 | `go test -race ./...` | ✅（`-short`） | 协议、服务、代理、路由（含自拉起 mock 网关） |
-| UI 端到端 | `bash test/run.sh ui v5vpn` 等 | ❌ 仅本机 | 真实浏览器驱动 UI：表单 → API → 渲染 → 断开 |
+| UI 端到端 | `bash test/run.sh e2e` | ❌ 仅本机 | 真实浏览器驱动 UI：全部套件（V5VPN 主链路 + 11 合 1 深度 + aTrust 主链路）聚合一份报告 |
 
 **最低门槛（任何改动）：**
 
@@ -21,15 +21,15 @@ go test -race ./...        # 本机跑全量，比 CI 的 -short 更严
 
 **触发条件加跑 UI E2E（只跑 go test 就推送是本仓库明确禁止的）：**
 
-- 改动 `internal/cmd/ui/**`、登录链、认证状态机、资源/代理逻辑 →
-  `bash test/run.sh ui v5vpn`；
-- 改动认证挑战、多因素、改密相关 → `bash test/run.sh v5vpn-multi`
-  （11 合 1：双因素 / 三因素链 / 全链挑战 / 验证码 / 改密 / 短信 / 令牌）；
-- 改动 aTrust 侧 → `bash test/run.sh ui atrust`。
+改动 `internal/cmd/ui/**`、登录链、认证状态机、资源/代理逻辑、**或任何
+用户可见行为** → `bash test/run.sh e2e`（统一入口，一个命令跑全部套件并
+聚合 `test/results/report.html`，不会漏）；赶时间或调试单套用
+`bash test/run.sh ui v5vpn` / `ui multi` / `ui atrust`。
 
-E2E 自己构建 app 与 mock 网关、用隔离的用户数据目录启动、随机端口，
-跑完即清理；需要本机装有 Edge 或 Chrome（`EDGE_PATH` 可指定路径）。
-产物在 `test/results/`：逐步截图 + HTML 报告 + 日志，可作 PR 证据。
+E2E 每套独立沙盒：自己构建 app 与 mock 网关、用隔离的用户数据目录
+（跨平台：`APPDATA` + `HOME` 重定向）启动、随机端口，跑完即清理；需要
+本机装有 Edge 或 Chrome（`EDGE_PATH` 可指定路径）。产物在 `test/results/`：
+统一报告（含逐步截图）、各套件摘要 `suite-*.json`、日志，可作 PR 证据。
 
 ## 测试约定速查
 
