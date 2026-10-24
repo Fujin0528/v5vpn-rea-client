@@ -82,6 +82,9 @@ func (s *VPNService) SetWebProxyConfig(pacEnabled bool, extraTargets string) err
 	if err := cfg.save(); err != nil {
 		return fmt.Errorf("保存网页代理设置失败: %w", err)
 	}
+	// 补充地址变了：PAC 会立即把新目标引到本地代理，代理的白名单必须同步，
+	// 否则新目标会被 403 拒绝。
+	s.syncWebProxyHosts()
 	if pacEnabled && hasWeb {
 		s.applySystemPACNow()
 	} else {

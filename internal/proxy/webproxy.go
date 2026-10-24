@@ -20,6 +20,10 @@ import (
 // 资源那样映射到某个固定的本地端口。官方客户端用虚拟网卡让浏览器直接访问
 // 内网 IP；本客户端不接管路由，改为在本地起一个 CONNECT 代理，浏览器经它
 // 访问目标地址，每条连接都带上该资源的 MapID。
+//
+// 代理只回环可达，但本机其他进程（恶意软件、低权限账户）也能连上来借道
+// 携带用户会话凭据的隧道。因此隧道目标必须命中 allowedHosts 白名单
+// （资源地址 + 用户补充地址），否则一律 403——不能依赖网关侧授权兜底。
 type WebProxy struct {
 	GatewayIP   string
 	GatewayPort int
@@ -28,25 +32,63 @@ type WebProxy struct {
 	ClientCert  *tls.Certificate
 	Logger      func(level string, format string, args ...any)
 
+	allowedMu    sync.RWMutex
+	allowedHosts []string
+
 	ln     net.Listener
 	mu     sync.Mutex
 	closed bool
 }
 
 // NewWebProxy creates a CONNECT proxy bound to one gateway resource.
+// allowedHosts 限定隧道目标主机（精确地址或尾部通配如 10.10.20.*），
+// 空切片表示不限制（仅供测试与显式声明任意目标的调用方使用）。
 func NewWebProxy(gwIP string, gwPort int, sessionID, mapID string, cert *tls.Certificate,
-	logger func(string, string, ...any)) *WebProxy {
+	allowedHosts []string, logger func(string, string, ...any)) *WebProxy {
 	if logger == nil {
 		logger = func(string, string, ...any) {}
 	}
 	return &WebProxy{
-		GatewayIP:   gwIP,
-		GatewayPort: gwPort,
-		SessionID:   sessionID,
-		MapID:       mapID,
-		ClientCert:  cert,
-		Logger:      logger,
+		GatewayIP:    gwIP,
+		GatewayPort:  gwPort,
+		SessionID:    sessionID,
+		MapID:        mapID,
+		ClientCert:   cert,
+		allowedHosts: append([]string(nil), allowedHosts...),
+		Logger:       logger,
 	}
+}
+
+// SetAllowedHosts 替换隧道目标白名单（资源刷新或用户改补充地址后同步）。
+func (p *WebProxy) SetAllowedHosts(hosts []string) {
+	p.allowedMu.Lock()
+	p.allowedHosts = append([]string(nil), hosts...)
+	p.allowedMu.Unlock()
+}
+
+// hostAllowed 判断 CONNECT 目标是否在白名单内：规则支持精确主机名与
+// 尾部 * 通配（与 PAC 的 shExpMatch 对齐的简化形态）。
+func (p *WebProxy) hostAllowed(host string) bool {
+	p.allowedMu.RLock()
+	defer p.allowedMu.RUnlock()
+	if len(p.allowedHosts) == 0 {
+		return true
+	}
+	for _, rule := range p.allowedHosts {
+		if rule == "" {
+			continue
+		}
+		if suffix, ok := strings.CutSuffix(rule, "*"); ok {
+			if strings.EqualFold(host, suffix) || strings.HasPrefix(strings.ToLower(host), strings.ToLower(suffix)) {
+				return true
+			}
+			continue
+		}
+		if strings.EqualFold(host, rule) {
+			return true
+		}
+	}
+	return false
 }
 
 // Start binds 127.0.0.1 on an ephemeral port and serves CONNECT requests.
@@ -119,6 +161,14 @@ func (p *WebProxy) serve(client net.Conn) {
 	target := req.Host
 	if !strings.Contains(target, ":") {
 		target += ":443"
+	}
+	// 目标必须命中白名单：代理在回环上对同机所有进程可达，而隧道自带
+	// 用户会话凭据，放行任意目标等于给低权限进程一条通往内网的便道。
+	host, _, splitErr := net.SplitHostPort(target)
+	if splitErr != nil || !p.hostAllowed(host) {
+		p.Logger("WARN", "网页代理拒绝非白名单目标 %s", target)
+		_, _ = io.WriteString(client, "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+		return
 	}
 
 	cfg := protocol.GatewayTLSConfig()

@@ -30,8 +30,16 @@ type WebResource struct {
 
 // startWebResources 为端口区间类资源建立本地 CONNECT 代理。
 // 返回的代理由调用方负责在会话结束或资源刷新时停止。
+// 每条代理的隧道白名单 = 自身资源地址 + 用户补充地址（与 PAC 规则一致）。
 func (s *VPNService) startWebResources(client *protocol.Client, cert *tls.Certificate,
 	resources []protocol.TCPUDPResource) ([]*proxy.WebProxy, []WebResource) {
+
+	// 白名单与 PAC 同源：PAC 引到代理的目标必须都能通过，否则用户会看到
+	// 「代理拒绝」而不是资源页面。
+	s.mu.Lock()
+	extra := s.webProxyCfg.ExtraTargets
+	s.mu.Unlock()
+	extraRules := extraTargetRules(extra)
 
 	var proxies []*proxy.WebProxy
 	var items []WebResource
@@ -49,7 +57,8 @@ func (s *VPNService) startWebResources(client *protocol.Client, cert *tls.Certif
 			continue
 		}
 
-		wp := proxy.NewWebProxy(client.GatewayIP, client.GatewayPort, client.SessionID, r.MapID, cert, s.Log)
+		allowed := append([]string{addr}, extraRules...)
+		wp := proxy.NewWebProxy(client.GatewayIP, client.GatewayPort, client.SessionID, r.MapID, cert, allowed, s.Log)
 		localAddr, err := wp.Start()
 		if err != nil {
 			s.Log("WARN", "网页资源 %q 启动本地代理失败: %v", r.Name, err)
@@ -66,6 +75,30 @@ func (s *VPNService) startWebResources(client *protocol.Client, cert *tls.Certif
 		s.Log("SUCCESS", "网页资源就绪: %s -> %s（本地代理 %s）", r.Name, addr, localAddr)
 	}
 	return proxies, items
+}
+
+// syncWebProxyHosts 把「资源地址 + 用户补充地址」同步为运行中代理的隧道
+// 白名单。资源刷新或用户改补充地址后必须调用，否则 PAC 引导的新目标会被
+// 代理 403 拒绝。
+func (s *VPNService) syncWebProxyHosts() {
+	s.mu.Lock()
+	proxies := append([]*proxy.WebProxy(nil), s.WebProxies...)
+	items := append([]WebResource(nil), s.WebResources...)
+	extra := s.webProxyCfg.ExtraTargets
+	s.mu.Unlock()
+
+	extraRules := extraTargetRules(extra)
+	addrByProxy := make(map[string][]string, len(items))
+	for _, w := range items {
+		if w.ProxyAddr != "" {
+			addrByProxy[w.ProxyAddr] = append(addrByProxy[w.ProxyAddr], w.RemoteAddr)
+		}
+	}
+	for _, wp := range proxies {
+		hosts := append([]string(nil), addrByProxy[wp.Addr()]...)
+		hosts = append(hosts, extraRules...)
+		wp.SetAllowedHosts(hosts)
+	}
 }
 
 // OpenWebResource 用本地 CONNECT 代理启动浏览器访问网页类资源。
@@ -259,12 +292,18 @@ func (s *VPNService) PACScript() string {
 		if w.RemoteAddr == "" || w.ProxyAddr == "" || seen[w.RemoteAddr] {
 			continue
 		}
+		if !pacSafeToken(w.RemoteAddr) {
+			// 网关下发的地址被拼进 PAC（每次浏览器请求都会执行的 JS），
+			// 含主机名/通配以外字符的一律丢弃，防止把可执行脚本注入 PAC。
+			s.Log("WARN", "网页资源地址 %q 含非常规字符，已跳过（不写入 PAC）", w.RemoteAddr)
+			continue
+		}
 		seen[w.RemoteAddr] = true
 		fmt.Fprintf(&b, "  if (host === \"%s\") return \"PROXY %s\";\n", w.RemoteAddr, w.ProxyAddr)
 	}
 	if proxyAddr != "" {
 		for _, rule := range extraTargetRules(extra) {
-			if seen[rule] {
+			if seen[rule] || !pacSafeToken(rule) {
 				continue
 			}
 			seen[rule] = true
@@ -277,6 +316,26 @@ func (s *VPNService) PACScript() string {
 	}
 	b.WriteString("  return \"DIRECT\";\n}\n")
 	return b.String()
+}
+
+// pacSafeToken 判断一段文本能否安全地嵌入 PAC 的 JS 字符串字面量：
+// 只允许字母、数字与 . * -（主机名与通配形态）。引号、括号、分号等
+// 任意其他字符都会让 PAC 变成可注入任意 JS 的载体，必须拒绝。
+// IPv6 文本地址含冒号，同样被拒——PAC 的 shExpMatch 不支持 IPv6，
+// 这类地址本就走不了 PAC 匹配。
+func pacSafeToken(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '.' || r == '*' || r == '-':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func (s *VPNService) pacURL() string {

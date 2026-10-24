@@ -594,12 +594,20 @@ func newAPIRouter(uiFS fs.FS, vpnService *service.VPNService, atrustSvc *service
 	})
 
 	// 网页代理设置：PAC 开关 + 额外代理地址（持久化到用户数据目录）。
+	// 该端点写入的地址会进入系统 PAC（每次浏览器请求都执行的 JS），
+	// 因此只吃显式 JSON，拒绝跨站网页用 text/plain 简单请求伪造的 POST。
 	mux.HandleFunc("/api/web-proxy/config", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.Method {
 		case http.MethodGet:
 			_ = json.NewEncoder(w).Encode(vpnService.GetWebProxyConfig())
 		case http.MethodPost:
+			// 恶意网页可用 text/plain 发跨站简单请求（无预检），必须挡掉。
+			if ct := r.Header.Get("Content-Type"); ct != "application/json" {
+				w.WriteHeader(http.StatusUnsupportedMediaType)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": "Content-Type must be application/json"})
+				return
+			}
 			var req struct {
 				PACEnabled   bool   `json:"pacEnabled"`
 				ExtraTargets string `json:"extraTargets"`

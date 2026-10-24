@@ -711,7 +711,9 @@ func (s *VPNService) loadResources(client *protocol.Client, cert *tls.Certificat
 		wp.Stop()
 	}
 
-	// 网页资源存在时启用系统 PAC，让用户自己打开的浏览器也能访问。
+	// 网页资源存在时启用系统 PAC，让用户自己打开的浏览器也能访问；
+	// 代理白名单与 PAC 规则同步刷新（资源地址可能变化）。
+	s.syncWebProxyHosts()
 	s.syncSystemPAC(len(webResources) > 0)
 
 	s.Log("SUCCESS", "Loaded %d protected resources (%d web).", len(resources), len(webResources))
@@ -781,6 +783,7 @@ func (s *VPNService) RefreshResources() (map[string]any, error) {
 		wp.Stop()
 	}
 
+	s.syncWebProxyHosts()
 	s.syncSystemPAC(len(webResources) > 0)
 
 	s.Log("SUCCESS", "Refreshed %d protected resources (%d web).", len(resources), len(webResources))
