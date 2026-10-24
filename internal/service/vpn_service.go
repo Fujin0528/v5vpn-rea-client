@@ -100,22 +100,25 @@ type VPNService struct {
 	// exist so the connected view can say what was assigned instead of "0 resources".
 	IPsecResources []protocol.IPsecResource
 	// IPsec data-plane state, populated asynchronously after resources load.
-	ipsecMgr       *ipsec.Manager
-	ipsecCfg       *ipsec.Config
-	ipsecGateway   string
-	ipsecState     string // "", "starting", "up", "error", "unavailable"
-	ipsecError     string
-	resourceState  ResourceLoadState
-	resourceError  string
-	Logs           []string
-	OnStatusChange func(string)
-	appVersion     string
-	authType       string
-	challenge      *authChallenge
-	pendingClients map[string]*preAuthClient
-	mu             sync.Mutex
-	logMu          sync.Mutex
-	onLog          func(string)
+	ipsecMgr     *ipsec.Manager
+	ipsecCfg     *ipsec.Config
+	ipsecGateway string
+	ipsecState   string // "", "starting", "up", "error", "unavailable"
+	ipsecError   string
+	// newIPsecManager builds the WSL Manager for a session. nil means
+	// ipsec.NewManager; tests substitute it to inject a fake CommandRunner.
+	newIPsecManager func(confPath string) *ipsec.Manager
+	resourceState   ResourceLoadState
+	resourceError   string
+	Logs            []string
+	OnStatusChange  func(string)
+	appVersion      string
+	authType        string
+	challenge       *authChallenge
+	pendingClients  map[string]*preAuthClient
+	mu              sync.Mutex
+	logMu           sync.Mutex
+	onLog           func(string)
 }
 
 // NewVPNService initializes the VPN service with loaded settings
@@ -757,7 +760,11 @@ func (s *VPNService) startIPsec(ncs []protocol.NCResource) {
 		return
 	}
 
-	mgr := ipsec.NewManager(filepath.Join(confDir, "ipsec.conf"))
+	newMgr := s.newIPsecManager
+	if newMgr == nil {
+		newMgr = ipsec.NewManager
+	}
+	mgr := newMgr(filepath.Join(confDir, "ipsec.conf"))
 	s.mu.Lock()
 	s.ipsecMgr = mgr
 	s.ipsecCfg = cfg

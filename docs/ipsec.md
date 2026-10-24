@@ -74,6 +74,21 @@
 访问 `203.0.113.10:443`、`203.0.113.11:443` 均能建立连接，SA 双向计数
 正常增长。
 
+### 2.2 测试覆盖（无 WSL 也能验证的部分）
+
+mock 网关支持 `-nc` 夹具（`only` 替换 TCP/UDP 列表、`mixed` 并存，地址为
+TEST-NET、PSK 为显式 mock 值），分四层守卫：
+
+| 层 | 位置 | 验什么 |
+|:---|:---|:---|
+| 协议解析 | `test/mock/v5vpn/nc_integration_test.go` | IKE/虚拟 IP/路由完整到达客户端；摘要 JSON 不含 PSK；`FromNC` 可生成数据面配置 |
+| service 状态机 | `internal/service/vpn_service_ipsec_test.go` | `ipsecState` 在 unavailable / up / error 间的迁移与清理（注入 fake Runner，不碰真实 WSL） |
+| UI 端到端 | `test/e2e_ui_test.js --scenario=v5vpn-nc` | 0 TCP/UDP 时资源表进入 NC 分支、状态条渲染、`/api/status` 摘要完整、PSK 不泄漏 |
+| 实网 | `internal/ipsec/live_test.go`（`IPSEC_PORTAL_XML` 启用） | 真实网关的 SA 建立 |
+
+无 WSL 的机器上，E2E 里 `ipsecState` 落到 `unavailable` 属预期——
+这验证的正是状态机与界面提示，而非隧道本身。
+
 一次性准备（管理员，需重启一次）：
 
 ```powershell
