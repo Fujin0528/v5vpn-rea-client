@@ -3,7 +3,7 @@
 本文记录 V5VPN 网关下发 `<NC_RESOURCE>`（Network Connect / IPsec 全网状）
 时的处理方式，以及完整数据面尚未实现的原因与可选路径。
 
-## 1. 现状：解析与展示，不做数据面
+## 1. NC 资源：是什么，为什么特殊
 
 网关对某些账号策略下发的不是 `<TCPUDP_RESOURCE>`（WEB 资源 / TCP 应用，
 客户端为每个资源起本地代理并用 HTTP CONNECT 透传），而是一个
@@ -31,17 +31,20 @@
 这是 **IKEv1 主模式 + 预共享密钥 + ESP 隧道模式** 的全网状 IPsec，
 客户端拿到的是一组内网路由（`SECURED-ROUTE` / `SECURED-ROUTES`）和一个
 虚拟内网 IP（`PRIVATE-IP`）。原厂客户端通过内核虚拟网卡
-（`SecTap.sys` / `ndislwf.sys`）承载这些路由，本客户端不实现这一层。
+（`SecTap.sys` / `ndislwf.sys`）承载这些路由；本客户端没有内核态组件，
+数据面交给 WSL2 里的 strongSwan 承载（见 §2）。
 
-当前实现：
+解析与编排的分工：
 
 - `internal/protocol/models.go` 解析 `NC_RESOURCE`（IKE 参数、虚拟 IP、
   隧道与路由）；`PSK` 带 `json:"-"`，不会进入 API 或界面。
 - `SummarizeNCResources` 生成不含密钥的摘要，`/api/status` 以
   `ipsecResources` 下发。
-- 连接成功的资源表在「TCP/UDP 资源为 0 但存在 IPsec 资源」时列出隧道
-  名称与路由，并说明数据面未实现，而不是只显示「未发现资源」。
-- 日志会记录一条 WARN，便于排查「登录成功但 0 资源」。
+- NC 隧道不产生本地代理行：当 TCP/UDP 资源为 0 时，资源表列出下发的
+  隧道名称与路由，并按 `ipsecState` 给出隧道状态（状态条见连接页顶部），
+  而不是只显示「未发现资源」。
+- 资源加载后若存在 NC 资源，日志记录一条 INFO 并异步拉起隧道；
+  建立失败以 ERROR 记录，便于排查「登录成功但 0 资源」。
 
 ## 2. 数据面：WSL2 + strongSwan（已实网验证）
 
@@ -98,6 +101,7 @@ dism /online /enable-feature /featurename:VirtualMachinePlatform /all /norestart
 
 见上。优点：复用成熟的 IKEv1/ESP 实现；缺点：依赖 WSL2 和管理员权限。
 
+### B. 用户态自实现（wintun）
 
 - 自行实现 IKEv1 主模式/快速模式、ESP（AES-CBC + HMAC-SHA1）、DPD 与重协商，
   用 wintun 承载路由。
@@ -111,7 +115,8 @@ dism /online /enable-feature /featurename:VirtualMachinePlatform /all /norestart
 
 ## 4. 结论
 
-- 只想访问该账号的内网：使用原厂客户端，或让网关管理员给账号分配
-  TCP/UDP 应用资源（本客户端立即可用）。
-- 要在本项目中打通 IPsec：建议按 A 路线推进，需要管理员安装 WSL2 +
-  strongSwan，并接受一次重启；B 路线适合作为长期替代。
+- 数据面已按 A 路线落地（§2，实网验证通过）：管理员安装一次 WSL2 +
+  strongSwan（接受一次重启）后，NC 账号即可在本客户端内访问内网。
+- 不具备 WSL2 条件（或非 Windows 环境）：NC 资源只有解析与展示，
+  需使用原厂客户端，或让网关管理员给账号分配 TCP/UDP 应用资源。
+- B 路线适合作为长期替代（摆脱 WSL2 与管理员权限依赖）。
