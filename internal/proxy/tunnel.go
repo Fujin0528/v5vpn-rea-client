@@ -77,6 +77,11 @@ func (pm *ProxyManager) StartProxies(resources []protocol.TCPUDPResource) ([]pro
 					targetIPs = append(targetIPs, addr)
 				}
 			}
+			if len(targetIPs) == 0 && strings.TrimSpace(res.Addr) != "" {
+				// 真实网关常把目标地址写在资源节点的 addr 属性上，
+				// 而不是 TCPUDP_IP 子节点。
+				targetIPs = append(targetIPs, strings.TrimSpace(res.Addr))
+			}
 			if len(targetIPs) == 0 {
 				targetIPs = []string{"127.0.0.1"}
 			}

@@ -168,6 +168,15 @@ V5VPN 与 aTrust 两套界面按协议独立（`/v5vpn/` 与 `/atrust/`），启
 http://127.0.0.1:45678
 ```
 
+#### 网页类资源（端口区间，如堡垒机）：
+
+网关把这类资源下发为 `port="1-65535"` + 节点 `addr` 属性，无法映射固定本地
+端口。客户端为每条资源启动仅监听 `127.0.0.1` 的 HTTP CONNECT 代理，浏览器
+经它访问内网地址；Windows 下登录后自动设置系统 PAC（仅资源地址走代理，
+NAS / 外网一律直连，断开即还原）。设计取舍与安全边界见
+**[docs/web-proxy.md](docs/web-proxy.md)**。双因子账号的「修改密码」也已修复
+（口令步不再预装证书，收到 `0x2` 后补呈证书再改密）。
+
 ### 5.3 命令行 (CLI) 快速工具
 
 #### 一键提取并解密系统 V5VPN 本地已存的所有账号密码：
@@ -367,6 +376,9 @@ go run ./cmd/e2e-atrust -gw https://127.0.0.1:8443 -user user1@local -pass any
 - 修改协议相关代码前先在私有分支跑通两套测试：单元测试 + `go test
   -short` 跳过的集成测试需要自行提供 `GATEWAY_IP / GATEWAY_PORT /
   GATEWAY_USER / GATEWAY_PASSWORD` 环境变量；
+- **提交/推送前的完整测试清单（`go test` ≠ 测完，UI E2E 不进 CI 必须本机跑）
+  见 [`AGENTS.md`](AGENTS.md)**：改动登录链 / 认证 / 资源代理时加跑
+  `bash test/run.sh ui v5vpn` 或 `v5vpn-multi`，报告与截图可作 PR 证据；
 - UI 改动请附前后对比截图，CSS 改动请确认在 1280x800 与 1920x1080
   两个分辨率下都不破布局。
 

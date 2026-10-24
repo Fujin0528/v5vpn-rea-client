@@ -61,6 +61,8 @@ type Client struct {
 	stopHeartbeat chan struct{}
 	mu            sync.Mutex
 	isLoggedIn    bool
+	// lastAuthMsg 保存最近一次认证成功响应里的网关提示（常为口令到期文案）。
+	lastAuthMsg   string
 	tlsClientCert *tls.Certificate
 }
 
@@ -104,30 +106,51 @@ func NewClient(ip string, port int, algo int, logger func(string, string, ...any
 }
 
 // Handshake checks gateway version via /vpn/version.xml
+// Handshake checks gateway version via /vpn/version.xml
+//
+// 网关链路存在短时抖动：TCP 能建连，但 TLS 握手被重置或超时，几十秒后自愈。
+// 这种瞬时故障不应让整次登录失败，因此失败后自动重试一次。
 func (c *Client) Handshake() (*VersionResponse, error) {
 	u := fmt.Sprintf("%s/vpn/version.xml", c.BaseURL)
 	c.Logger("INFO", "Connecting to gateway: %s", u)
 
-	resp, err := c.HTTPClient.Get(u)
-	if err != nil {
-		c.Logger("ERROR", "Handshake failed: %v", err)
-		return nil, fmt.Errorf("gateway handshake failed: %w", err)
-	}
-	defer resp.Body.Close()
+	var lastErr error
+	for attempt := 1; attempt <= 2; attempt++ {
+		resp, err := c.HTTPClient.Get(u)
+		if err != nil {
+			lastErr = err
+			if attempt == 1 && !isContextCancelled(err) {
+				c.Logger("WARN", "握手失败（第 1 次）: %v，500ms 后重试", err)
+				time.Sleep(500 * time.Millisecond)
+				continue
+			}
+			break
+		}
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
+		body, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr != nil {
+			lastErr = readErr
+			break
+		}
+
+		var v VersionResponse
+		if err := xml.Unmarshal(body, &v); err != nil {
+			c.Logger("WARN", "Failed to parse version.xml: %s, fallback to default", string(body))
+			return &VersionResponse{Major: "2", Minor: "0"}, nil
+		}
+
+		c.Logger("SUCCESS", "Gateway handshake OK. Version %s.%s", v.Major, v.Minor)
+		return &v, nil
 	}
 
-	var v VersionResponse
-	if err := xml.Unmarshal(body, &v); err != nil {
-		c.Logger("WARN", "Failed to parse version.xml: %s, fallback to default", string(body))
-		return &VersionResponse{Major: "2", Minor: "0"}, nil
-	}
+	c.Logger("ERROR", "Handshake failed: %v", lastErr)
+	return nil, fmt.Errorf("gateway handshake failed: %w", lastErr)
+}
 
-	c.Logger("SUCCESS", "Gateway handshake OK. Version %s.%s", v.Major, v.Minor)
-	return &v, nil
+// isContextCancelled 判断是否由调用方主动取消，这类错误重试没有意义。
+func isContextCancelled(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
 // Login authenticates the user with the gateway (Base64 credentials, encode=1) and then loads the portal integration info.
@@ -157,7 +180,24 @@ func (c *Client) ChangePassword(username, oldPassword, newPassword, verifycode s
 	// client.
 	c.captureSession()
 
-	changeBody := passwordChangeBody(oldPassword, newPassword)
+	// 明文提交是原厂的默认形态；部分网关的 pwdchange 与登录一样按
+	// Base64 + encode=1 解析，此时会回「原密码错误」。被拒后换编码重试一次。
+	err := c.submitPasswordChange(passwordChangeBody(oldPassword, newPassword))
+	if err != nil && isPasswordMismatch(err) {
+		c.Logger("WARN", "改密被网关判为原密码错误（%v），改用 Base64 + encode=1 重试", err)
+		err = c.submitPasswordChange(passwordChangeBodyEncoded(oldPassword, newPassword))
+	}
+	if err != nil {
+		return err
+	}
+
+	c.captureSession()
+	c.Logger("SUCCESS", "Password changed successfully for user: %s", username)
+	return nil
+}
+
+// submitPasswordChange posts one password-change body and parses the RESULT.
+func (c *Client) submitPasswordChange(changeBody string) error {
 	changeURL := fmt.Sprintf("%s/vpn/user/auth/pwdchange", c.BaseURL)
 
 	req, err := http.NewRequest(http.MethodPost, changeURL, strings.NewReader(changeBody))
@@ -210,10 +250,21 @@ func (c *Client) ChangePassword(username, oldPassword, newPassword, verifycode s
 	if resultCode == "" {
 		return fmt.Errorf("修改密码响应缺少结果码，无法确认修改成功")
 	}
-
-	c.captureSession()
-	c.Logger("SUCCESS", "Password changed successfully for user: %s", username)
 	return nil
+}
+
+// isPasswordMismatch 判断网关是否把 old_pwd 判成了错误（可换编码重试）。
+func isPasswordMismatch(err error) bool {
+	var authErr *AuthError
+	if !errors.As(err, &authErr) {
+		return false
+	}
+	if authErr.Kind == AuthKindBadCredentials {
+		return true
+	}
+	return strings.Contains(authErr.Msg, "原密码") ||
+		strings.Contains(authErr.Msg, "旧密码") ||
+		strings.Contains(authErr.Msg, "密码错误")
 }
 
 // AuthPassword verifies the user credentials against /vpn/user/auth/password
@@ -253,6 +304,13 @@ func (c *Client) authPasswordLocked(username, password, verifycode string) (*Aut
 	if c.SessionID == "" {
 		c.Logger("ERROR", "No valid Session ID received from gateway. Response: %s", string(respBody))
 		return nil, fmt.Errorf("登录未下发有效会话ID (可能凭证错误或需要图形验证码)")
+	}
+
+	// 成功响应的 msg 常带口令有效期提示（如「密码还有 X 天过期」），
+	// 原厂客户端会把它展示给用户；保留下来供服务层展示。
+	if msg := strings.TrimSpace(authResp.Result.Msg); msg != "" {
+		c.lastAuthMsg = msg
+		c.Logger("INFO", "网关提示: %s", msg)
 	}
 
 	return &authResp, nil
@@ -862,7 +920,19 @@ func (c *Client) certAuthLocked(verifycode string) (*AuthResponse, error) {
 		c.Logger("ERROR", "No valid Session ID received after certificate auth. Response: %s", string(respBody))
 		return nil, fmt.Errorf("证书登录未下发有效会话ID")
 	}
+	if msg := strings.TrimSpace(authResp.Result.Msg); msg != "" {
+		c.lastAuthMsg = msg
+		c.Logger("INFO", "网关提示: %s", msg)
+	}
 	return &authResp, nil
+}
+
+// LastAuthMessage 返回最近一次认证成功响应携带的网关提示文案
+// （常见为「密码还有 X 天过期」），没有则为空。
+func (c *Client) LastAuthMessage() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.lastAuthMsg
 }
 
 // ClientCertificate returns the certificate installed for mTLS, or nil.

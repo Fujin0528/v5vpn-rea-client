@@ -79,9 +79,18 @@ const pendingClientTTL = 10 * time.Minute
 
 // VPNService is the backend service exposed to the MyGo frontend
 type VPNService struct {
-	Config       *config.AppConfig
-	Client       *protocol.Client
-	ProxyMgr     *proxy.ProxyManager
+	Config   *config.AppConfig
+	Client   *protocol.Client
+	ProxyMgr *proxy.ProxyManager
+	// 端口区间类资源（堡垒机等）不映射固定本地端口，各起一个本地 CONNECT 代理。
+	WebProxies   []*proxy.WebProxy
+	WebResources []WebResource
+	localPort    int // 本地 HTTP 服务端口，用于生成系统 PAC 地址
+	webProxyCfg  webProxyConfig
+	// passwordExpiryDays 是网关下发的口令剩余有效天数（0 表示无提示）。
+	passwordExpiryDays int
+	// loginNotice 是网关认证成功时返回的提示文案（如「密码还有 X 天过期」）。
+	loginNotice  string
 	CertStore    *certstore.Store
 	Status       string // "Disconnected", "Connecting", "Connected", "Error"
 	StatusDetail string
@@ -111,6 +120,9 @@ type VPNService struct {
 
 // NewVPNService initializes the VPN service with loaded settings
 func NewVPNService(onLog func(string)) *VPNService {
+	// 上次进程被强杀时来不及还原系统代理，这里先收拾干净。
+	recoverSystemProxy()
+
 	cfg, err := config.LoadSettingXML("")
 	if err != nil {
 		// Provide default config if not found
@@ -123,6 +135,7 @@ func NewVPNService(onLog func(string)) *VPNService {
 		StatusDetail: "Ready",
 		Logs:         make([]string, 0),
 		onLog:        onLog,
+		webProxyCfg:  loadWebProxyConfig(),
 	}
 
 	s.Log("INFO", "V5VPN Client Service initialized. Loaded %d gateway profiles.", len(cfg.Gateways))
@@ -607,6 +620,7 @@ func (s *VPNService) enterConnected(client *protocol.Client, username string, ce
 	s.challenge = nil
 	s.Resources = nil
 	s.IPsecResources = nil
+	s.loginNotice = client.LastAuthMessage()
 	s.resourceState = ResourceLoading
 	s.resourceError = ""
 	s.Status = "Connected"
@@ -676,6 +690,11 @@ func (s *VPNService) loadResources(client *protocol.Client, cert *tls.Certificat
 	if startErr != nil {
 		s.Log("WARN", "Proxy start partially encountered issues: %v", startErr)
 	}
+	// 端口区间类资源（堡垒机等）无法映射固定本地端口，改走本地 CONNECT 代理。
+	webProxies, webResources := s.startWebResources(client, cert, integration.ResourceList.TCPUDPResources)
+	if days := integration.User.PwdOvertime; days > 0 {
+		s.Log("WARN", "登录密码将在 %d 天后过期，建议尽快修改", days)
+	}
 	if staleProxy != nil {
 		staleProxy.Stop()
 	}
@@ -685,17 +704,34 @@ func (s *VPNService) loadResources(client *protocol.Client, cert *tls.Certificat
 	if s.Client != client {
 		s.mu.Unlock()
 		proxyMgr.Stop()
+		for _, wp := range webProxies {
+			wp.Stop()
+		}
 		return
 	}
+	staleWebProxies := s.WebProxies
 	s.ProxyMgr = proxyMgr
+	s.WebProxies = webProxies
+	s.WebResources = webResources
 	s.Resources = resources
 	s.IPsecResources = ipsecResources
+	s.passwordExpiryDays = integration.User.PwdOvertime
 	s.resourceState = ResourceReady
 	s.resourceError = ""
-	s.StatusDetail = fmt.Sprintf("Connected as %s (%d resources active)", resourceDisplayUser(client), len(resources))
+	s.StatusDetail = fmt.Sprintf("Connected as %s (%d resources active, %d web)",
+		resourceDisplayUser(client), len(resources), len(webResources))
 	s.mu.Unlock()
 
-	s.Log("SUCCESS", "Loaded %d protected resources.", len(resources))
+	for _, wp := range staleWebProxies {
+		wp.Stop()
+	}
+
+	// 网页资源存在时启用系统 PAC，让用户自己打开的浏览器也能访问；
+	// 代理白名单与 PAC 规则同步刷新（资源地址可能变化）。
+	s.syncWebProxyHosts()
+	s.syncSystemPAC(len(webResources) > 0)
+
+	s.Log("SUCCESS", "Loaded %d protected resources (%d web).", len(resources), len(webResources))
 	if len(ipsecResources) > 0 {
 		if len(resources) == 0 {
 			s.Log("INFO", "Gateway granted %d IPsec (NC) profile(s); starting the IPsec data plane", len(ipsecResources))
@@ -851,26 +887,39 @@ func (s *VPNService) RefreshResources() (map[string]any, error) {
 	if startErr != nil {
 		s.Log("WARN", "Proxy start partially encountered issues: %v", startErr)
 	}
+	webProxies, webResources := s.startWebResources(client, client.ClientCertificate(), integration.ResourceList.TCPUDPResources)
 
 	s.mu.Lock()
 	staleProxy := s.ProxyMgr
+	staleWebProxies := s.WebProxies
 	s.ProxyMgr = proxyMgr
+	s.WebProxies = webProxies
+	s.WebResources = webResources
 	s.Resources = resources
+	s.passwordExpiryDays = integration.User.PwdOvertime
 	s.resourceState = ResourceReady
 	s.resourceError = ""
-	s.StatusDetail = fmt.Sprintf("Connected as %s (%d resources active)", resourceDisplayUser(client), len(resources))
+	s.StatusDetail = fmt.Sprintf("Connected as %s (%d resources active, %d web)",
+		resourceDisplayUser(client), len(resources), len(webResources))
 	s.mu.Unlock()
 	if staleProxy != nil {
 		staleProxy.Stop()
 	}
+	for _, wp := range staleWebProxies {
+		wp.Stop()
+	}
 
-	s.Log("SUCCESS", "Refreshed %d protected resources.", len(resources))
+	s.syncWebProxyHosts()
+	s.syncSystemPAC(len(webResources) > 0)
+
+	s.Log("SUCCESS", "Refreshed %d protected resources (%d web).", len(resources), len(webResources))
 	return map[string]any{
 		"status":        "Connected",
 		"sessionId":     client.SessionID,
 		"resourceState": string(ResourceReady),
 		"resourceCount": len(resources),
 		"resources":     resources,
+		"webResources":  webResources,
 	}, nil
 }
 
@@ -1158,11 +1207,8 @@ func (s *VPNService) ChangePassword(gwIdentifier, username, password, newPasswor
 	}
 	if client == nil || client.GatewayIP != gwIP || client.GatewayPort != gwPort {
 		client = protocol.NewClient(gwIP, gwPort, gwAlgo, s.Log)
-		if challengeCert != nil {
-			// A fresh client for a two-factor session must present the same
-			// certificate, or the gateway rejects the password check.
-			client.SetTLSClientCertificate(challengeCert)
-		}
+		// 证书不在这里安装：口令步必须不带证书，等网关返回 0x2 证书挑战后
+		// 再由 AuthCertOnly 呈递，否则握手顺序与原厂不一致。
 		if _, err := client.Handshake(); err != nil {
 			s.setStatus("Error", fmt.Sprintf("Handshake failed: %v", err))
 			return nil, err
@@ -1172,7 +1218,24 @@ func (s *VPNService) ChangePassword(gwIdentifier, username, password, newPasswor
 	// Ensure the client has an active session cookie (VSG_SESSIONID) required by pwdchange.
 	if client.SessionID == "" {
 		if _, err := client.AuthPassword(username, password, verifycode); err != nil {
-			if !protocol.IsPasswordExpired(err) {
+			var authErr *protocol.AuthError
+			isCertChallenge := errors.As(err, &authErr) &&
+				protocol.NextAuthStep(authErr.Code) == protocol.AuthStepCertificate
+
+			switch {
+			case protocol.IsPasswordExpired(err):
+				// 口令过期：网关已下发会话，直接进入改密。
+			case isCertChallenge && challengeCert != nil:
+				// 双因子网关：口令步之后必须补呈证书，会话才算完整。
+				s.Log("INFO", "口令校验通过，正在补呈客户端证书以完成改密会话")
+				if certErr := client.AuthCertOnly(challengeCert, verifycode); certErr != nil {
+					s.setStatus("Error", fmt.Sprintf("证书认证失败: %v", certErr))
+					return nil, certErr
+				}
+			case isCertChallenge:
+				s.setStatus("Error", "该网关要求口令 + 证书双因子，但未找到可用证书")
+				return nil, fmt.Errorf("该网关要求客户端证书，请先在登录页选择证书后再修改密码")
+			default:
 				s.setStatus("Error", fmt.Sprintf("验证当前密码失败: %v", err))
 				return nil, err
 			}
@@ -1588,8 +1651,11 @@ func (s *VPNService) cleanupStaleSessionLocked() {
 func (s *VPNService) Logout() (bool, error) {
 	s.mu.Lock()
 	proxyMgr := s.ProxyMgr
+	webProxies := s.WebProxies
 	client := s.Client
 	s.ProxyMgr = nil
+	s.WebProxies = nil
+	s.WebResources = nil
 	s.Client = nil
 	s.challenge = nil
 	s.pendingClients = nil
@@ -1599,6 +1665,8 @@ func (s *VPNService) Logout() (bool, error) {
 	s.IPsecResources = nil
 	s.resourceState = ""
 	s.resourceError = ""
+	s.passwordExpiryDays = 0
+	s.loginNotice = ""
 	fn := s.OnStatusChange
 	s.mu.Unlock()
 
@@ -1613,6 +1681,12 @@ func (s *VPNService) Logout() (bool, error) {
 	if proxyMgr != nil {
 		proxyMgr.Stop()
 	}
+	for _, wp := range webProxies {
+		wp.Stop()
+	}
+
+	// 断开即还原系统代理，避免残留 PAC 指向一个已停止的服务。
+	s.disableSystemPAC()
 
 	if client != nil {
 		_ = client.Logout()
@@ -1634,17 +1708,20 @@ func (s *VPNService) GetStatus() map[string]any {
 	s.logMu.Unlock()
 
 	return map[string]any{
-		"status":         s.Status,
-		"statusDetail":   s.StatusDetail,
-		"authType":       s.authType,
-		"resources":      s.Resources,
-		"ipsecResources": s.IPsecResources,
-		"ipsecState":     s.ipsecState,
-		"ipsecError":     s.ipsecError,
-		"resourceState":  string(s.resourceState),
-		"resourceError":  s.resourceError,
-		"lastUseGateway": s.Config.LastUseGateway,
-		"logCount":       logCount,
+		"status":             s.Status,
+		"statusDetail":       s.StatusDetail,
+		"authType":           s.authType,
+		"resources":          s.Resources,
+		"webResources":       s.WebResources,
+		"ipsecResources":     s.IPsecResources,
+		"ipsecState":         s.ipsecState,
+		"ipsecError":         s.ipsecError,
+		"resourceState":      string(s.resourceState),
+		"resourceError":      s.resourceError,
+		"passwordExpiryDays": s.passwordExpiryDays,
+		"loginNotice":        s.loginNotice,
+		"lastUseGateway":     s.Config.LastUseGateway,
+		"logCount":           logCount,
 	}
 }
 

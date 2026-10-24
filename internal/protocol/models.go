@@ -54,6 +54,8 @@ type UserInfo struct {
 	LogoutPolicy string `xml:"logout_policy,attr"`
 	SSLSM2       string `xml:"ssl_sm2,attr"`
 	PSKey        string `xml:"client_jump_pskey,attr"`
+	// PwdOvertime 是网关给出的口令剩余有效天数（0 表示无过期策略或已取不到）。
+	PwdOvertime int `xml:"pwd_overtime,attr"`
 }
 
 type SessionInfo struct {
@@ -180,12 +182,15 @@ func SummarizeNCResources(list []NCResource) []IPsecResource {
 }
 
 type TCPUDPResource struct {
-	Name      string     `xml:"name,attr" json:"name"`
-	Protocol  string     `xml:"protocol,attr" json:"protocol"`
-	MapID     string     `xml:"mapid,attr" json:"mapId"`
-	Port      string     `xml:"port,attr" json:"port"` // can be "24390" or "443;24390"
-	Status    string     `xml:"status,attr" json:"status"`
-	IsTCP     string     `xml:"istcp,attr" json:"isTcp"`
+	Name     string `xml:"name,attr" json:"name"`
+	Protocol string `xml:"protocol,attr" json:"protocol"`
+	MapID    string `xml:"mapid,attr" json:"mapId"`
+	Port     string `xml:"port,attr" json:"port"` // can be "24390" or "443;24390"
+	Status   string `xml:"status,attr" json:"status"`
+	IsTCP    string `xml:"istcp,attr" json:"isTcp"`
+	// Addr 是网关直接写在资源节点上的目标地址（真实网关常见形态，例如
+	// 堡垒机 addr="10.10.20.15"），与子节点 TCPUDP_IP 二选一。
+	Addr      string     `xml:"addr,attr" json:"addr"`
 	IPConfigs []TCPUDPIp `xml:"TCPUDP_IP" json:"ipConfigs"`
 	LocalPort int        `xml:"-" json:"localPort"` // Local forwarding port assigned by client
 }

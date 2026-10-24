@@ -543,3 +543,25 @@ func TestStaticFilesStillServed(t *testing.T) {
 		}
 	}
 }
+
+// TestWebProxyConfigRouteRequiresJSONContent 锁定 PAC 设置端点的内容类型
+// 守卫：该端点的写入会进入系统 PAC（每次浏览器请求都执行的 JS），跨站
+// 网页用 text/plain 简单请求伪造的 POST 必须被 415 挡掉（简单请求无预检）。
+func TestWebProxyConfigRouteRequiresJSONContent(t *testing.T) {
+	h, _, _ := newTestRouter(t)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/web-proxy/config",
+		strings.NewReader(`{"pacEnabled":true,"extraTargets":"10.10.20.*"}`))
+	req.Header.Set("Content-Type", "text/plain")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnsupportedMediaType {
+		t.Fatalf("text/plain POST: status = %d，期望 415。body=%s", rec.Code, rec.Body)
+	}
+
+	// 显式 JSON 正常通过。
+	rec = postJSON(t, h, "/api/web-proxy/config", `{"pacEnabled":false,"extraTargets":""}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("JSON POST: status = %d，期望 200。body=%s", rec.Code, rec.Body)
+	}
+}
